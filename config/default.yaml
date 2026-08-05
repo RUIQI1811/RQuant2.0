@@ -1,0 +1,39 @@
+project:
+  data_root: data
+  runs_root: runs
+  timezone: Asia/Shanghai
+  seed: 42
+
+data:
+  formal_start: 2010-01-01
+  warmup_trading_days: 300
+  through: null
+  universe: csi300
+  benchmark: SH000300
+  tushare_index_code: 399300.SZ
+  max_requests_per_minute: 190
+
+factors:
+  factor_set: combined
+  dtype: double
+  input_layout: TS
+  output_layout: TS
+  workers: 4
+  catalog_version: 1
+
+workflow:
+  train_years: 3
+  validation_months: 6
+  first_prediction_year: 2013
+  seed: 42
+
+backtest:
+  initial_capital: 1000000
+  topk: 50
+  n_drop: 5
+  trade_unit: 100
+  commission_rate: 0.0003
+  minimum_commission: 5.0
+  stamp_tax_before_2023_08_28: 0.001
+  stamp_tax_from_2023_08_28: 0.0005
+  impact_cost: 0.0
