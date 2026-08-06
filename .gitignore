@@ -16,6 +16,7 @@ dist/
 data/raw/
 data/canonical/
 data/qlib/
+data/qlib 2/
 data/qlib.previous.*/
 data/factors/
 data/cache/
