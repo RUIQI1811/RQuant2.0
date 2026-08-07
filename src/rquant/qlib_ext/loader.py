@@ -24,7 +24,7 @@ HORIZON_STEPS = {"1d": 1, "5d": 5, "20d": 20}
 
 
 class KunQuantDataLoader(_QlibDataLoaderBase):
-    """Load canonical KunQuant features and a Qlib-evaluated next-open label."""
+    """Load a registered RQuant factor store and a Qlib-evaluated next-open label."""
 
     def __init__(self, factor_root: str, factor_set: FactorSet = "combined", horizon: str = "1d") -> None:
         if horizon not in LABEL_EXPRESSIONS:
@@ -33,6 +33,7 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         self.factor_set = factor_set
         self.horizon = horizon
         self.catalog = get_catalog()
+        self.catalog.select(factor_set)
 
     def load(
         self,
@@ -59,7 +60,8 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         if instrument_list:
             frame = frame[frame["instrument"].isin(instrument_list)]
         expected = list(self.catalog.canonical_names(self.factor_set))
-        if [column for column in frame.columns if column.startswith(("a158_", "a101_"))] != expected:
+        factor_columns = [column for column in frame.columns if column not in {"datetime", "instrument"}]
+        if factor_columns != expected:
             raise DataContractError("Factor store columns do not match the locked catalog")
 
         # DataHandlerLP follows QlibDataLoader's canonical <datetime, instrument> index order.

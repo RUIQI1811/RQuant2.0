@@ -90,7 +90,8 @@ class PortfolioBacktestRunner:
             only_tradable=True,
             forbid_all_trade_at_limit=False,
         )
-        executor = SimulatorExecutor(time_per_step="day", generate_portfolio_metrics=True, verbose=False)
+        executor_class = _zero_order_safe_executor_class(SimulatorExecutor)
+        executor = executor_class(time_per_step="day", generate_portfolio_metrics=True, verbose=False)
         portfolio, indicators = backtest(
             start_time=start_time,
             end_time=end_time,
@@ -198,6 +199,39 @@ def _liquidating_strategy_class(base_class: Any) -> type[Any]:
             return TradeDecisionWO(orders, self)
 
     return LiquidatingTopkDropoutStrategy
+
+
+def _zero_order_safe_executor_class(base_class: Any) -> type[Any]:
+    """Keep Qlib trade indicators defined when a daily decision contains no orders."""
+    from qlib.backtest.report import Indicator
+
+    class ZeroOrderSafeIndicator(Indicator):
+        def cal_trade_indicators(
+            self,
+            trade_start_time: Any,
+            freq: str,
+            indicator_config: dict[str, Any] | None = None,
+        ) -> None:
+            if self.order_indicator.get_index_data("amount").empty:
+                self.trade_indicator.update(
+                    {
+                        "ffr": None,
+                        "pa": None,
+                        "pos": None,
+                        "deal_amount": 0.0,
+                        "value": 0.0,
+                        "count": 0,
+                    }
+                )
+                return
+            super().cal_trade_indicators(trade_start_time, freq, indicator_config or {})
+
+    class ZeroOrderSafeSimulatorExecutor(base_class):  # type: ignore[misc,valid-type]
+        def reset_common_infra(self, common_infra: Any, copy_trade_account: bool = False) -> None:
+            super().reset_common_infra(common_infra, copy_trade_account)
+            self.trade_account.indicator = ZeroOrderSafeIndicator()
+
+    return ZeroOrderSafeSimulatorExecutor
 
 
 def _position_artifact(pd: Any, positions: dict[Any, Any], exchange: Any) -> Any:

@@ -82,6 +82,11 @@ class KunQuantSmokeTests(unittest.TestCase):
         for name in ("a101_068", "a101_086"):
             finite = output[name][np.isfinite(output[name])]
             self.assertGreater(np.unique(finite).size, 1, f"{name} must not collapse to a constant")
+        from rquant.factors.libraries.alpha101 import ALPHA101_UPSTREAM_MISSING
+
+        for ordinal in ALPHA101_UPSTREAM_MISSING:
+            name = f"a101_{ordinal:03d}"
+            self.assertGreater(np.isfinite(output[name]).sum(), 0, f"{name} must produce finite values")
 
 
 if __name__ == "__main__":

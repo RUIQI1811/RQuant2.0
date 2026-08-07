@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from rquant.factors.catalog import ALPHA101_KUNQUANT_MISSING, get_catalog
+from rquant.factors.catalog import ALPHA101_UPSTREAM_MISSING, get_catalog
 from rquant.factors.engine import validate_factor_frame
 
 
@@ -31,7 +31,7 @@ class FactorCatalogTests(unittest.TestCase):
     def test_alpha101_is_strictly_numbered(self) -> None:
         names = get_catalog().canonical_names("wq_alpha101")
         self.assertEqual(tuple(f"a101_{value:03d}" for value in range(1, 102)), names)
-        self.assertEqual(19, len(ALPHA101_KUNQUANT_MISSING))
+        self.assertEqual(19, len(ALPHA101_UPSTREAM_MISSING))
 
     def test_combined_order_is_locked(self) -> None:
         names = get_catalog().canonical_names("combined")

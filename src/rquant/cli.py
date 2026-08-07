@@ -19,8 +19,8 @@ from rquant.data.canonical import CanonicalBuilder
 from rquant.data.collector import TushareCollector
 from rquant.data.qlib_builder import QlibProviderBuilder
 from rquant.errors import DataContractError, DependencyError, RQuantError
-from rquant.factors.catalog import FactorSet, get_catalog
-from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine, validate_factor_frame
+from rquant.factors.catalog import CATALOG_VERSION, FactorSet, get_catalog
+from rquant.factors.engine import FactorBuildConfig, create_factor_engine, validate_factor_frame
 from rquant.factors.evaluation import FactorEvaluationConfig, FactorEvaluator
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
@@ -58,10 +58,17 @@ def build_parser() -> argparse.ArgumentParser:
     catalog.add_argument("--format", choices=("table", "json", "csv"), default="table")
     catalog.add_argument("--output", help="Export JSON or CSV to this path")
     catalog.set_defaults(handler=_factor_catalog)
-    factor_build = factor_commands.add_parser("build", help="Compile KunQuant and write factor partitions")
+    factor_build = factor_commands.add_parser("build", help="Compute a registered factor library and write partitions")
     factor_build.add_argument("--factor-set", choices=_factor_sets(), required=True)
     factor_build.add_argument("--start")
     factor_build.add_argument("--end")
+    factor_build.add_argument(
+        "--external-input",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Register a project-local external factor input, for example style_factors=data/reference/style.parquet",
+    )
     factor_build.set_defaults(handler=_factor_build)
     factor_validate = factor_commands.add_parser("validate", help="Validate stored factor columns and ordering")
     factor_validate.add_argument("--factor-set", choices=_factor_sets(), required=True)
@@ -106,8 +113,27 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
-def _factor_sets() -> tuple[str, str, str]:
-    return "qlib_alpha158", "wq_alpha101", "combined"
+def _factor_sets() -> tuple[str, ...]:
+    return get_catalog().factor_sets()
+
+
+def _factor_external_inputs(args: argparse.Namespace) -> tuple[tuple[str, str], ...]:
+    root = _root(args)
+    parsed: dict[str, str] = {}
+    for raw in args.external_input:
+        name, separator, value = raw.partition("=")
+        if not separator or not name or not value:
+            raise ValueError(f"Invalid --external-input {raw!r}; expected NAME=PATH")
+        if name in parsed:
+            raise ValueError(f"Duplicate --external-input name: {name}")
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        path = path.resolve()
+        if not path.is_relative_to(root):
+            raise ValueError(f"External factor input escapes the project root: {path}")
+        parsed[name] = str(path)
+    return tuple(parsed.items())
 
 
 def _root(args: argparse.Namespace) -> Path:
@@ -175,7 +201,7 @@ def _doctor(args: argparse.Namespace) -> int:
     record("TUSHARE_TOKEN", bool(token), "set" if token else "missing")
     record(
         "factor_catalog",
-        len(get_catalog().specs) == 259,
+        len(get_catalog().specs) == 449,
         {"columns": len(get_catalog().specs), "fingerprint": get_catalog().fingerprint},
     )
     config_path = Path(args.config)
@@ -273,7 +299,11 @@ def _factor_catalog(args: argparse.Namespace) -> int:
         catalog.export(destination, factor_set=args.factor_set, format=args.format)
         print(
             json.dumps(
-                {"output": str(destination), "rows": len(rows), "fingerprint": catalog.fingerprint},
+                {
+                    "output": str(destination),
+                    "rows": len(rows),
+                    "fingerprint": catalog.fingerprint_for(args.factor_set),
+                },
                 ensure_ascii=False,
                 indent=2,
             )
@@ -282,7 +312,11 @@ def _factor_catalog(args: argparse.Namespace) -> int:
     if args.format == "json":
         print(
             json.dumps(
-                {"catalog_version": 1, "fingerprint": catalog.fingerprint, "factors": rows},
+                {
+                    "catalog_version": CATALOG_VERSION,
+                    "fingerprint": catalog.fingerprint_for(args.factor_set),
+                    "factors": rows,
+                },
                 ensure_ascii=False,
                 indent=2,
             )
@@ -300,7 +334,8 @@ def _factor_catalog(args: argparse.Namespace) -> int:
 def _factor_build(args: argparse.Namespace) -> int:
     def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
         factor_config = config.get("factors", {})
-        engine = KunQuantFactorEngine(
+        external_inputs = _factor_external_inputs(args)
+        engine = create_factor_engine(
             paths.cache,
             FactorBuildConfig(
                 factor_set=args.factor_set,
@@ -308,9 +343,11 @@ def _factor_build(args: argparse.Namespace) -> int:
                 input_layout=str(factor_config.get("input_layout", "TS")),
                 output_layout=str(factor_config.get("output_layout", "TS")),
                 workers=int(factor_config.get("workers", 4)),
+                external_inputs=external_inputs,
             ),
         )
-        run.add_input("catalog_fingerprint", get_catalog().fingerprint)
+        run.add_input("catalog_fingerprint", get_catalog().fingerprint_for(args.factor_set))
+        run.add_input("external_inputs", dict(external_inputs))
         return engine.build_from_canonical(paths.canonical, paths.factors, start=args.start, end=args.end)
 
     return _run(args, action)
@@ -336,7 +373,7 @@ def _factor_validate(args: argparse.Namespace) -> int:
         fingerprint_payload.pop("fingerprint", None)
         if fingerprint != stable_hash(fingerprint_payload):
             raise DataContractError("Factor manifest fingerprint is invalid")
-        if manifest.get("catalog_fingerprint") != get_catalog().fingerprint:
+        if manifest.get("catalog_fingerprint") != get_catalog().fingerprint_for(factor_set):
             raise DataContractError("Factor manifest catalog fingerprint is stale")
         canonical_manifest_path = paths.canonical / "manifest.json"
         with canonical_manifest_path.open("r", encoding="utf-8") as handle:

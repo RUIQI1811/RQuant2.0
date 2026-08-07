@@ -2,68 +2,77 @@ from __future__ import annotations
 
 import csv
 import json
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
 
 from rquant.errors import FactorContractError
+from rquant.factors.libraries.alpha101 import ALPHA101_UPSTREAM_MISSING
+from rquant.factors.libraries.base import FactorFamily, FactorSet, FactorSpec
+from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
 from rquant.io import stable_hash
 
-FactorFamily = Literal["qlib_alpha158", "wq_alpha101"]
-FactorSet = Literal["qlib_alpha158", "wq_alpha101", "combined"]
-CATALOG_VERSION = 1
-
-
-@dataclass(frozen=True)
-class FactorSpec:
-    canonical_name: str
-    source_name: str
-    family: FactorFamily
-    ordinal: int
-    formula: str
-    max_lookback: int
-    implementation: str
-    catalog_version: int = CATALOG_VERSION
+CATALOG_VERSION = 2
 
 
 class FactorCatalog:
-    def __init__(self, specs: Iterable[FactorSpec]) -> None:
+    def __init__(self, specs: Iterable[FactorSpec], factor_sets: Mapping[str, tuple[str, ...]]) -> None:
         self.specs = tuple(specs)
+        self._factor_sets = dict(factor_sets)
         self.validate()
 
+    def factor_sets(self) -> tuple[str, ...]:
+        return tuple(self._factor_sets)
+
     def select(self, factor_set: FactorSet) -> tuple[FactorSpec, ...]:
-        if factor_set == "combined":
-            return self.specs
-        if factor_set not in {"qlib_alpha158", "wq_alpha101"}:
-            raise FactorContractError(f"Unknown factor set: {factor_set}")
-        return tuple(spec for spec in self.specs if spec.family == factor_set)
+        try:
+            families = self._factor_sets[factor_set]
+        except KeyError as exc:
+            raise FactorContractError(f"Unknown factor set: {factor_set}") from exc
+        by_family = {family: [] for family in families}
+        for spec in self.specs:
+            if spec.family in by_family:
+                by_family[spec.family].append(spec)
+        return tuple(spec for family in families for spec in by_family[family])
 
     def canonical_names(self, factor_set: FactorSet = "combined") -> tuple[str, ...]:
         return tuple(spec.canonical_name for spec in self.select(factor_set))
 
     def source_to_canonical(self, factor_set: FactorSet) -> dict[str, str]:
-        return {spec.source_name: spec.canonical_name for spec in self.select(factor_set)}
+        specs = self.select(factor_set)
+        source_names = [spec.source_name for spec in specs]
+        if len(source_names) != len(set(source_names)):
+            raise FactorContractError(f"Factor set {factor_set} has ambiguous source names")
+        return {spec.source_name: spec.canonical_name for spec in specs}
 
     @property
     def fingerprint(self) -> str:
         return stable_hash([asdict(spec) for spec in self.specs])
 
+    def fingerprint_for(self, factor_set: FactorSet) -> str:
+        return stable_hash([asdict(spec) for spec in self.select(factor_set)])
+
     def validate(self) -> None:
-        expected_158 = tuple(f"a158_{index:03d}" for index in range(1, 159))
-        expected_101 = tuple(f"a101_{index:03d}" for index in range(1, 102))
-        actual_158 = tuple(spec.canonical_name for spec in self.specs if spec.family == "qlib_alpha158")
-        actual_101 = tuple(spec.canonical_name for spec in self.specs if spec.family == "wq_alpha101")
-        if actual_158 != expected_158:
-            raise FactorContractError("Alpha158 catalog must be exactly a158_001..a158_158 in locked order")
-        if actual_101 != expected_101:
-            raise FactorContractError("Alpha101 catalog must be exactly a101_001..a101_101 in locked order")
+        if not self.specs:
+            raise FactorContractError("Factor catalog must not be empty")
+        registered_families = {family for families in self._factor_sets.values() for family in families}
+        spec_families = {spec.family for spec in self.specs}
+        if spec_families != registered_families:
+            raise FactorContractError("Factor catalog families differ from the registered factor sets")
         canonical = [spec.canonical_name for spec in self.specs]
-        if len(canonical) != 259 or len(set(canonical)) != 259:
-            raise FactorContractError("Combined catalog must contain 259 unique canonical names")
+        if len(canonical) != len(set(canonical)):
+            raise FactorContractError("Factor catalog contains duplicate canonical names")
         for spec in self.specs:
+            if not spec.canonical_name or not spec.source_name:
+                raise FactorContractError("Factor names must not be empty")
             if spec.source_name == spec.canonical_name:
                 raise FactorContractError(f"Source name leaked as canonical name: {spec.source_name}")
+            if spec.ordinal < 1 or spec.max_lookback < 1:
+                raise FactorContractError(f"Invalid factor metadata: {spec.canonical_name}")
+        for factor_set in self._factor_sets:
+            selected = self.select(factor_set)
+            if not selected:
+                raise FactorContractError(f"Factor set is empty: {factor_set}")
 
     def rows(self, factor_set: FactorSet = "combined") -> list[dict[str, object]]:
         return [asdict(spec) for spec in self.select(factor_set)]
@@ -75,7 +84,11 @@ class FactorCatalog:
         if format == "json":
             with path.open("w", encoding="utf-8") as handle:
                 json.dump(
-                    {"catalog_version": CATALOG_VERSION, "fingerprint": self.fingerprint, "factors": rows},
+                    {
+                        "catalog_version": CATALOG_VERSION,
+                        "fingerprint": self.fingerprint_for(factor_set),
+                        "factors": rows,
+                    },
                     handle,
                     ensure_ascii=False,
                     indent=2,
@@ -91,93 +104,26 @@ class FactorCatalog:
         raise FactorContractError(f"Unsupported catalog export format: {format}")
 
 
-_ALPHA158_KBAR = ("KMID", "KLEN", "KMID2", "KUP", "KUP2", "KLOW", "KLOW2", "KSFT", "KSFT2")
-_ALPHA158_PRICE = ("OPEN0", "HIGH0", "LOW0", "VWAP0")
-_ALPHA158_ROLLING = (
-    "ROC",
-    "MA",
-    "STD",
-    "BETA",
-    "RSQR",
-    "RESI",
-    "MAX",
-    "MIN",
-    "QTLU",
-    "QTLD",
-    "RANK",
-    "RSV",
-    "IMAX",
-    "IMIN",
-    "IMXD",
-    "CORR",
-    "CORD",
-    "CNTP",
-    "CNTN",
-    "CNTD",
-    "SUMP",
-    "SUMN",
-    "SUMD",
-    "VMA",
-    "VSTD",
-    "WVMA",
-    "VSUMP",
-    "VSUMN",
-    "VSUMD",
-)
-_ALPHA158_WINDOWS = (5, 10, 20, 30, 60)
-ALPHA158_SOURCE_NAMES = (
-    _ALPHA158_KBAR
-    + _ALPHA158_PRICE
-    + tuple(f"{operator}{window}" for operator in _ALPHA158_ROLLING for window in _ALPHA158_WINDOWS)
-)
-
-ALPHA101_KUNQUANT_MISSING = frozenset({48, 56, 58, 59, 63, 67, 69, 70, 76, 79, 80, 82, 87, 89, 90, 91, 93, 97, 100})
-
-
-def _alpha158_specs() -> list[FactorSpec]:
-    if len(ALPHA158_SOURCE_NAMES) != 158:
-        raise FactorContractError(f"Locked Alpha158 source order has {len(ALPHA158_SOURCE_NAMES)} names, expected 158")
-    specs = []
-    for ordinal, source_name in enumerate(ALPHA158_SOURCE_NAMES, 1):
-        lookback = next((window for window in _ALPHA158_WINDOWS if source_name.endswith(str(window))), 1)
-        specs.append(
-            FactorSpec(
-                canonical_name=f"a158_{ordinal:03d}",
-                source_name=source_name,
-                family="qlib_alpha158",
-                ordinal=ordinal,
-                formula=f"Qlib Alpha158 source expression: {source_name}",
-                max_lookback=lookback,
-                implementation="KunQuant.predefined.Alpha158",
-            )
-        )
-    return specs
-
-
-def _alpha101_specs() -> list[FactorSpec]:
-    specs = []
-    for ordinal in range(1, 102):
-        missing = ordinal in ALPHA101_KUNQUANT_MISSING
-        specs.append(
-            FactorSpec(
-                canonical_name=f"a101_{ordinal:03d}",
-                source_name=f"alpha{ordinal:03d}",
-                family="wq_alpha101",
-                ordinal=ordinal,
-                formula=f"WorldQuant Formulaic Alpha #{ordinal:03d}",
-                max_lookback=250,
-                implementation=(
-                    f"rquant.factors.alpha101_missing.alpha{ordinal:03d}"
-                    if missing
-                    else f"KunQuant.predefined.Alpha101.alpha{ordinal:03d}"
-                ),
-            )
-        )
-    return specs
-
-
-_CATALOG = FactorCatalog((*_alpha158_specs(), *_alpha101_specs()))
+def catalog_from_registry(registry: FactorLibraryRegistry) -> FactorCatalog:
+    factor_sets = {
+        factor_set: tuple(library.family for library in registry.select(factor_set))
+        for factor_set in registry.factor_sets()
+    }
+    specs = tuple(spec for library in registry.libraries() for spec in library.specs)
+    return FactorCatalog(specs, factor_sets)
 
 
 def get_catalog() -> FactorCatalog:
-    return _CATALOG
+    return catalog_from_registry(get_library_registry())
+
+
+__all__ = [
+    "ALPHA101_UPSTREAM_MISSING",
+    "CATALOG_VERSION",
+    "FactorCatalog",
+    "FactorFamily",
+    "FactorSet",
+    "FactorSpec",
+    "catalog_from_registry",
+    "get_catalog",
+]

@@ -8,7 +8,9 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算 Alpha158、Alpha101 因子；
+- KunQuant 用于编译和计算 Alpha158、Alpha101 因子；GTJA191 使用独立的 Pandas 面板后端；
+- Alpha158、Alpha101 和 GTJA191 的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
+  不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；
 - 当前工程独立于旧版 RQuant 与 StockTradebyZ，禁止从那些工程隐式导入、复制运行产物或混用环境；
 - 当前工程不内嵌 Qlib 上游源码；运行时只使用 `pyproject.toml` 锁定并安装在 `rquant` 环境中的
   `pyqlib==0.9.7`。除非任务明确要求开发 Qlib 上游，否则不要在项目根目录克隆 Qlib，也不要
@@ -63,14 +65,18 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 主要目录：
 
 - `src/rquant/`：产品代码；
+- `src/rquant/factors/libraries/`：因子库接口、注册表及本地公式定义；
+- `src/rquant/factors/extensions/`：KunQuant 0.1.11 缺失能力的最小扩展，不是上游运行时副本；
+- `src/rquant/factors/panel_operators.py`：GTJA191 使用的公共 Pandas 面板算子；
 - `tests/`：快速、确定性的自动化测试；
 - `config/default.yaml`：默认研究和执行参数；
 - `data/raw/`：不可变的 Tushare 分区、分区级清单及总同步清单；
 - `data/canonical/`：标准化、可审计的日线数据；
 - `data/qlib/`：Qlib provider；
 - `data/factors/`：按因子集和年份分区的因子结果；
-- `data/cache/`：KunQuant 编译缓存；
+- `data/cache/`：因子执行缓存（当前主要为 KunQuant 编译缓存）；
 - `runs/<run-id>/`：运行清单、日志、预测、回测与报告产物；
+- `THIRD_PARTY_NOTICES.md` 与 `licenses/`：迁入公式的来源、修改说明和第三方许可证；
 - Qlib 上游源码不属于本工程；需要查阅时使用独立于项目根目录的临时或同级 checkout。
 
 不要手工编辑生成数据来“修好”结果。应修复生成逻辑，然后通过正式命令重建相应产物。
@@ -81,7 +87,8 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 
 - 先阅读相关源码、测试、配置和已有清单；
 - 检查工作区是否有同名文件、未完成运行或用户正在进行的修改；
-- 当前项目根目录可能不是 Git 仓库，不得假设 `git status` 可用；若操作 `qlib/`，单独检查它自己的 Git 状态；
+- 当前项目根目录是 Git 仓库；先用 `git status --short` 和针对性 `git diff` 区分用户已有改动与本次改动，
+  不得覆盖、回退或顺手整理无关变更，也不得另行初始化 Git；
 - 诊断失败运行时，优先查看 `runs/<run-id>/run.json` 与 `run.log`，同时核对命令参数、输入指纹、状态和输出文件；
 - 只修改完成任务所需的最小范围，保留所有无关文件和用户产物。
 
@@ -92,6 +99,13 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 路径必须经项目根目录解析，运行数据不得逃出项目根目录；
 - 写入清单和关键产物应保持原子性；失败必须留下明确的 `failed` 状态与异常信息；
 - 保留配置、数据、因子、编译和运行指纹，任何会改变结果的参数都必须进入可审计输入；
+- 新增因子库应实现 `FactorLibrary` 或 `PanelFactorLibrary`，并只通过
+  `src/rquant/factors/libraries/registry.py` 注册；CLI 的 `--factor-set` 选项、目录和执行后端应由注册表派生，
+  不要在 CLI、加载器和引擎中重复硬编码新名称；
+- KunQuant 因子优先组合其公共算子，只有现有算子无法表达的最小能力才可加入 `extensions/kunquant.py`；
+  Pandas 面板算子必须明确行是交易日、列是证券，并锁定窗口、NaN、排名和回归语义；
+- 从第三方迁入或改写公式时，必须保留来源、版本、修改边界和许可证文本，并同步更新
+  `THIRD_PARTY_NOTICES.md`；
 - 不吞掉异常，不用空结果冒充成功，不通过关闭警告来掩盖数值或数据问题。
 
 ### 修改后
@@ -111,7 +125,17 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 停牌日要保留为不可交易缺口，不能用前值伪造正常行情；
 - 指数成分、行业、涨跌停和其他横截面信息必须保持 point-in-time 语义；
 - 标签、特征和股票池必须按同一交易日历对齐，并执行与预测期限相符的 purge；
-- 因子列名和顺序是稳定契约：Alpha158 为 `a158_001` 至 `a158_158`，Alpha101 为 `a101_001` 至 `a101_101`；不得暴露上游原始名称；
+- 因子列名和顺序是稳定契约：Alpha158 为 `a158_001` 至 `a158_158`，Alpha101 为 `a101_001` 至
+  `a101_101`，GTJA191 当前为 `gtja_001` 至 `gtja_191` 中除 `gtja_030` 外的 190 列；不得暴露上游原始名称；
+- 当前注册表共有 449 个可构建因子。`combined` 是兼容性因子集，只按顺序包含 Alpha158 与 Alpha101
+  的 259 列，不得因注册 GTJA191 或自定义库而隐式扩容；若要组合新库，应注册一个新的、名称稳定的因子集；
+- `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
+  `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
+- `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖标准数据中的沪深 300 指数序列。参考输入的路径、
+  选择结果和文件哈希必须写入因子清单；外部输入只能通过 `--external-input NAME=PATH` 显式提供，且路径
+  必须位于项目根目录内；
+- 目录指纹按所选 factor set 计算，执行清单还必须记录库实现指纹、后端、标准数据指纹和外部参考输入；
+  不能用全目录指纹替代某一因子集的契约，也不能复用实现指纹已过期的历史产物；
 - NaN、Inf、常数截面、零方差和极大有限值必须被显式处理，不能让相关系数或评估结果静默失真；
 - IC、多空分组收益只用于因子诊断；最终可交易结论以受约束的 long-only 回测为准。
 
@@ -136,8 +160,18 @@ conda activate rquant
 rquant doctor --skip-permission-check
 rquant factors catalog
 python -m pytest tests/test_cli.py -q
+python -m pytest tests/test_catalog.py tests/test_factor_libraries.py tests/test_gtja191.py -q
 python -m ruff check src tests
 ```
+
+因子库或目录变更后，至少确认下列计数和顺序仍成立：
+
+```bash
+python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
+```
+
+当前预期为总目录 `449`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+`combined=259`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 完整快速测试：
 
@@ -157,6 +191,8 @@ rquant data sync --through YYYY-MM-DD
 rquant data build-qlib
 rquant factors build --factor-set combined
 rquant factors validate --factor-set combined
+rquant factors build --factor-set gtja191
+rquant factors validate --factor-set gtja191
 rquant walk-forward --model lgb --horizon 1d --factor-set combined
 rquant report RUN_ID
 ```
@@ -177,6 +213,7 @@ rquant report RUN_ID
 - 不修改无关配置来让测试通过；
 - 不联网查询或上传本地数据、token、持仓、日志和运行产物；
 - 不新增依赖，除非现有依赖无法合理完成任务，并先说明必要性与锁定方式；
+- 不删除、缩短或改写 `THIRD_PARTY_NOTICES.md` 和 `licenses/` 中适用于现有派生代码的声明；
 - 不在未经授权的情况下发布、提交、推送或创建 PR。
 
 ## 8. 交付标准

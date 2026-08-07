@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算 Alpha158 与 Alpha101 因子。
+- KunQuant 编译并计算 Alpha158 与 Alpha101 因子；审计过的 Pandas 面板后端计算 GTJA191。
 
 完整工作流概览
 
@@ -100,7 +100,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - `clang++`；
 - Tushare token；
-- 259 个因子的固定目录；
+- 449 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -237,6 +237,7 @@ python -m json.tool data/qlib/manifest.json
 rquant factors catalog
 rquant factors catalog --factor-set qlib_alpha158
 rquant factors catalog --factor-set wq_alpha101
+rquant factors catalog --factor-set gtja191
 rquant factors catalog --factor-set combined
 ```
 
@@ -251,9 +252,110 @@ rquant factors catalog --factor-set combined --format csv --output factor_catalo
 
 - `qlib_alpha158`：`a158_001` 至 `a158_158`，共 158 列；
 - `wq_alpha101`：`a101_001` 至 `a101_101`，共 101 列；
+- `gtja191`：`gtja_001` 至 `gtja_191`（暂时排除 `gtja_030`），共 190 列；
 - `combined`：先排列 158 列 Alpha158，再排列 101 列 Alpha101，共 259 列。
 
+`combined` 保持原有 259 列契约，不会隐式加入 GTJA191。这样已有模型和历史产物的列数、顺序与指纹不会
+因新增因子库而静默改变。
+
 固定目录保留来源名称、公式标识、序号、最大回看期和实现方式，但模型特征只暴露规范列名。
+
+### 因子库代码结构
+
+所有可研究的因子公式由 RQuant 自己维护。Alpha158/Alpha101 使用 KunQuant 后端，GTJA191 使用 Pandas
+宽表后端；两者共用目录、清单、年度 Parquet、验证器和下游加载契约：
+
+```text
+src/rquant/factors/
+├── extensions/
+│   └── kunquant.py                      # KunQuant 缺失能力的最小扩展与适配
+├── panel_operators.py                   # 公共 Pandas 面板算子
+├── catalog.py                           # 动态目录、稳定命名和实现指纹
+├── engine.py                            # 后端选择、执行和标准分区写入
+└── libraries/
+    ├── base.py                          # 因子库接口与输入字段契约
+    ├── registry.py                      # 因子库及组合因子集注册表
+    ├── alpha158.py                      # 158 条本地 Alpha158 公式
+    ├── alpha101.py                      # 101 条本地 Alpha101 公式
+    ├── gtja191.py                       # 完整 GTJA191 提供者与公式语义说明
+    └── custom.py                        # 自定义小型因子库构造器
+```
+
+Alpha158 与 Alpha101 的公式定义均保存在 RQuant 源码中，不从
+`KunQuant.predefined.Alpha158/Alpha101` 导入。KunQuant 仅提供算子、图优化、C++ 代码生成和运行时；公式变更会
+进入 RQuant 的实现指纹。迁入公式基于 KunQuant 0.1.11 的 Apache-2.0 源码，来源与许可证见
+`THIRD_PARTY_NOTICES.md`。
+
+因子公式优先直接组合 KunQuant 公共算子。只有 KunQuant 0.1.11 无法表达的能力才放入
+`extensions/kunquant.py`；当前仅包含 Alpha101 行业中性化所需的横截面扩展和轻量符号适配，不复制
+`OpBase`、优化 pass、代码生成器或运行时。
+
+### 添加自己的因子库
+
+在 `src/rquant/factors/libraries/` 中新建独立模块。小型因子库可直接使用 `CustomFactorLibrary`：
+
+```python
+from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
+
+
+def price_spread(inputs):
+    return inputs["close"] - inputs["open"]
+
+
+LIBRARY = CustomFactorLibrary(
+    family="custom_price",
+    required_inputs=("open", "close"),
+    factors=(
+        CustomFactor(
+            canonical_name="custom_price_001",
+            source_name="price_spread",
+            formula="close - open",
+            max_lookback=1,
+            builder=price_spread,
+        ),
+    ),
+)
+```
+
+然后只在 `libraries/registry.py` 的 `_default_registry()` 中导入并注册：
+
+```python
+from rquant.factors.libraries.my_factors import LIBRARY
+
+registry.register_library(LIBRARY)
+```
+
+注册后，因子库名称会自动成为 CLI 可选的 `--factor-set`，无需修改 `engine.py`、CLI 参数列表、数据加载器
+或因子列前缀校验。如需把多个库组合成一个稳定因子集，再调用：
+
+```python
+registry.register_factor_set("research_v1", ("qlib_alpha158", "wq_alpha101", "custom_price"))
+```
+
+每个新库至少要补充：目录名称和顺序测试、小型数值基准测试、对应后端的执行测试，以及缺失输入测试。
+
+### 构建 GTJA191
+
+GTJA191 当前构建 190 条公式：186 条只依赖标准 OHLCV、成交额和 VWAP，另外 4 条需要指数序列：
+
+- `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 使用标准数据中的沪深 300 日线；构建器自动从
+  `data/canonical/reference/index_daily.parquet` 选择 `000300.SH`，缺失时兼容 `399300.SZ`；
+- `gtja_030` 的公式仍保留在源码中，但因当前缺少可审计的逐日 `mkt`、`smb`、`hml` 风格收益，暂时不注册到构建目录。
+
+构建命令：
+
+```bash
+rquant factors build --factor-set gtja191
+rquant factors validate --factor-set gtja191
+```
+
+结果写到 `data/factors/gtja191/year=YYYY/factors.parquet` 和
+`data/factors/gtja191/manifest.json`；清单会记录沪深 300 文件哈希。
+
+公式以国泰君安[《数量化专题之九：基于短周期价量特征的多因子选股体系》](https://guorn.com/static/upload/file/3/134065454575605.pdf)
+附录为基准。原报告中
+`Alpha159` 的 `HGIH` 按 `HIGH` 修正并保留其原始加权式；`Alpha181` 的分母 `SUM` 缺少窗口参数，
+实现采用与分子一致的 20 日窗口，并在源码 `GTJA191_FORMULA_NOTES` 中固定这些解释。
 
 ### 构建因子
 

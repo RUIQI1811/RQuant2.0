@@ -225,10 +225,9 @@ class DataPipelineTests(unittest.TestCase):
 
     def test_qlib_binary_has_suspension_gap_and_raw_price_recovery(self) -> None:
         import numpy as np
+        import qlib
         from qlib.constant import REG_CN
         from qlib.data import D
-
-        import qlib
 
         CanonicalBuilder(self.raw, self.canonical).build()
         manifest = QlibProviderBuilder(self.canonical, self.qlib).build()
@@ -263,15 +262,25 @@ class DataPipelineTests(unittest.TestCase):
             ],
             columns=["datetime", "instrument", "score"],
         ).to_parquet(run_directory / "predictions.parquet", index=False)
-        result = PortfolioBacktestRunner(
-            qlib_root=self.qlib,
-            run_directory=run_directory,
-            config=PortfolioConfig(initial_capital=100_000, topk=1, n_drop=1),
-        ).run()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            result = PortfolioBacktestRunner(
+                qlib_root=self.qlib,
+                run_directory=run_directory,
+                config=PortfolioConfig(initial_capital=100_000, topk=1, n_drop=1),
+            ).run()
         self.assertEqual("complete", result["status"])
         self.assertTrue((run_directory / "portfolio.parquet").exists())
         self.assertTrue((run_directory / "positions.parquet").exists())
         self.assertTrue((run_directory / "trades.parquet").exists())
+        indicators = self.pd.read_parquet(run_directory / "trade_indicators.parquet")
+        zero_order_day = indicators.iloc[0]
+        self.assertTrue(self.pd.isna(zero_order_day["ffr"]))
+        self.assertTrue(self.pd.isna(zero_order_day["pa"]))
+        self.assertTrue(self.pd.isna(zero_order_day["pos"]))
+        self.assertEqual(0.0, zero_order_day["deal_amount"])
+        self.assertEqual(0.0, zero_order_day["value"])
+        self.assertEqual(0, zero_order_day["count"])
         self.assertTrue(result["terminal_liquidation"]["complete"])
         trades = self.pd.read_parquet(run_directory / "trades.parquet")
         self.assertEqual("sell", trades.iloc[-1]["direction"])

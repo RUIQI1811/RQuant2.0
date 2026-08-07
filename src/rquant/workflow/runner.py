@@ -153,7 +153,7 @@ class RollingWorkflowRunner:
             "seed": self.seed,
             "windows": window_manifests,
             "prediction_rows": len(combined),
-            "catalog_fingerprint": get_catalog().fingerprint,
+            "catalog_fingerprint": get_catalog().fingerprint_for(self.factor_set),
             "mlflow_tracking_uri": tracking_uri,
         }
         atomic_write_json(self.run_directory / "walk_forward.json", manifest)
