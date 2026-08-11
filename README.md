@@ -24,13 +24,21 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 对应命令如下。第一次使用时不要一次性全部执行，请按本文各步骤检查上一步产物后再继续：
 
 ```bash
+qlib_alpha158
+wq_alpha101
+gtja191
+
 rquant doctor
 rquant data sync --through 2026-08-04
 rquant data build-qlib
 rquant factors build --factor-set combined
 rquant factors validate --factor-set combined
+rquant factors evaluate --factor-set qlib_alpha158 --horizon 1d \
+  --start 2010-01-01 --end 2026-08-04
+  
 rquant walk-forward --model lgb --horizon 1d --factor-set combined \
   --first-year 2013 --last-year 2026 --through 2026-08-04
+  
 rquant report RUN_ID
 ```
 
@@ -404,11 +412,13 @@ rquant factors evaluate \
 
 默认取因子最高和最低各 20% 的股票。多头端超额定义为 `Top 分组收益 - 沪深 300 收益`，
 空头端超额定义为 `沪深 300 收益 - Bottom 分组收益`；正值分别表示高因子组跑赢基准、低因子组跑输基准。
-年度有效性要求该年有至少 20 个可评估交易日，且对应一端基准调整后的复合年度收益为正。
+年度有效性要求该年有至少 20 个可评估交易日、每个所需口袋都有有效样本，且对应一端基准调整后的
+等权口袋年度收益为正。
 IC、Rank IC、ICIR 和 Rank ICIR 同时保留为诊断，但不单独决定年度有效性。`1d` 标签为下一交易日
 开盘到再下一交易日开盘的收益，`5d` 标签为下一交易日开盘到第六个交易日开盘的收益，`20d` 标签为
-下一交易日开盘到第 21 个交易日开盘的收益。使用 `5d` 或 `20d` 标签时分别每 5 或 20 个交易日选取一个
-非重叠评估锚点。
+下一交易日开盘到第 21 个交易日开盘的收益。三个期限都会在每个交易日产生评估结果；`5d` 和 `20d`
+分别使用 5 个和 20 个等资金口袋错峰持有，每天只轮到一个口袋按当日因子排序换仓。每个口袋内部按
+持有期复利不重叠收益，全部口袋的终值再等权合并，避免把重叠窗口当成同一笔资金重复复利。
 
 输出写入该次 `runs/<run-id>/`：
 
@@ -420,8 +430,9 @@ annual_effectiveness.csv
 ```
 
 `annual_effectiveness.csv` 的 `effective_side` 会标记为 `long`、`short`、`both`、`neither` 或
-`insufficient_data`；`dominant_side` 表示两端均有效时贡献更大的一端。多空端结果只用于因子诊断，
-最终交易结论仍以包含 A 股交易约束的 long-only 组合回测为准。
+`insufficient_data`；`dominant_side` 表示两端均有效时贡献更大的一端。`factor_daily.parquet` 的
+`pocket` 列记录每日轮值口袋，汇总文件中的 `pocket_count` 与 `required_pockets` 用于核对口袋覆盖。
+多空端结果只用于因子诊断，最终交易结论仍以包含 A 股交易约束的 long-only 组合回测为准。
 
 ## 7. 执行滚动训练与样本外预测
 

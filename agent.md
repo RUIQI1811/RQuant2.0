@@ -72,6 +72,7 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - `config/default.yaml`：默认研究和执行参数；
 - `data/raw/`：不可变的 Tushare 分区、分区级清单及总同步清单；
 - `data/canonical/`：标准化、可审计的日线数据；
+- `data/canonical/reference/`：从原始分区构建的 point-in-time 参考序列，包括 GTJA191 使用的沪深 300 日线；
 - `data/qlib/`：Qlib provider；
 - `data/factors/`：按因子集和年份分区的因子结果；
 - `data/cache/`：因子执行缓存（当前主要为 KunQuant 编译缓存）；
@@ -102,6 +103,8 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 新增因子库应实现 `FactorLibrary` 或 `PanelFactorLibrary`，并只通过
   `src/rquant/factors/libraries/registry.py` 注册；CLI 的 `--factor-set` 选项、目录和执行后端应由注册表派生，
   不要在 CLI、加载器和引擎中重复硬编码新名称；
+- 一个组合因子集内的库必须使用同一执行后端：全部为 `kunquant` 或全部为 `panel`；当前通用引擎
+  不支持在同一 factor set 中混合两种后端；
 - KunQuant 因子优先组合其公共算子，只有现有算子无法表达的最小能力才可加入 `extensions/kunquant.py`；
   Pandas 面板算子必须明确行是交易日、列是证券，并锁定窗口、NaN、排名和回归语义；
 - 从第三方迁入或改写公式时，必须保留来源、版本、修改边界和许可证文本，并同步更新
@@ -131,11 +134,18 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   的 259 列，不得因注册 GTJA191 或自定义库而隐式扩容；若要组合新库，应注册一个新的、名称稳定的因子集；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
-- `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖标准数据中的沪深 300 指数序列。参考输入的路径、
-  选择结果和文件哈希必须写入因子清单；外部输入只能通过 `--external-input NAME=PATH` 显式提供，且路径
-  必须位于项目根目录内；
+- `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖 `data/canonical/reference/index_daily.parquet`
+  中的沪深 300 序列；引擎优先选择 `000300.SH`，缺失时才选 `399300.SZ`，并把参考文件哈希写入
+  因子清单；
+- 可选风格收益文件只能使用 `--external-input style_factors=PROJECT_LOCAL_PATH` 显式提供，且路径必须位于
+  项目根目录内。仅提供该文件不会自动把 `gtja_030` 加回公开构建目录；还需同时更新注册契约和回归测试；
 - 目录指纹按所选 factor set 计算，执行清单还必须记录库实现指纹、后端、标准数据指纹和外部参考输入；
   不能用全目录指纹替代某一因子集的契约，也不能复用实现指纹已过期的历史产物；
+- `factors build --start/--end` 会在 staging 目录完成计算后原子替换整个
+  `data/factors/<factor-set>/`，不是对既有年度分区做增量追加；限定日期诊断也会缩短正式产物覆盖区间，
+  未经用户明确授权不得在现有完整因子库上执行；
+- 因子构建会同时保留 staging 输出与临时 memmap，并要求空闲空间至少为原始输出体积的两倍加 1 GiB；
+  启动前必须核对磁盘空间，且不得并发写入同一 factor set；
 - NaN、Inf、常数截面、零方差和极大有限值必须被显式处理，不能让相关系数或评估结果静默失真；
 - IC、多空分组收益只用于因子诊断；最终可交易结论以受约束的 long-only 回测为准。
 
@@ -173,6 +183,26 @@ python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); prin
 当前预期为总目录 `449`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
 `combined=259`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
+复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
+标准数据的校验不代替这一步：
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+from rquant.factors.engine import FactorBuildConfig, create_factor_engine
+
+for factor_set in ("combined", "gtja191"):
+    path = Path("data/factors") / factor_set / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    current = create_factor_engine(Path("data/cache"), FactorBuildConfig(factor_set=factor_set))
+    print(factor_set, manifest.get("compilation_fingerprint"), current.compilation_fingerprint())
+PY
+```
+
+两个指纹必须一致；缺失或不一致时，该产物只能作为历史结果保留，不得作为当前代码的可复用因子库。
+
 完整快速测试：
 
 ```bash
@@ -196,6 +226,9 @@ rquant factors validate --factor-set gtja191
 rquant walk-forward --model lgb --horizon 1d --factor-set combined
 rquant report RUN_ID
 ```
+
+上述任何 `factors build` 都会替换同名 factor set 的完整现有目录；`--start/--end` 只是缩小新产物的日期范围，
+不会创建独立诊断目录。
 
 获得授权启动长任务后：
 

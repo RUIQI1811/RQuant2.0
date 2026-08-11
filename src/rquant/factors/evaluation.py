@@ -55,10 +55,9 @@ class FactorEvaluator:
     def run(self, *, start: Any, end: Any) -> dict[str, Any]:
         try:
             import pandas as pd
+            import qlib
             from qlib.constant import REG_CN
             from qlib.data import D
-
-            import qlib
         except ImportError as exc:
             raise DependencyError(
                 "pandas, pyarrow, NumPy and pyqlib==0.9.7 are required for factor evaluation"
@@ -82,8 +81,7 @@ class FactorEvaluator:
         ).normalize()
         if calendar.empty:
             raise DataContractError("No Qlib trading dates in the requested factor-evaluation range")
-        anchor_step = HORIZON_STEPS[self.config.horizon]
-        anchor_dates = set(calendar[::anchor_step])
+        holding_period = HORIZON_STEPS[self.config.horizon]
         daily_parts = []
         for partition in partitions:
             year = int(partition.parent.name.removeprefix("year="))
@@ -92,9 +90,7 @@ class FactorEvaluator:
             print(f"factor evaluation: reading year={year}", file=sys.stderr, flush=True)
             frame = pd.read_parquet(partition, columns=["datetime", "instrument", *expected])
             frame["datetime"] = pd.to_datetime(frame["datetime"]).dt.normalize()
-            frame = frame[
-                frame["datetime"].between(start_timestamp, end_timestamp) & frame["datetime"].isin(anchor_dates)
-            ]
+            frame = frame[frame["datetime"].between(start_timestamp, end_timestamp)]
             if frame.empty:
                 continue
             partition_start = frame["datetime"].min()
@@ -131,10 +127,12 @@ class FactorEvaluator:
         if not daily_parts:
             raise DataContractError("No factor observations in the requested evaluation range")
         daily = pd.concat(daily_parts, ignore_index=True).sort_values(["factor", "datetime"]).reset_index(drop=True)
+        daily = assign_staggered_pockets(daily, calendar, holding_period=holding_period)
         summary, annual = summarize_effectiveness(
             daily,
             expected,
             min_effective_days=self.config.min_effective_days,
+            holding_period=holding_period,
         )
         self.output_directory.mkdir(parents=True, exist_ok=True)
         daily_path = self.output_directory / "factor_daily.parquet"
@@ -154,7 +152,10 @@ class FactorEvaluator:
             "min_effective_days": self.config.min_effective_days,
             "start": str(daily["datetime"].min().date()),
             "end": str(daily["datetime"].max().date()),
-            "anchor_step": anchor_step,
+            "anchor_step": 1,
+            "holding_period": holding_period,
+            "pocket_count": holding_period,
+            "evaluation_method": "staggered_pockets_v1",
             "factor_count": len(expected),
             "daily_rows": len(daily),
             "annual_rows": len(annual),
@@ -163,12 +164,17 @@ class FactorEvaluator:
             "side_definitions": {
                 "long_excess_daily": "top_quantile_return - benchmark_return",
                 "short_excess_daily": "benchmark_return - bottom_quantile_return",
-                "annual_long_excess": "compounded_top_return - compounded_benchmark_return",
-                "annual_short_excess": "compounded_benchmark_return - compounded_bottom_return",
+                "annual_long_excess": "equal_weight_pocket_top_return - equal_weight_pocket_benchmark_return",
+                "annual_short_excess": "equal_weight_pocket_benchmark_return - equal_weight_pocket_bottom_return",
             },
+            "portfolio_aggregation": (
+                "Each trading date is assigned to one of holding_period equal-capital pockets. Each pocket compounds "
+                "its non-overlapping holding-period returns; pocket terminal wealth is then combined at equal weight."
+            ),
             "effectiveness_rule": (
-                "A side is effective when it has at least min_effective_days and its benchmark-adjusted "
-                "compounded period return is positive. IC and Rank IC remain diagnostics."
+                "A side is effective when it has at least min_effective_days, every required pocket has a valid "
+                "return, and its benchmark-adjusted equal-weight pocket return is positive. IC and Rank IC remain "
+                "diagnostics."
             ),
             "artifacts": {
                 daily_path.name: sha256_file(daily_path),
@@ -264,11 +270,38 @@ def evaluate_factor_frame(
     return pd.DataFrame(output)
 
 
+def assign_staggered_pockets(daily: Any, calendar: Any, *, holding_period: int) -> Any:
+    """Assign every evaluated trading date to one of the equal-capital staggered pockets."""
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise DependencyError("pandas is required for factor evaluation") from exc
+    if holding_period < 1:
+        raise ValueError("holding_period must be positive")
+    if "datetime" not in daily.columns:
+        raise DataContractError("Factor-evaluation frame is missing column: datetime")
+    normalized_calendar = pd.DatetimeIndex(calendar).normalize()
+    if normalized_calendar.empty:
+        raise DataContractError("Cannot assign staggered pockets without trading dates")
+    if normalized_calendar.has_duplicates:
+        raise DataContractError("Trading calendar contains duplicate dates")
+    pockets = {timestamp: index % holding_period + 1 for index, timestamp in enumerate(normalized_calendar)}
+    result = daily.copy()
+    result["datetime"] = pd.to_datetime(result["datetime"]).dt.normalize()
+    result["pocket"] = result["datetime"].map(pockets)
+    if result["pocket"].isna().any():
+        missing = result.loc[result["pocket"].isna(), "datetime"].min()
+        raise DataContractError(f"Factor-evaluation date is absent from the Qlib trading calendar: {missing.date()}")
+    result["pocket"] = result["pocket"].astype(int)
+    return result
+
+
 def summarize_effectiveness(
     daily: Any,
     factor_names: list[str] | tuple[str, ...],
     *,
     min_effective_days: int,
+    holding_period: int,
 ) -> tuple[Any, Any]:
     try:
         import pandas as pd
@@ -276,6 +309,10 @@ def summarize_effectiveness(
         raise DependencyError("pandas is required for factor evaluation") from exc
     if min_effective_days < 1:
         raise ValueError("min_effective_days must be positive")
+    if holding_period < 1:
+        raise ValueError("holding_period must be positive")
+    if "pocket" not in daily.columns:
+        raise DataContractError("Factor-evaluation frame is missing column: pocket")
     frame = daily.copy()
     frame["datetime"] = pd.to_datetime(frame["datetime"])
     frame["year"] = frame["datetime"].dt.year
@@ -283,13 +320,17 @@ def summarize_effectiveness(
     annual_rows = []
     for factor in factor_names:
         factor_frame = frame[frame["factor"].eq(factor)]
-        summary_rows.append({"factor": factor, **_aggregate_period(factor_frame, min_effective_days)})
+        summary_rows.append(
+            {"factor": factor, **_aggregate_period(factor_frame, min_effective_days, holding_period)}
+        )
         for year, group in factor_frame.groupby("year", sort=True):
-            annual_rows.append({"factor": factor, "year": int(year), **_aggregate_period(group, min_effective_days)})
+            annual_rows.append(
+                {"factor": factor, "year": int(year), **_aggregate_period(group, min_effective_days, holding_period)}
+            )
     return pd.DataFrame(summary_rows), pd.DataFrame(annual_rows)
 
 
-def _aggregate_period(frame: Any, min_effective_days: int) -> dict[str, Any]:
+def _aggregate_period(frame: Any, min_effective_days: int, holding_period: int) -> dict[str, Any]:
     import numpy as np
 
     def mean_and_ir(column: str) -> tuple[float, float, int]:
@@ -303,14 +344,30 @@ def _aggregate_period(frame: Any, min_effective_days: int) -> dict[str, Any]:
     ic_mean, icir, ic_days = mean_and_ir("ic")
     rank_ic_mean, rank_icir, rank_ic_days = mean_and_ir("rank_ic")
     returns = frame.loc[
-        :, ["datetime", "top_return", "benchmark_return", "bottom_return", "long_excess", "short_excess"]
+        :, ["datetime", "pocket", "top_return", "benchmark_return", "bottom_return", "long_excess", "short_excess"]
     ]
     returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
     days = len(returns)
+    pocket_count = int(returns["pocket"].nunique()) if days else 0
     if days:
-        top_return = _compound(np, returns["top_return"].to_numpy(dtype=float))
-        benchmark_return = _compound(np, returns["benchmark_return"].to_numpy(dtype=float))
-        bottom_return = _compound(np, returns["bottom_return"].to_numpy(dtype=float))
+        invalid_pockets = returns.loc[
+            ~returns["pocket"].isin(range(1, holding_period + 1)),
+            "pocket",
+        ]
+        if len(invalid_pockets):
+            raise DataContractError(f"Pocket is outside 1..{holding_period}: {invalid_pockets.iloc[0]}")
+        pocket_returns = []
+        for _, pocket in returns.sort_values("datetime").groupby("pocket", sort=True):
+            pocket_returns.append(
+                (
+                    _compound(np, pocket["top_return"].to_numpy(dtype=float)),
+                    _compound(np, pocket["benchmark_return"].to_numpy(dtype=float)),
+                    _compound(np, pocket["bottom_return"].to_numpy(dtype=float)),
+                )
+            )
+        top_return = float(np.mean([value[0] for value in pocket_returns]))
+        benchmark_return = float(np.mean([value[1] for value in pocket_returns]))
+        bottom_return = float(np.mean([value[2] for value in pocket_returns]))
         long_excess = top_return - benchmark_return
         short_excess = benchmark_return - bottom_return
         long_positive_ratio = float((returns["long_excess"] > 0.0).mean())
@@ -318,7 +375,7 @@ def _aggregate_period(frame: Any, min_effective_days: int) -> dict[str, Any]:
     else:
         top_return = benchmark_return = bottom_return = long_excess = short_excess = float("nan")
         long_positive_ratio = short_positive_ratio = float("nan")
-    sufficient = days >= min_effective_days
+    sufficient = days >= min_effective_days and pocket_count == holding_period
     long_effective = bool(sufficient and np.isfinite(long_excess) and long_excess > 0.0)
     short_effective = bool(sufficient and np.isfinite(short_excess) and short_excess > 0.0)
     if not sufficient:
@@ -343,6 +400,8 @@ def _aggregate_period(frame: Any, min_effective_days: int) -> dict[str, Any]:
         "rank_ic_mean": rank_ic_mean,
         "rank_icir": rank_icir,
         "return_days": days,
+        "pocket_count": pocket_count,
+        "required_pockets": holding_period,
         "top_return": top_return,
         "benchmark_return": benchmark_return,
         "bottom_return": bottom_return,
