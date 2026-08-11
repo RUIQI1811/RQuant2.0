@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import subprocess
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from rquant.cli import LOCKED_DEPENDENCIES, build_parser, main
+from rquant.cli import LOCKED_DEPENDENCIES, _resolve_report_run_directory, _run, build_parser, main
+from rquant.config import ProjectPaths
+from rquant.errors import DataContractError
 
 
 class CliTests(unittest.TestCase):
@@ -28,6 +33,83 @@ class CliTests(unittest.TestCase):
         for argv in cases:
             with self.subTest(argv=argv):
                 self.assertTrue(callable(parser.parse_args(argv).handler))
+
+    def test_only_factor_evaluate_and_walk_forward_have_run_categories(self) -> None:
+        parser = build_parser()
+        factor_args = parser.parse_args(
+            ["factors", "evaluate", "--factor-set", "combined", "--horizon", "20d"]
+        )
+        walk_args = parser.parse_args(
+            ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "combined"]
+        )
+        doctor_args = parser.parse_args(["doctor", "--skip-permission-check"])
+
+        self.assertEqual("factors-evaluate", factor_args.run_category)
+        self.assertEqual("walk-forward", walk_args.run_category)
+        self.assertFalse(hasattr(doctor_args, "run_category"))
+
+    def test_run_uses_category_beneath_configured_runs_root(self) -> None:
+        with TemporaryDirectory() as temporary:
+            paths = ProjectPaths.from_root(temporary, runs_root="custom-runs")
+            args = argparse.Namespace(run_category="walk-forward")
+            output = io.StringIO()
+            with (
+                patch("rquant.cli._config", return_value=({}, paths)),
+                patch("rquant.cli._dependency_versions", return_value={}),
+                redirect_stdout(output),
+            ):
+                code = _run(args, lambda run, config, project_paths: {"ok": True})
+
+            payload = json.loads(output.getvalue())
+            run_directory = Path(payload["run_directory"])
+            self.assertEqual(0, code)
+            self.assertEqual(paths.runs / "walk-forward", run_directory.parent)
+            self.assertTrue((run_directory / "run.json").is_file())
+
+    def test_run_without_category_remains_directly_beneath_runs_root(self) -> None:
+        with TemporaryDirectory() as temporary:
+            paths = ProjectPaths.from_root(temporary, runs_root="custom-runs")
+            output = io.StringIO()
+            with (
+                patch("rquant.cli._config", return_value=({}, paths)),
+                patch("rquant.cli._dependency_versions", return_value={}),
+                redirect_stdout(output),
+            ):
+                code = _run(argparse.Namespace(), lambda run, config, project_paths: {"ok": True})
+
+            payload = json.loads(output.getvalue())
+            run_directory = Path(payload["run_directory"])
+            self.assertEqual(0, code)
+            self.assertEqual(paths.runs, run_directory.parent)
+
+    def test_report_run_resolution_prefers_categorized_directory(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runs_root = Path(temporary)
+            categorized = runs_root / "walk-forward" / "same-id"
+            legacy = runs_root / "same-id"
+            categorized.mkdir(parents=True)
+            legacy.mkdir()
+
+            self.assertEqual(categorized, _resolve_report_run_directory(runs_root, "same-id"))
+
+    def test_report_run_resolution_falls_back_to_legacy_directory(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runs_root = Path(temporary)
+            legacy = runs_root / "legacy-id"
+            legacy.mkdir()
+
+            self.assertEqual(legacy, _resolve_report_run_directory(runs_root, "legacy-id"))
+
+    def test_report_run_resolution_rejects_missing_run_without_creating_paths(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runs_root = Path(temporary)
+            expected = runs_root / "walk-forward" / "missing-id"
+
+            with self.assertRaises(DataContractError) as caught:
+                _resolve_report_run_directory(runs_root, "missing-id")
+
+            self.assertEqual(f"Run does not exist: {expected}", str(caught.exception))
+            self.assertFalse(expected.exists())
 
     def test_catalog_json_is_machine_readable(self) -> None:
         output = io.StringIO()

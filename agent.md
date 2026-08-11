@@ -76,7 +76,9 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - `data/qlib/`：Qlib provider；
 - `data/factors/`：按因子集和年份分区的因子结果；
 - `data/cache/`：因子执行缓存（当前主要为 KunQuant 编译缓存）；
-- `runs/<run-id>/`：运行清单、日志、预测、回测与报告产物；
+- `runs/factors-evaluate/<run-id>/`：因子评估运行清单、日志和评估产物；
+- `runs/walk-forward/<run-id>/`：滚动训练运行清单、日志、预测、回测与报告产物；
+- `runs/<run-id>/`：其他命令和旧版运行的清单、日志与产物；
 - `THIRD_PARTY_NOTICES.md` 与 `licenses/`：迁入公式的来源、修改说明和第三方许可证；
 - Qlib 上游源码不属于本工程；需要查阅时使用独立于项目根目录的临时或同级 checkout。
 
@@ -90,7 +92,8 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 检查工作区是否有同名文件、未完成运行或用户正在进行的修改；
 - 当前项目根目录是 Git 仓库；先用 `git status --short` 和针对性 `git diff` 区分用户已有改动与本次改动，
   不得覆盖、回退或顺手整理无关变更，也不得另行初始化 Git；
-- 诊断失败运行时，优先查看 `runs/<run-id>/run.json` 与 `run.log`，同时核对命令参数、输入指纹、状态和输出文件；
+- 诊断失败运行时，优先查看命令 stdout 返回的 `run_directory` 中的 `run.json` 与 `run.log`，同时核对命令参数、
+  输入指纹、状态和输出文件；
 - 只修改完成任务所需的最小范围，保留所有无关文件和用户产物。
 
 ### 修改时
@@ -241,7 +244,7 @@ rquant report RUN_ID
 - 使用 CLI，而不是临时脚本直接调用内部 runner；
 - 明确记录完整参数与目标日期；
 - 续跑数据同步时优先复用已验证分区，并分别核对 `cached_artifacts` 与 `fetched_artifacts`，不得把进度条到达 100% 单独当作完成证据；
-- 通过 `runs/<run-id>/run.json` 的 `status`、`inputs`、`outputs` 和 `error` 判断结果；
+- 通过 stdout 返回的 `run_directory/run.json` 中的 `status`、`inputs`、`outputs` 和 `error` 判断结果；
 - 同时核对 `run.log` 和约定产物，不能仅凭目录存在判断成功；
 - 失败后先诊断已有运行，不要未经确认直接重新执行昂贵任务。
 

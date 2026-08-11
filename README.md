@@ -33,8 +33,8 @@ rquant data sync --through 2026-08-04
 rquant data build-qlib
 rquant factors build --factor-set combined
 rquant factors validate --factor-set combined
-rquant factors evaluate --factor-set qlib_alpha158 --horizon 1d \
-  --start 2010-01-01 --end 2026-08-04
+rquant factors evaluate --factor-set qlib_alpha158 \
+  --horizon 1d --start 2010-01-01 --end 2026-08-04
   
 rquant walk-forward --model lgb --horizon 1d --factor-set combined \
   --first-year 2013 --last-year 2026 --through 2026-08-04
@@ -144,7 +144,7 @@ rquant doctor --skip-permission-check
 rquant --config config/你的配置.yaml doctor
 ```
 
-运行时会把完整配置及其指纹写入 `runs/<run-id>/run.json`，因此不要依赖未记录的临时参数。
+运行时会把完整配置及其指纹写入 stdout 返回的 `run_directory/run.json`，因此不要依赖未记录的临时参数。
 
 ## 4. 同步原始数据
 
@@ -436,7 +436,7 @@ IC、Rank IC、ICIR 和 Rank ICIR 同时保留为诊断，但不单独决定年�
 分别使用 5 个和 20 个等资金口袋错峰持有，每天只轮到一个口袋按当日因子排序换仓。每个口袋内部按
 持有期复利不重叠收益，全部口袋的终值再等权合并，避免把重叠窗口当成同一笔资金重复复利。
 
-输出写入该次 `runs/<run-id>/`：
+输出写入该次 `runs/factors-evaluate/<run-id>/`：
 
 ```text
 factor_evaluation.json
@@ -488,7 +488,7 @@ rquant walk-forward \
 命令完成后会在 stdout 返回 `run_id`。输出目录结构如下：
 
 ```text
-runs/<run-id>/
+runs/walk-forward/<run-id>/
 ├── run.json
 ├── run.log
 ├── mlflow.db
@@ -504,8 +504,8 @@ runs/<run-id>/
 检查训练结果：
 
 ```bash
-python -m json.tool runs/RUN_ID/run.json
-python -m json.tool runs/RUN_ID/walk_forward.json
+python -m json.tool runs/walk-forward/RUN_ID/run.json
+python -m json.tool runs/walk-forward/RUN_ID/walk_forward.json
 ```
 
 必须确认：
@@ -526,6 +526,9 @@ python -m json.tool runs/RUN_ID/walk_forward.json
 rquant report RUN_ID
 ```
 
+报告命令优先读取 `runs/walk-forward/RUN_ID/`；如果该目录不存在，会回退读取旧版
+`runs/RUN_ID/`，因此已有滚动训练结果仍可使用。
+
 报告命令使用该运行的样本外预测执行 A 股约束下的 long-only TopkDropout 回测：
 
 - 初始资金 100 万元；
@@ -542,7 +545,7 @@ rquant report RUN_ID
 报告会写回同一个运行目录：
 
 ```text
-runs/<run-id>/
+runs/walk-forward/<run-id>/
 ├── backtest.json
 ├── portfolio.parquet
 ├── positions.parquet
@@ -559,9 +562,9 @@ runs/<run-id>/
 检查：
 
 ```bash
-python -m json.tool runs/RUN_ID/backtest.json
-python -m json.tool runs/RUN_ID/report.json
-sed -n '1,240p' runs/RUN_ID/report.md
+python -m json.tool runs/walk-forward/RUN_ID/backtest.json
+python -m json.tool runs/walk-forward/RUN_ID/report.json
+sed -n '1,240p' runs/walk-forward/RUN_ID/report.md
 ```
 
 重点核对：
@@ -576,25 +579,29 @@ sed -n '1,240p' runs/RUN_ID/report.md
 
 ## 9. 运行清单与状态判断
 
-所有会改变数据或产生研究结果的主流程命令都会创建：
+所有会改变数据或产生研究结果的主流程命令都会创建 `run.json` 和 `run.log`。两个研究命令使用分类目录，
+其他命令和旧版运行仍使用根目录：
 
 ```text
+runs/factors-evaluate/<run-id>/run.json
+runs/walk-forward/<run-id>/run.json
 runs/<run-id>/run.json
-runs/<run-id>/run.log
 ```
 
 查看最近运行：
 
 ```bash
-ls -td runs/* | head
+find runs -name run.json -exec ls -t {} + | head
 ```
 
 查看指定运行：
 
 ```bash
-python -m json.tool runs/RUN_ID/run.json
-tail -n 100 runs/RUN_ID/run.log
+python -m json.tool runs/walk-forward/RUN_ID/run.json
+tail -n 100 runs/walk-forward/RUN_ID/run.log
 ```
+
+因子评估把上述 `walk-forward` 换成 `factors-evaluate`；其他命令和旧版运行省略该分类层级。
 
 `run.json` 的关键字段：
 
@@ -678,8 +685,8 @@ data/raw/sync_manifest.json
   → data/canonical/manifest.json
   → data/qlib/manifest.json
   → data/factors/<factor-set>/manifest.json
-  → runs/<run-id>/walk_forward.json
-  → runs/<run-id>/backtest.json
+  → runs/walk-forward/<run-id>/walk_forward.json
+  → runs/walk-forward/<run-id>/backtest.json
 ```
 
 不要手工把清单状态改成 `complete`。

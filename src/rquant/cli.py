@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     factor_evaluate.add_argument("--quantile", type=float, default=0.2)
     factor_evaluate.add_argument("--min-cross-section", type=int, default=20)
     factor_evaluate.add_argument("--min-effective-days", type=int, default=20)
-    factor_evaluate.set_defaults(handler=_factor_evaluate)
+    factor_evaluate.set_defaults(handler=_factor_evaluate, run_category="factors-evaluate")
 
     walk = commands.add_parser("walk-forward", help="Run yearly three-year rolling out-of-sample training")
     walk.add_argument("--model", choices=("lgb", "double-ensemble"), required=True)
@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--first-year", type=int)
     walk.add_argument("--last-year", type=int)
     walk.add_argument("--through", type=_date)
-    walk.set_defaults(handler=_walk_forward)
+    walk.set_defaults(handler=_walk_forward, run_category="walk-forward")
 
     report = commands.add_parser("report", help="Run portfolio backtest and build the report for a walk-forward run")
     report.add_argument("run_id")
@@ -156,7 +156,9 @@ def _run(
     action: Callable[[RunContext, dict[str, Any], ProjectPaths], dict[str, Any]],
 ) -> int:
     config, paths = _config(args)
-    run = RunContext(paths.runs, list(sys.argv if sys.argv else ["rquant"]), config)
+    run_category = getattr(args, "run_category", None)
+    runs_root = paths.runs / run_category if run_category else paths.runs
+    run = RunContext(runs_root, list(sys.argv if sys.argv else ["rquant"]), config)
     run.add_input("dependencies", _dependency_versions())
     try:
         result = action(run, config, paths)
@@ -479,11 +481,20 @@ def _walk_forward(args: argparse.Namespace) -> int:
     return _run(args, action)
 
 
+def _resolve_report_run_directory(runs_root: str | Path, run_id: str) -> Path:
+    root = Path(runs_root)
+    categorized = root / "walk-forward" / run_id
+    if categorized.is_dir():
+        return categorized
+    legacy = root / run_id
+    if legacy.is_dir():
+        return legacy
+    raise DataContractError(f"Run does not exist: {categorized}")
+
+
 def _report(args: argparse.Namespace) -> int:
     config, paths = _config(args)
-    run_directory = paths.runs / args.run_id
-    if not run_directory.is_dir():
-        raise DataContractError(f"Run does not exist: {run_directory}")
+    run_directory = _resolve_report_run_directory(paths.runs, args.run_id)
     backtest = config.get("backtest", {})
     portfolio = PortfolioBacktestRunner(
         qlib_root=paths.qlib,
