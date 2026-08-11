@@ -15,8 +15,51 @@ class KunQuantSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             alpha158, _ = KunQuantFactorEngine(temporary, FactorBuildConfig(factor_set="qlib_alpha158")).build_graph()
             alpha101, _ = KunQuantFactorEngine(temporary, FactorBuildConfig(factor_set="wq_alpha101")).build_graph()
+            alpha360, _ = KunQuantFactorEngine(temporary, FactorBuildConfig(factor_set="qlib_alpha360")).build_graph()
         self.assertGreater(len(alpha158.ops), 158)
         self.assertGreater(len(alpha101.ops), 101)
+        self.assertGreater(len(alpha360.ops), 360)
+
+    @unittest.skipUnless(shutil.which("clang++"), "clang++ is required for KunQuant compilation")
+    def test_alpha360_graph_compiles_and_preserves_locked_lag_and_field_order(self) -> None:
+        import numpy as np
+
+        from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine
+
+        rows, columns = 70, 3
+        day = np.arange(rows, dtype=np.float64)[:, None]
+        security = np.arange(columns, dtype=np.float64)[None, :]
+        close = 100.0 + day * 2.0 + security
+        open_ = close + 0.25
+        high = close + 1.0
+        low = close - 1.0
+        vwap = close + 0.5
+        volume = 1_000.0 + day * 10.0 + security
+        inputs = {
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "vwap": vwap,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = KunQuantFactorEngine(
+                temporary,
+                FactorBuildConfig(factor_set="qlib_alpha360", workers=1),
+            )
+            output = engine.run(inputs)
+
+        self.assertEqual(tuple(f"a360_{ordinal:03d}" for ordinal in range(1, 361)), tuple(output))
+        self.assertTrue(np.isnan(output["a360_001"][:59]).all())
+        np.testing.assert_allclose(output["a360_001"][59:], close[:-59] / close[59:])
+        np.testing.assert_allclose(output["a360_060"], close / close)
+        np.testing.assert_allclose(output["a360_061"][59:], open_[:-59] / close[59:])
+        np.testing.assert_allclose(output["a360_120"], open_ / close)
+        np.testing.assert_allclose(output["a360_241"][59:], vwap[:-59] / close[59:])
+        np.testing.assert_allclose(output["a360_300"], vwap / close)
+        np.testing.assert_allclose(output["a360_301"][59:], volume[:-59] / (volume[59:] + 1e-12))
+        np.testing.assert_allclose(output["a360_360"], volume / (volume + 1e-12))
 
     @unittest.skipUnless(shutil.which("clang++"), "clang++ is required for KunQuant compilation")
     def test_combined_graph_compiles_and_runs_all_259_outputs(self) -> None:

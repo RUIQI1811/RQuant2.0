@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from rquant.errors import FactorContractError
+from typing import Any, Mapping
+
+from rquant.errors import DependencyError, FactorContractError
 from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 
 CATALOG_VERSION = 1
@@ -53,3 +55,19 @@ class QlibAlpha360Library(FactorLibrary):
                 zip(ALPHA360_SOURCE_NAMES, ALPHA360_SOURCE_EXPRESSIONS, strict=True), 1
             )
         )
+
+    def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        try:
+            from KunQuant.ops import BackRef
+        except ImportError as exc:
+            raise DependencyError("KunQuant==0.1.11 is required to build Alpha360") from exc
+
+        outputs: dict[str, Any] = {}
+        for label, field in _GROUPS:
+            denominator = inputs["volume"] + 1e-12 if field == "volume" else inputs["close"]
+            for lag in _LAGS:
+                numerator = BackRef(inputs[field], lag) if lag else inputs[field]
+                outputs[f"{label}{lag}"] = numerator / denominator
+        if tuple(outputs) != ALPHA360_SOURCE_NAMES:
+            raise FactorContractError("Local Alpha360 output order differs from the locked catalog")
+        return outputs
