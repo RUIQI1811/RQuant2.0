@@ -30,7 +30,8 @@ class FactorCatalogTests(unittest.TestCase):
         self.assertEqual(source_names, [spec.source_name for spec in specs])
         self.assertEqual(expressions, [spec.formula for spec in specs])
 
-    # Break caught: registering standalone Alpha360 accidentally changes the locked combined Alpha158-plus-Alpha101 bundle.
+    # Break caught: registering standalone Alpha360 accidentally changes the locked combined
+    # Alpha158-plus-Alpha101 bundle.
     def test_alpha360_does_not_expand_combined(self) -> None:
         catalog = get_catalog()
         self.assertEqual(809, len(catalog.specs))
