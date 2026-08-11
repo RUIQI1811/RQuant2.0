@@ -27,6 +27,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 qlib_alpha158
 wq_alpha101
 gtja191
+qlib_alpha360
 
 rquant doctor
 rquant data sync --through 2026-08-04
