@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算 Alpha158 与 Alpha101 因子；审计过的 Pandas 面板后端计算 GTJA191。
+- KunQuant 编译并计算 Alpha158、Alpha101 与 Alpha360 因子；审计过的 Pandas 面板后端计算 GTJA191。
 
 完整工作流概览
 
@@ -108,7 +108,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - `clang++`；
 - Tushare token；
-- 449 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191）；
+- 809 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -246,6 +246,7 @@ rquant factors catalog
 rquant factors catalog --factor-set qlib_alpha158
 rquant factors catalog --factor-set wq_alpha101
 rquant factors catalog --factor-set gtja191
+rquant factors catalog --factor-set qlib_alpha360
 rquant factors catalog --factor-set combined
 ```
 
@@ -261,17 +262,19 @@ rquant factors catalog --factor-set combined --format csv --output factor_catalo
 - `qlib_alpha158`：`a158_001` 至 `a158_158`，共 158 列；
 - `wq_alpha101`：`a101_001` 至 `a101_101`，共 101 列；
 - `gtja191`：`gtja_001` 至 `gtja_191`（暂时排除 `gtja_030`），共 190 列；
+- `qlib_alpha360`：`a360_001` 至 `a360_360`，共 360 列；它是 Qlib Alpha360 的六组归一化
+  OHLC、VWAP 与成交量字段各取 60 个滞后期，而非 360 条手工设计的独立信号；
 - `combined`：先排列 158 列 Alpha158，再排列 101 列 Alpha101，共 259 列。
 
-`combined` 保持原有 259 列契约，不会隐式加入 GTJA191。这样已有模型和历史产物的列数、顺序与指纹不会
-因新增因子库而静默改变。
+`combined` 保持原有 259 列契约，只包含 Alpha158 与 Alpha101，不会隐式加入 GTJA191 或 Alpha360。这样已有
+模型和历史产物的列数、顺序与指纹不会因新增因子库而静默改变。
 
 固定目录保留来源名称、公式标识、序号、最大回看期和实现方式，但模型特征只暴露规范列名。
 
 ### 因子库代码结构
 
-所有可研究的因子公式由 RQuant 自己维护。Alpha158/Alpha101 使用 KunQuant 后端，GTJA191 使用 Pandas
-宽表后端；两者共用目录、清单、年度 Parquet、验证器和下游加载契约：
+所有可研究的因子公式由 RQuant 自己维护。Alpha158/Alpha101/Alpha360 使用 KunQuant 后端，GTJA191 使用
+Pandas 宽表后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约：
 
 ```text
 src/rquant/factors/
@@ -285,11 +288,12 @@ src/rquant/factors/
     ├── registry.py                      # 因子库及组合因子集注册表
     ├── alpha158.py                      # 158 条本地 Alpha158 公式
     ├── alpha101.py                      # 101 条本地 Alpha101 公式
+    ├── alpha360.py                      # 6 个归一化字段各 60 个滞后期的 Alpha360 图
     ├── gtja191.py                       # 完整 GTJA191 提供者与公式语义说明
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
-Alpha158 与 Alpha101 的公式定义均保存在 RQuant 源码中，不从
+Alpha158、Alpha101 与 Alpha360 的公式定义均保存在 RQuant 源码中，不从
 `KunQuant.predefined.Alpha158/Alpha101` 导入。KunQuant 仅提供算子、图优化、C++ 代码生成和运行时；公式变更会
 进入 RQuant 的实现指纹。迁入公式基于 KunQuant 0.1.11 的 Apache-2.0 源码，来源与许可证见
 `THIRD_PARTY_NOTICES.md`。
@@ -366,6 +370,17 @@ rquant factors validate --factor-set gtja191
 实现采用与分子一致的 20 日窗口，并在源码 `GTJA191_FORMULA_NOTES` 中固定这些解释。
 
 ### 构建因子
+
+Alpha360 是独立的因子集；先检查目录，再在明确需要新产物且已确认磁盘空间、无并发写入者后构建：
+
+```bash
+rquant factors catalog --factor-set qlib_alpha360
+rquant factors build --factor-set qlib_alpha360
+rquant factors validate --factor-set qlib_alpha360
+```
+
+完整构建会在完成 staging 后原子替换整个 `data/factors/qlib_alpha360/` 目录，而不是向既有年度分区追加；本文
+不执行该构建。
 
 完整研究通常构建组合因子集：
 

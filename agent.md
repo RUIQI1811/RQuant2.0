@@ -8,8 +8,8 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算 Alpha158、Alpha101 因子；GTJA191 使用独立的 Pandas 面板后端；
-- Alpha158、Alpha101 和 GTJA191 的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
+- KunQuant 用于编译和计算 Alpha158、Alpha101、Alpha360 因子；GTJA191 使用独立的 Pandas 面板后端；
+- Alpha158、Alpha101、Alpha360 和 GTJA191 的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
   不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；
 - 当前工程独立于旧版 RQuant 与 StockTradebyZ，禁止从那些工程隐式导入、复制运行产物或混用环境；
 - 当前工程不内嵌 Qlib 上游源码；运行时只使用 `pyproject.toml` 锁定并安装在 `rquant` 环境中的
@@ -129,9 +129,12 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 指数成分、行业、涨跌停和其他横截面信息必须保持 point-in-time 语义；
 - 标签、特征和股票池必须按同一交易日历对齐，并执行与预测期限相符的 purge；
 - 因子列名和顺序是稳定契约：Alpha158 为 `a158_001` 至 `a158_158`，Alpha101 为 `a101_001` 至
-  `a101_101`，GTJA191 当前为 `gtja_001` 至 `gtja_191` 中除 `gtja_030` 外的 190 列；不得暴露上游原始名称；
-- 当前注册表共有 449 个可构建因子。`combined` 是兼容性因子集，只按顺序包含 Alpha158 与 Alpha101
-  的 259 列，不得因注册 GTJA191 或自定义库而隐式扩容；若要组合新库，应注册一个新的、名称稳定的因子集；
+  `a101_101`，GTJA191 当前为 `gtja_001` 至 `gtja_191` 中除 `gtja_030` 外的 190 列，Alpha360 为
+  `a360_001` 至 `a360_360` 的 360 列；不得暴露上游原始名称。Alpha360 是六组归一化 OHLC、VWAP 与成交量字段
+  各取 60 个滞后期，不是 360 条手工设计信号；
+- 当前注册表共有 809 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+  `qlib_alpha360=360`。`combined` 是兼容性因子集，只按顺序包含 Alpha158 与 Alpha101 的 259 列，
+  不得因注册 GTJA191、Alpha360 或自定义库而隐式扩容；若要组合新库，应注册一个新的、名称稳定的因子集；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖 `data/canonical/reference/index_daily.parquet`
@@ -169,6 +172,7 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 conda activate rquant
 rquant doctor --skip-permission-check
 rquant factors catalog
+rquant factors catalog --factor-set qlib_alpha360
 python -m pytest tests/test_cli.py -q
 python -m pytest tests/test_catalog.py tests/test_factor_libraries.py tests/test_gtja191.py -q
 python -m ruff check src tests
@@ -180,8 +184,8 @@ python -m ruff check src tests
 python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
 ```
 
-当前预期为总目录 `449`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`combined=259`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+当前预期为唯一目录（unique catalog）`809`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+`qlib_alpha360=360`、`combined=259`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：
@@ -223,12 +227,14 @@ rquant factors build --factor-set combined
 rquant factors validate --factor-set combined
 rquant factors build --factor-set gtja191
 rquant factors validate --factor-set gtja191
+rquant factors build --factor-set qlib_alpha360
+rquant factors validate --factor-set qlib_alpha360
 rquant walk-forward --model lgb --horizon 1d --factor-set combined
 rquant report RUN_ID
 ```
 
-上述任何 `factors build` 都会替换同名 factor set 的完整现有目录；`--start/--end` 只是缩小新产物的日期范围，
-不会创建独立诊断目录。
+上述任何 `factors build` 都会替换同名 factor set 的完整现有目录；因此 Alpha360 的完整构建会替换
+`data/factors/qlib_alpha360/`。`--start/--end` 只是缩小新产物的日期范围，不会创建独立诊断目录。
 
 获得授权启动长任务后：
 
