@@ -295,7 +295,8 @@ src/rquant/factors/
 
 Alpha158、Alpha101 与 Alpha360 的公式定义均保存在 RQuant 源码中，不从
 `KunQuant.predefined.Alpha158/Alpha101` 导入。KunQuant 仅提供算子、图优化、C++ 代码生成和运行时；公式变更会
-进入 RQuant 的实现指纹。迁入公式基于 KunQuant 0.1.11 的 Apache-2.0 源码，来源与许可证见
+进入 RQuant 的实现指纹。Alpha158 与 Alpha101 的迁入公式基于 KunQuant 0.1.11 的 Apache-2.0 源码；
+Alpha360 的迁入公式基于 Qlib 0.9.7 的 MIT 源码。两项来源与许可证文件路径均见
 `THIRD_PARTY_NOTICES.md`。
 
 因子公式优先直接组合 KunQuant 公共算子。只有 KunQuant 0.1.11 无法表达的能力才放入

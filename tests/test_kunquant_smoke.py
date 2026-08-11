@@ -35,6 +35,7 @@ class KunQuantSmokeTests(unittest.TestCase):
         low = close - 1.0
         vwap = close + 0.5
         volume = 1_000.0 + day * 10.0 + security
+        volume[0, 0] = 1e-12
         inputs = {
             "open": open_,
             "high": high,
@@ -59,6 +60,7 @@ class KunQuantSmokeTests(unittest.TestCase):
         np.testing.assert_allclose(output["a360_241"][59:], vwap[:-59] / close[59:])
         np.testing.assert_allclose(output["a360_300"], vwap / close)
         np.testing.assert_allclose(output["a360_301"][59:], volume[:-59] / (volume[59:] + 1e-12))
+        self.assertAlmostEqual(float(output["a360_360"][0, 0]), 0.5)
         np.testing.assert_allclose(output["a360_360"], volume / (volume + 1e-12))
 
     @unittest.skipUnless(shutil.which("clang++"), "clang++ is required for KunQuant compilation")
