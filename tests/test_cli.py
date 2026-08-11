@@ -39,6 +39,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual("a101_001", payload["factors"][0]["canonical_name"])
         self.assertEqual("a101_101", payload["factors"][-1]["canonical_name"])
 
+    def test_alpha360_catalog_json_is_machine_readable(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = main(["factors", "catalog", "--factor-set", "qlib_alpha360", "--format", "json"])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(0, code)
+        self.assertEqual(360, len(payload["factors"]))
+        self.assertEqual("a360_001", payload["factors"][0]["canonical_name"])
+        self.assertEqual("a360_360", payload["factors"][-1]["canonical_name"])
+
     def test_doctor_accepts_the_registered_factor_catalog(self) -> None:
         output = io.StringIO()
         clang = subprocess.CompletedProcess(["clang++", "--version"], 0, stdout="Apple clang version fixture\n")
@@ -56,7 +66,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual("ok", payload["status"])
         self.assertTrue(factor_catalog["ok"])
-        self.assertEqual(449, factor_catalog["detail"]["columns"])
+        self.assertEqual(809, factor_catalog["detail"]["columns"])
 
 
 if __name__ == "__main__":
