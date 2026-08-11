@@ -33,10 +33,14 @@ def custom_price_library() -> CustomFactorLibrary:
 
 
 class FactorLibraryRegistryTests(unittest.TestCase):
+    # Break caught: omitting Alpha360 from the default registry leaves callers unable to select its declared inputs.
     def test_default_registry_keeps_locked_factor_sets_and_input_contracts(self) -> None:
         registry = get_library_registry()
 
-        self.assertEqual(("qlib_alpha158", "wq_alpha101", "gtja191", "combined"), registry.factor_sets())
+        self.assertEqual(
+            ("qlib_alpha158", "wq_alpha101", "gtja191", "qlib_alpha360", "combined"),
+            registry.factor_sets(),
+        )
         self.assertEqual(
             ("open", "high", "low", "close", "volume", "amount", "vwap"),
             registry.required_inputs("qlib_alpha158"),
@@ -46,18 +50,24 @@ class FactorLibraryRegistryTests(unittest.TestCase):
             ("open", "high", "low", "close", "volume", "amount", "vwap"),
             registry.required_inputs("gtja191"),
         )
+        self.assertEqual(
+            ("open", "high", "low", "close", "volume", "vwap"),
+            registry.required_inputs("qlib_alpha360"),
+        )
 
+    # Break caught: a local Alpha360 catalog that changes feature count or delegates formula ownership outside RQuant.
     def test_alpha_formulas_are_complete_and_repository_owned(self) -> None:
         from rquant.factors.extensions import kunquant as kunquant_extensions
-        from rquant.factors.libraries import alpha101, alpha158
+        from rquant.factors.libraries import alpha101, alpha158, alpha360
 
         builtin = set(alpha101._BUILTIN_ALPHA101)
         extended = {f"alpha{ordinal:03d}" for ordinal in alpha101.ALPHA101_UPSTREAM_MISSING}
         self.assertFalse(builtin & extended)
         self.assertEqual({f"alpha{ordinal:03d}" for ordinal in range(1, 102)}, builtin | extended)
         self.assertEqual(158, len(alpha158.ALPHA158_SOURCE_NAMES))
+        self.assertEqual(360, len(alpha360.ALPHA360_SOURCE_NAMES))
 
-        for module in (alpha101, alpha158):
+        for module in (alpha101, alpha158, alpha360):
             source = inspect.getsource(module)
             self.assertNotIn("from KunQuant.predefined", source)
             self.assertNotIn("import KunQuant.predefined", source)
@@ -68,7 +78,7 @@ class FactorLibraryRegistryTests(unittest.TestCase):
         self.assertNotIn("class OpBase", extension_source)
 
         registry = get_library_registry()
-        for factor_set in ("qlib_alpha158", "wq_alpha101"):
+        for factor_set in ("qlib_alpha158", "wq_alpha101", "qlib_alpha360"):
             for library in registry.select(factor_set):
                 for spec in library.specs:
                     self.assertTrue(

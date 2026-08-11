@@ -79,12 +79,14 @@ class FactorLibraryRegistry:
 def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.alpha101 import WorldQuantAlpha101Library
     from rquant.factors.libraries.alpha158 import QlibAlpha158Library
+    from rquant.factors.libraries.alpha360 import QlibAlpha360Library
     from rquant.factors.libraries.gtja191 import GTJA191Library
 
     registry = FactorLibraryRegistry()
     registry.register_library(QlibAlpha158Library())
     registry.register_library(WorldQuantAlpha101Library())
     registry.register_library(GTJA191Library())
+    registry.register_library(QlibAlpha360Library())
     registry.register_factor_set("combined", ("qlib_alpha158", "wq_alpha101"))
     return registry
 

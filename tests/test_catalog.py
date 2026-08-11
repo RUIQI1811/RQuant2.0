@@ -16,6 +16,27 @@ class FakeFrame:
 
 
 class FactorCatalogTests(unittest.TestCase):
+    # Break caught: Alpha360 specs that omit, duplicate, or reorder canonical output positions.
+    def test_alpha360_is_strictly_numbered(self) -> None:
+        names = get_catalog().canonical_names("qlib_alpha360")
+        self.assertEqual(tuple(f"a360_{value:03d}" for value in range(1, 361)), names)
+
+    # Break caught: RQuant formula metadata diverging from the locked pyqlib 0.9.7 Alpha360DL source contract.
+    def test_alpha360_source_contract_matches_locked_qlib(self) -> None:
+        from qlib.contrib.data.loader import Alpha360DL
+
+        expressions, source_names = Alpha360DL.get_feature_config()
+        specs = get_catalog().select("qlib_alpha360")
+        self.assertEqual(source_names, [spec.source_name for spec in specs])
+        self.assertEqual(expressions, [spec.formula for spec in specs])
+
+    # Break caught: registering standalone Alpha360 accidentally changes the locked combined Alpha158-plus-Alpha101 bundle.
+    def test_alpha360_does_not_expand_combined(self) -> None:
+        catalog = get_catalog()
+        self.assertEqual(809, len(catalog.specs))
+        self.assertEqual(259, len(catalog.select("combined")))
+
+    # Break caught: Alpha158 specs that omit, duplicate, or reorder canonical output positions.
     def test_alpha158_is_strictly_numbered(self) -> None:
         names = get_catalog().canonical_names("qlib_alpha158")
         self.assertEqual(158, len(names))
