@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
@@ -53,6 +54,25 @@ def atomic_replace_file(temporary: str | Path, destination: str | Path) -> None:
     destination_path = Path(destination)
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     os.replace(Path(temporary), destination_path)
+
+
+def atomic_replace_directory(staging: Path, destination: Path) -> None:
+    """Publish a fully built directory while preserving the previous version on failure."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    try:
+        if destination.exists():
+            backup = Path(tempfile.mkdtemp(prefix=f".{destination.name}.backup.", dir=destination.parent))
+            backup.rmdir()
+            os.replace(destination, backup)
+        os.replace(staging, destination)
+    except BaseException:
+        if backup is not None and backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    else:
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
 
 
 def _json_default(value: Any) -> Any:
