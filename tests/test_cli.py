@@ -34,7 +34,7 @@ class CliTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertTrue(callable(parser.parse_args(argv).handler))
 
-    def test_only_factor_evaluate_and_walk_forward_have_run_categories(self) -> None:
+    def test_research_commands_have_run_categories(self) -> None:
         parser = build_parser()
         factor_args = parser.parse_args(
             ["factors", "evaluate", "--factor-set", "combined", "--horizon", "20d"]
@@ -42,10 +42,12 @@ class CliTests(unittest.TestCase):
         walk_args = parser.parse_args(
             ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "combined"]
         )
+        report_args = parser.parse_args(["report", "run-id"])
         doctor_args = parser.parse_args(["doctor", "--skip-permission-check"])
 
         self.assertEqual("factors-evaluate", factor_args.run_category)
         self.assertEqual("walk-forward", walk_args.run_category)
+        self.assertEqual("report", report_args.run_category)
         self.assertFalse(hasattr(doctor_args, "run_category"))
 
     def test_run_uses_category_beneath_configured_runs_root(self) -> None:
@@ -111,6 +113,27 @@ class CliTests(unittest.TestCase):
             self.assertEqual(f"Run does not exist: {expected}", str(caught.exception))
             self.assertFalse(expected.exists())
 
+    def test_through_comes_from_arguments_or_config_never_the_clock(self) -> None:
+        from datetime import date
+
+        from rquant.cli import _through
+
+        self.assertEqual(
+            date(2024, 1, 5), _through(argparse.Namespace(through=date(2024, 1, 5)), {"data": {"through": None}})
+        )
+        configured = {"data": {"through": "2024-02-01"}}
+        self.assertEqual(date(2024, 2, 1), _through(argparse.Namespace(through=None), configured))
+        with self.assertRaisesRegex(ValueError, "--through is required"):
+            _through(argparse.Namespace(through=None), {"data": {"through": None}})
+
+    def test_universe_is_validated(self) -> None:
+        from rquant.cli import _universe
+
+        self.assertEqual("csi300", _universe({}))
+        self.assertEqual("all", _universe({"data": {"universe": "all"}}))
+        with self.assertRaisesRegex(ValueError, "data.universe"):
+            _universe({"data": {"universe": "csi500"}})
+
     def test_catalog_json_is_machine_readable(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
@@ -134,11 +157,12 @@ class CliTests(unittest.TestCase):
     def test_doctor_accepts_the_registered_factor_catalog(self) -> None:
         output = io.StringIO()
         clang = subprocess.CompletedProcess(["clang++", "--version"], 0, stdout="Apple clang version fixture\n")
+        # Replacing importlib.import_module affects how later patch targets resolve, so it must be patched last.
         with (
-            patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
-            patch("rquant.cli.importlib.import_module"),
-            patch("rquant.cli.subprocess.run", return_value=clang),
             patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
+            patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.subprocess.run", return_value=clang),
+            patch("rquant.cli.importlib.import_module"),
             redirect_stdout(output),
         ):
             code = main(["doctor", "--skip-permission-check"])
@@ -149,6 +173,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual("ok", payload["status"])
         self.assertTrue(factor_catalog["ok"])
         self.assertEqual(809, factor_catalog["detail"]["columns"])
+
+    def test_doctor_reports_missing_clang_instead_of_crashing(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
+            patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.subprocess.run", side_effect=FileNotFoundError("clang++")),
+            patch("rquant.cli.importlib.import_module"),
+            redirect_stdout(output),
+        ):
+            code = main(["doctor", "--skip-permission-check"])
+
+        payload = json.loads(output.getvalue())
+        clang = next(check for check in payload["checks"] if check["name"] == "clang++")
+        self.assertEqual(1, code)
+        self.assertFalse(clang["ok"])
+        self.assertIn("missing", clang["detail"])
 
 
 if __name__ == "__main__":

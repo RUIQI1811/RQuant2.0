@@ -23,9 +23,20 @@ def generate_rolling_windows(
     last_prediction_year: int,
     horizon: str,
     through: date,
+    train_years: int = 3,
+    validation_months: int = 6,
+    formal_start_year: int = 2010,
 ) -> list[RollingWindow]:
-    if first_prediction_year < 2013:
-        raise ValueError("Three-year rolling evaluation cannot predict before 2013 when formal history starts in 2010")
+    if train_years < 1:
+        raise ValueError("train_years must be at least 1")
+    if not 1 <= validation_months < train_years * 12:
+        raise ValueError("validation_months must be at least 1 and shorter than the training window")
+    earliest = formal_start_year + train_years
+    if first_prediction_year < earliest:
+        raise ValueError(
+            f"{train_years}-year rolling evaluation cannot predict before {earliest} "
+            f"when formal history starts in {formal_start_year}"
+        )
     if last_prediction_year < first_prediction_year:
         raise ValueError("last_prediction_year must not precede first_prediction_year")
     if horizon not in {"1d", "5d"}:
@@ -36,11 +47,11 @@ def generate_rolling_windows(
         test_end = min(date(year, 12, 31), through)
         if test_end < date(year, 1, 1):
             continue
-        validation_start = date(year - 1, 7, 1)
+        validation_start = _months_before(date(year, 1, 1), validation_months)
         windows.append(
             RollingWindow(
                 prediction_year=year,
-                train_start=date(year - 3, 1, 1),
+                train_start=date(year - train_years, 1, 1),
                 inner_train_end=validation_start - timedelta(days=1),
                 validation_start=validation_start,
                 validation_end=date(year - 1, 12, 31),
@@ -51,6 +62,11 @@ def generate_rolling_windows(
             )
         )
     return windows
+
+
+def _months_before(value: date, months: int) -> date:
+    index = value.year * 12 + value.month - 1 - months
+    return date(index // 12, index % 12 + 1, 1)
 
 
 def is_five_day_anchor(calendar_position: int) -> bool:

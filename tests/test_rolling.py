@@ -19,6 +19,37 @@ class RollingWindowTests(unittest.TestCase):
         self.assertEqual(date(2013, 1, 1), window.test_start)
         self.assertEqual(1, window.purge_trading_days)
 
+    def test_window_lengths_follow_configuration(self) -> None:
+        window = generate_rolling_windows(
+            first_prediction_year=2015,
+            last_prediction_year=2015,
+            horizon="1d",
+            through=date(2015, 12, 31),
+            train_years=5,
+            validation_months=3,
+        )[0]
+        self.assertEqual(date(2010, 1, 1), window.train_start)
+        self.assertEqual(date(2014, 10, 1), window.validation_start)
+        self.assertEqual(date(2014, 9, 30), window.inner_train_end)
+
+    def test_first_year_respects_formal_start_and_train_years(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot predict before 2015"):
+            generate_rolling_windows(
+                first_prediction_year=2014,
+                last_prediction_year=2014,
+                horizon="1d",
+                through=date(2014, 12, 31),
+                train_years=5,
+            )
+        with self.assertRaisesRegex(ValueError, "validation_months"):
+            generate_rolling_windows(
+                first_prediction_year=2013,
+                last_prediction_year=2013,
+                horizon="1d",
+                through=date(2013, 12, 31),
+                validation_months=36,
+            )
+
     def test_current_year_is_clipped(self) -> None:
         through = date(2026, 8, 3)
         window = generate_rolling_windows(

@@ -129,15 +129,18 @@ rquant doctor --skip-permission-check
 | ---------------------------------- | -------------: | ---------------------------- |
 | `data.formal_start`              | `2010-01-01` | 正式研究起点                 |
 | `data.warmup_trading_days`       |        `300` | 正式研究前预热交易日数       |
-| `data.universe`                  |     `csi300` | 历史时点沪深 300 股票池      |
+| `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
+| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `factors.factor_set`             |   `combined` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |
+| `workflow.validation_months`     |          `6` | 训练窗口最后几个月用于选择迭代数 |
 | `workflow.first_prediction_year` |       `2013` | 第一个样本外预测年           |
 | `backtest.initial_capital`       |    `1000000` | 初始资金，人民币             |
 | `backtest.topk`                  |         `50` | 目标持股数量                 |
 | `backtest.n_drop`                |          `5` | 每期最多换出数量             |
+| `backtest.impact_cost`           |        `0.0` | Qlib 二次冲击成本系数，按成交额占当日成交额比例的平方计费 |
 
 如需使用其他配置文件，所有命令都可以在主命令前指定：
 
@@ -163,6 +166,8 @@ rquant data sync --through 2026-08-04
 - 每个分区都带有内容哈希和清单；
 - 已完成且哈希有效的分区会作为缓存复用；
 - 损坏或不完整的分区会重新获取；
+- 开市日的 `daily`、`adj_factor`、`daily_basic`、`stk_limit` 必须返回数据；若返回空表（通常是当日数据尚未发布），同步会报错且不缓存该分区，稍后用相同参数重跑即可；旧版本缓存的空分区会自动重新获取；
+- 停牌不单独拉取接口：停牌日在 Tushare 日线中没有记录，Qlib provider 中对应为 NaN 行情，回测视为不可交易；
 - 所有请求和重试共同遵守每 60 秒 190 次的默认滑动窗口限制；
 - 分区进度、缓存命中数和新获取数显示在 stderr；最终 JSON 结果输出到 stdout。
 
@@ -396,6 +401,9 @@ rquant factors build --factor-set combined
 rquant factors build --factor-set combined --start 2020-01-01 --end 2020-12-31
 ```
 
+因子在股票池成员的全部历史行情上计算（包括入选沪深 300 之前和调出之后的日子），因此新进成分股在入选当天就有
+完整的滚动窗口与滞后特征；写盘时只保留当日属于股票池的行。
+
 因子结果按年份写入：
 
 ```text
@@ -483,7 +491,9 @@ rquant walk-forward \
 - `1d`：下一交易日开盘到再下一交易日开盘的收益；
 - `5d`：下一交易日开盘到第六个交易日开盘的收益，并按每 5 个交易日取一个预测锚点。
 
-每个预测年使用此前三个完整自然年：前一年的下半年用于模型选择，随后在三年训练窗口内重新拟合并预测下一年。
+每个预测年使用此前 `workflow.train_years`（默认 3）个完整自然年：训练窗口最后 `workflow.validation_months`
+（默认 6）个月用于模型选择，随后在整个训练窗口内重新拟合并预测下一年。最早的预测年为 `data.formal_start`
+所在年份加 `train_years`。未传 `--through` 时使用 `data.through`；两者都没有时命令会报错，不会默认取当天日期。
 训练边界会按预测期限清除 1 或 5 个交易日，避免标签跨越验证或测试边界。
 
 命令完成后会在 stdout 返回 `run_id`。输出目录结构如下：
@@ -540,10 +550,12 @@ rquant report RUN_ID
 - T+1；
 - 停牌不可交易；
 - 按方向执行开盘涨停不可买、开盘跌停不可卖；
-- 佣金、最低佣金和印花税来自 `config/default.yaml`；
+- 佣金、最低佣金、印花税和可选的冲击成本（`backtest.impact_cost`）来自 `config/default.yaml`；
 - 最后一个可用开盘尝试在相同约束下清仓，无法卖出的证券会明确保留在清单中。
 
-报告会写回同一个运行目录：
+`report` 自身也会创建 `runs/report/<report-run-id>/run.json`，记录所用的组合参数、预测文件哈希和 Qlib
+指纹；失败时状态为 `failed`。回测产物仍写回滚动训练的运行目录，同一 `RUN_ID` 重跑会覆盖上一次的回测产物，
+对应 walk-forward `run.json` 中的 `report_run_id` 指向最近一次报告运行：
 
 ```text
 runs/walk-forward/<run-id>/
@@ -580,12 +592,13 @@ sed -n '1,240p' runs/walk-forward/RUN_ID/report.md
 
 ## 9. 运行清单与状态判断
 
-所有会改变数据或产生研究结果的主流程命令都会创建 `run.json` 和 `run.log`。两个研究命令使用分类目录，
+所有会改变数据或产生研究结果的主流程命令都会创建 `run.json` 和 `run.log`。三个研究命令使用分类目录，
 其他命令和旧版运行仍使用根目录：
 
 ```text
 runs/factors-evaluate/<run-id>/run.json
 runs/walk-forward/<run-id>/run.json
+runs/report/<run-id>/run.json
 runs/<run-id>/run.json
 ```
 
@@ -602,7 +615,7 @@ python -m json.tool runs/walk-forward/RUN_ID/run.json
 tail -n 100 runs/walk-forward/RUN_ID/run.log
 ```
 
-因子评估把上述 `walk-forward` 换成 `factors-evaluate`；其他命令和旧版运行省略该分类层级。
+因子评估和报告分别把上述 `walk-forward` 换成 `factors-evaluate`、`report`；其他命令和旧版运行省略该分类层级。
 
 `run.json` 的关键字段：
 

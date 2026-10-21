@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.metadata
 import inspect
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -16,29 +15,11 @@ from rquant.factors.catalog import FactorSet, catalog_from_registry, get_catalog
 from rquant.factors.extensions import kunquant as kunquant_extensions
 from rquant.factors.libraries.base import CANONICAL_INPUT_FIELDS
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
+from rquant.io import atomic_replace_directory as _atomic_replace_directory
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 
 INPUT_FIELDS = CANONICAL_INPUT_FIELDS
-FACTOR_ENGINE_VERSION = 2
-
-
-def _atomic_replace_directory(staging: Path, destination: Path) -> None:
-    """Publish a fully built directory while preserving the previous version on failure."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    backup: Path | None = None
-    try:
-        if destination.exists():
-            backup = Path(tempfile.mkdtemp(prefix=f".{destination.name}.backup.", dir=destination.parent))
-            backup.rmdir()
-            os.replace(destination, backup)
-        os.replace(staging, destination)
-    except BaseException:
-        if backup is not None and backup.exists() and not destination.exists():
-            os.replace(backup, destination)
-        raise
-    else:
-        if backup is not None:
-            shutil.rmtree(backup, ignore_errors=True)
+FACTOR_ENGINE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -241,32 +222,12 @@ class KunQuantFactorEngine:
             raise DataContractError("Canonical dataset is not complete")
         if not bars_path.exists():
             raise DataContractError(f"Canonical bars do not exist: {bars_path}")
-        columns = ["datetime", "instrument", *self.input_fields]
-        if self.config.universe == "csi300":
-            columns.append("in_csi300")
-        bars = pd.read_parquet(bars_path, columns=columns)
-        bars["datetime"] = pd.to_datetime(bars["datetime"])
-        if start:
-            bars = bars[bars["datetime"] >= pd.Timestamp(start)]
-        if end:
-            bars = bars[bars["datetime"] <= pd.Timestamp(end)]
-        if bars.empty:
-            raise DataContractError("No canonical rows in requested factor range")
-        if self.config.universe == "csi300":
-            bars = bars[bars["in_csi300"].fillna(False)]
-        if bars.empty:
-            raise DataContractError(f"No canonical rows for universe {self.config.universe}")
-
-        dates = pd.Index(sorted(bars["datetime"].unique()), name="datetime")
-        instruments = pd.Index(sorted(bars["instrument"].unique()), name="instrument")
+        dates, instruments, panels, output_mask = _load_canonical_panels(
+            pd, bars_path, self.input_fields, self.config.universe, start=start, end=end
+        )
         numpy_dtype = np.dtype(np.float64 if self.config.dtype == "double" else np.float32)
-        matrices: dict[str, Any] = {}
-        for field in self.input_fields:
-            panel = bars.pivot(index="datetime", columns="instrument", values=field).reindex(
-                index=dates, columns=instruments
-            )
-            matrices[field] = np.ascontiguousarray(panel.to_numpy(dtype=numpy_dtype))
-        del bars, panel
+        matrices = {field: np.ascontiguousarray(panel.to_numpy(dtype=numpy_dtype)) for field, panel in panels.items()}
+        del panels
 
         output_root = Path(output_root)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -321,31 +282,18 @@ class KunQuantFactorEngine:
                     flush=True,
                 )
 
-                date_years = dates.year
-                total_rows = 0
-                for year in sorted(set(date_years)):
-                    positions = np.flatnonzero(date_years == year)
-                    first = int(positions[0])
-                    last = int(positions[-1]) + 1
-                    year_dates = dates[first:last]
-                    factor_data: dict[str, Any] = {
-                        "datetime": np.repeat(year_dates.to_numpy(), len(instruments)),
-                        "instrument": np.tile(instruments.to_numpy(), len(year_dates)),
-                    }
-                    for name in expected:
-                        factor_data[name] = result[name][first:last, : len(instruments)].reshape(-1)
-                    frame = pd.DataFrame(factor_data)
-                    destination = staging_root / f"year={year}" / "factors.parquet"
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    frame.to_parquet(destination, index=False)
-                    partition_hashes[str(year)] = sha256_file(destination)
-                    total_rows += len(frame)
-                    print(
-                        f"factors {self.config.factor_set}: year={year} dates={len(year_dates)} rows={len(frame)}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    del factor_data, frame
+                total_rows = _write_year_partitions(
+                    pd,
+                    np,
+                    staging_root,
+                    dates,
+                    instruments,
+                    expected,
+                    lambda name, first, last: result[name][first:last, : len(instruments)],
+                    output_mask,
+                    partition_hashes,
+                    label=self.config.factor_set,
+                )
 
                 output_buffers.clear()
                 result.clear()
@@ -361,9 +309,10 @@ class KunQuantFactorEngine:
                 "input_fields": list(self.input_fields),
                 "compilation_fingerprint": self.compilation_fingerprint(),
                 "canonical_fingerprint": canonical_manifest.get("fingerprint"),
-                "start": str(dates.min()),
-                "end": str(dates.max()),
+                "start": str(dates[output_mask.any(axis=1)].min()),
+                "end": str(dates[output_mask.any(axis=1)].max()),
                 "instruments": len(instruments),
+                "universe": self.config.universe,
                 "rows": total_rows,
                 "columns": len(expected),
                 "partitions": partition_hashes,
@@ -407,6 +356,7 @@ class PanelFactorEngine:
         return stable_hash(
             {
                 "backend": "pandas_panel_v1",
+                "factor_engine_version": FACTOR_ENGINE_VERSION,
                 "catalog": self.catalog.fingerprint_for(self.config.factor_set),
                 "factor_set": self.config.factor_set,
                 "dtype": self.config.dtype,
@@ -457,29 +407,9 @@ class PanelFactorEngine:
         if not bars_path.exists():
             raise DataContractError(f"Canonical bars do not exist: {bars_path}")
 
-        columns = ["datetime", "instrument", *self.input_fields]
-        if self.config.universe == "csi300":
-            columns.append("in_csi300")
-        bars = pd.read_parquet(bars_path, columns=columns)
-        bars["datetime"] = pd.to_datetime(bars["datetime"])
-        if start:
-            bars = bars[bars["datetime"] >= pd.Timestamp(start)]
-        if end:
-            bars = bars[bars["datetime"] <= pd.Timestamp(end)]
-        if self.config.universe == "csi300":
-            bars = bars[bars["in_csi300"].fillna(False)]
-        if bars.empty:
-            raise DataContractError("No canonical rows in requested panel-factor range and universe")
-
-        dates = pd.Index(sorted(bars["datetime"].unique()), name="datetime")
-        instruments = pd.Index(sorted(bars["instrument"].unique()), name="instrument")
-        panels = {
-            field: bars.pivot(index="datetime", columns="instrument", values=field).reindex(
-                index=dates, columns=instruments
-            )
-            for field in self.input_fields
-        }
-        del bars
+        dates, instruments, panels, output_mask = _load_canonical_panels(
+            pd, bars_path, self.input_fields, self.config.universe, start=start, end=end
+        )
         external, reference_hashes = _load_gtja191_external_inputs(
             canonical_root,
             dates,
@@ -525,25 +455,18 @@ class PanelFactorEngine:
                 del panels
                 output_store.flush()
 
-                total_rows = 0
-                for year in sorted(set(dates.year)):
-                    positions = np.flatnonzero(dates.year == year)
-                    first = int(positions[0])
-                    last = int(positions[-1]) + 1
-                    year_dates = dates[first:last]
-                    factor_data: dict[str, Any] = {
-                        "datetime": np.repeat(year_dates.to_numpy(), len(instruments)),
-                        "instrument": np.tile(instruments.to_numpy(), len(year_dates)),
-                    }
-                    for name in expected:
-                        factor_data[name] = output_buffers[name][first:last].reshape(-1)
-                    frame = pd.DataFrame(factor_data)
-                    destination = staging_root / f"year={year}" / "factors.parquet"
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    frame.to_parquet(destination, index=False)
-                    partition_hashes[str(year)] = sha256_file(destination)
-                    total_rows += len(frame)
-                    del factor_data, frame
+                total_rows = _write_year_partitions(
+                    pd,
+                    np,
+                    staging_root,
+                    dates,
+                    instruments,
+                    expected,
+                    lambda name, first, last: output_buffers[name][first:last],
+                    output_mask,
+                    partition_hashes,
+                    label=self.config.factor_set,
+                )
 
                 output_buffers.clear()
                 output_store.flush()
@@ -559,9 +482,10 @@ class PanelFactorEngine:
                 "factor_libraries": [library.family for library in self.libraries],
                 "input_fields": list(self.input_fields),
                 "reference_inputs": reference_hashes,
-                "start": str(dates.min()),
-                "end": str(dates.max()),
+                "start": str(dates[output_mask.any(axis=1)].min()),
+                "end": str(dates[output_mask.any(axis=1)].max()),
                 "instruments": len(instruments),
+                "universe": self.config.universe,
                 "rows": total_rows,
                 "columns": len(expected),
                 "partitions": partition_hashes,
@@ -578,6 +502,111 @@ class PanelFactorEngine:
         finally:
             if staging_root.exists():
                 shutil.rmtree(staging_root, ignore_errors=True)
+
+
+SUPPORTED_UNIVERSES = ("csi300", "all")
+
+
+def _load_canonical_panels(
+    pd: Any,
+    bars_path: Path,
+    input_fields: tuple[str, ...],
+    universe: str,
+    *,
+    start: str | None,
+    end: str | None,
+) -> tuple[Any, Any, dict[str, Any], Any]:
+    """Build full-history input panels and the mask of rows that belong in the published store.
+
+    Time-series operators need each instrument's history before it entered the research universe, so the panels keep
+    every canonical bar of every instrument that is ever in the universe. Membership only decides which computed rows
+    are published.
+    """
+    if universe not in SUPPORTED_UNIVERSES:
+        raise DataContractError(f"Unsupported factor universe {universe!r}; expected one of {SUPPORTED_UNIVERSES}")
+    columns = ["datetime", "instrument", *input_fields]
+    if universe == "csi300":
+        columns.append("in_csi300")
+    bars = pd.read_parquet(bars_path, columns=columns)
+    bars["datetime"] = pd.to_datetime(bars["datetime"])
+    if start:
+        bars = bars[bars["datetime"] >= pd.Timestamp(start)]
+    if end:
+        bars = bars[bars["datetime"] <= pd.Timestamp(end)]
+    if bars.empty:
+        raise DataContractError("No canonical rows in requested factor range")
+    if universe == "csi300":
+        bars = bars.assign(in_universe=bars["in_csi300"].fillna(False).astype(bool))
+    else:
+        bars = bars.assign(in_universe=True)
+    members = bars.loc[bars["in_universe"], "instrument"].unique()
+    if not len(members):
+        raise DataContractError(f"No canonical rows for universe {universe}")
+    bars = bars[bars["instrument"].isin(members)]
+
+    dates = pd.Index(sorted(bars["datetime"].unique()), name="datetime")
+    instruments = pd.Index(sorted(members), name="instrument")
+    panels = {
+        field: bars.pivot(index="datetime", columns="instrument", values=field).reindex(
+            index=dates, columns=instruments
+        )
+        for field in input_fields
+    }
+    output_mask = (
+        bars.pivot(index="datetime", columns="instrument", values="in_universe")
+        .reindex(index=dates, columns=instruments)
+        .fillna(False)
+        .astype(bool)
+        .to_numpy()
+    )
+    return dates, instruments, panels, output_mask
+
+
+def _write_year_partitions(
+    pd: Any,
+    np: Any,
+    staging_root: Path,
+    dates: Any,
+    instruments: Any,
+    expected: tuple[str, ...],
+    values_for: Any,
+    output_mask: Any,
+    partition_hashes: dict[str, str],
+    *,
+    label: str,
+) -> int:
+    """Write one Parquet partition per year containing only rows inside the research universe."""
+    total_rows = 0
+    date_years = dates.year
+    for year in sorted(set(date_years)):
+        positions = np.flatnonzero(date_years == year)
+        first = int(positions[0])
+        last = int(positions[-1]) + 1
+        year_dates = dates[first:last]
+        keep = output_mask[first:last].reshape(-1)
+        if not keep.any():
+            continue
+        factor_data: dict[str, Any] = {
+            "datetime": np.repeat(year_dates.to_numpy(), len(instruments))[keep],
+            "instrument": np.tile(instruments.to_numpy(), len(year_dates))[keep],
+        }
+        for name in expected:
+            factor_data[name] = np.asarray(values_for(name, first, last)).reshape(-1)[keep]
+        frame = pd.DataFrame(factor_data)
+        destination = staging_root / f"year={year}" / "factors.parquet"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(destination, index=False)
+        partition_hashes[str(year)] = sha256_file(destination)
+        total_rows += len(frame)
+        print(
+            f"factors {label}: year={year} dates={len(year_dates)} rows={len(frame)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        del factor_data, frame
+    if not total_rows:
+        raise DataContractError(f"Factor build for {label} produced no rows inside the research universe")
+    return total_rows
 
 
 def _load_gtja191_external_inputs(

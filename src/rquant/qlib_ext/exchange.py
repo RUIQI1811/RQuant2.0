@@ -52,10 +52,25 @@ class AshareExchange(Exchange):  # type: ignore[misc,valid-type]
 
     def _calc_trade_info_by_order(self, order: Any, position: Any, dealt_order_amount: dict[Any, Any]) -> Any:
         trade_price, trade_value, _ = super()._calc_trade_info_by_order(order, position, dealt_order_amount)
+        value = abs(float(trade_value))
+        if value <= 1e-5:
+            # Qlib charges nothing for an order that did not deal.
+            return trade_price, trade_value, 0.0
         trade_date = _as_date(order.start_time)
         is_sell = bool(order.direction == Order.SELL)
-        cost = self.cost_model.total(abs(float(trade_value)), trade_date, is_sell=is_sell)
+        cost = self.cost_model.total(value, trade_date, is_sell=is_sell)
+        cost += value * self._impact_ratio(order, float(trade_price), value)
         return trade_price, trade_value, cost
+
+    def _impact_ratio(self, order: Any, trade_price: float, trade_value: float) -> float:
+        """Qlib's quadratic market-impact ratio, re-applied because the base cost is replaced above."""
+        if not self.impact_cost:
+            return 0.0
+        volume = self.get_volume(order.stock_id, order.start_time, order.end_time)
+        daily_value = float(volume) * trade_price if volume is not None else float("nan")
+        if not daily_value or daily_value != daily_value:
+            return float(self.impact_cost)
+        return float(self.impact_cost) * (trade_value / daily_value) ** 2
 
 
 def _as_date(value: Any) -> date:

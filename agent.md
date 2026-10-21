@@ -78,6 +78,7 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - `data/cache/`：因子执行缓存（当前主要为 KunQuant 编译缓存）；
 - `runs/factors-evaluate/<run-id>/`：因子评估运行清单、日志和评估产物；
 - `runs/walk-forward/<run-id>/`：滚动训练运行清单、日志、预测、回测与报告产物；
+- `runs/report/<run-id>/`：报告命令的运行清单与日志（回测产物写回对应的 walk-forward 目录）；
 - `runs/<run-id>/`：其他命令和旧版运行的清单、日志与产物；
 - `THIRD_PARTY_NOTICES.md` 与 `licenses/`：迁入公式的来源、修改说明和第三方许可证；
 - Qlib 上游源码不属于本工程；需要查阅时使用独立于项目根目录的临时或同级 checkout。

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from rquant.data.contracts import CANONICAL_BAR_COLUMNS
 from rquant.errors import DataContractError, DependencyError
-from rquant.io import atomic_write_json, stable_hash
+from rquant.io import atomic_replace_directory, atomic_write_json, stable_hash
 
 
 class CanonicalBuilder:
@@ -95,7 +97,6 @@ class CanonicalBuilder:
         bars["amount"] = bars["raw_amount"]
         bars["vwap"] = bars["raw_vwap"] * bars["factor"]
         bars["change"] = bars["raw_close"] / bars["raw_pre_close"] - 1.0
-        bars["suspended"] = False
         bars["limit_buy"] = bars["up_limit"].notna() & bars["raw_open"].round(2).ge(bars["up_limit"].round(2))
         bars["limit_sell"] = bars["down_limit"].notna() & bars["raw_open"].round(2).le(bars["down_limit"].round(2))
 
@@ -118,11 +119,18 @@ class CanonicalBuilder:
         bars = bars.loc[~invalid_ohlc].reset_index(drop=True)
         self._validate_bars(bars)
 
+        # Publish all yearly partitions at once so a narrower rebuild cannot leave stale years behind.
         bars_root = self.canonical_root / "bars"
-        for year, frame in bars.groupby(bars["datetime"].dt.year, sort=True):
-            destination = bars_root / f"year={year}" / "bars.parquet"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            frame.loc[:, CANONICAL_BAR_COLUMNS].to_parquet(destination, index=False)
+        self.canonical_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".bars.staging.", dir=self.canonical_root))
+        try:
+            for year, frame in bars.groupby(bars["datetime"].dt.year, sort=True):
+                destination = staging / f"year={year}" / "bars.parquet"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                frame.loc[:, CANONICAL_BAR_COLUMNS].to_parquet(destination, index=False)
+            atomic_replace_directory(staging, bars_root)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
         reference_root = self.canonical_root / "reference"
         reference_root.mkdir(parents=True, exist_ok=True)
@@ -300,11 +308,11 @@ class CanonicalBuilder:
             raise DataContractError(
                 f"Canonical bars contain {int(invalid_ohlc.sum())} invalid OHLC rows: {examples}"
             )
-        live = ~bars["suspended"]
-        if bars.loc[live, "factor"].isna().any() or bars.loc[live, "factor"].le(0).any():
+        # Tushare daily rows exist only for traded days, so every canonical bar is a live quote.
+        if bars["factor"].isna().any() or bars["factor"].le(0).any():
             raise DataContractError("Live quotes require a positive restoration factor")
-        restored = bars.loc[live, "close"] / bars.loc[live, "factor"]
-        if not np.allclose(restored, bars.loc[live, "raw_close"], rtol=1e-10, atol=1e-10, equal_nan=True):
+        restored = bars["close"] / bars["factor"]
+        if not np.allclose(restored, bars["raw_close"], rtol=1e-10, atol=1e-10, equal_nan=True):
             raise DataContractError("Qlib close/factor does not restore the raw close")
         if tuple(column for column in CANONICAL_BAR_COLUMNS if column not in bars.columns):
             missing = [column for column in CANONICAL_BAR_COLUMNS if column not in bars.columns]

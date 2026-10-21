@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-RAW_DAILY_ENDPOINTS = ("daily", "adj_factor", "daily_basic", "stk_limit", "suspend_d")
+# Suspensions need no endpoint of their own: Tushare `daily` has no row for a suspended day, and the Qlib provider
+# turns that gap into NaN quotes, which Qlib treats as untradable.
+RAW_DAILY_ENDPOINTS = ("daily", "adj_factor", "daily_basic", "stk_limit")
 
 CANONICAL_BAR_COLUMNS = (
     "instrument",
@@ -29,7 +31,6 @@ CANONICAL_BAR_COLUMNS = (
     "sector",
     "industry",
     "subindustry",
-    "suspended",
     "limit_buy",
     "limit_sell",
     "in_csi300",
