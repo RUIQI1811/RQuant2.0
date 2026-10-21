@@ -47,7 +47,9 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         except ImportError as exc:
             raise DependencyError("pandas, pyarrow and pyqlib==0.9.7 are required by KunQuantDataLoader") from exc
 
-        paths = sorted((self.factor_root / self.factor_set).glob("year=*/factors.parquet"))
+        paths = _partitions_in_range(
+            sorted((self.factor_root / self.factor_set).glob("year=*/factors.parquet")), pd, start_time, end_time
+        )
         if not paths:
             raise DataContractError(f"No factor partitions for {self.factor_set}: {self.factor_root}")
         frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
@@ -82,6 +84,21 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
             [("feature", column) if column != "LABEL0" else ("label", column) for column in merged.columns]
         )
         return merged.sort_index()
+
+
+def _partitions_in_range(paths: list[Path], pd: Any, start_time: Any, end_time: Any) -> list[Path]:
+    """Keep only yearly partitions that can contain rows between start_time and end_time."""
+    first_year = pd.Timestamp(start_time).year if start_time is not None else None
+    last_year = pd.Timestamp(end_time).year if end_time is not None else None
+    selected = []
+    for path in paths:
+        year = int(path.parent.name.removeprefix("year="))
+        if first_year is not None and year < first_year:
+            continue
+        if last_year is not None and year > last_year:
+            continue
+        selected.append(path)
+    return selected
 
 
 def _resolve_instruments(D: Any, instruments: Any, start_time: Any, end_time: Any) -> list[str] | None:

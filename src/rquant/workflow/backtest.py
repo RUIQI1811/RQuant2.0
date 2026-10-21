@@ -300,7 +300,8 @@ def _metrics(np: Any, returns: Any, benchmark: Any) -> dict[str, float | None]:
     excess = values - benchmark_values
     annual_return = float(nav[-1] ** (252.0 / len(values)) - 1.0) if len(values) else float("nan")
     volatility = float(np.std(values, ddof=1) * math.sqrt(252)) if len(values) > 1 else float("nan")
-    sharpe = annual_return / volatility if volatility > 0 else float("nan")
+    # Conventional annualized Sharpe: arithmetic mean daily return scaled by 252 over annualized volatility.
+    sharpe = float(np.mean(values) * 252.0) / volatility if volatility > 0 else float("nan")
     running_max = np.maximum.accumulate(nav) if len(nav) else np.asarray([])
     max_drawdown = float(np.min(nav / running_max - 1.0)) if len(nav) else float("nan")
     return {
