@@ -94,7 +94,6 @@ class DataPipelineTests(unittest.TestCase):
                 columns=["ts_code", "trade_date", "up_limit", "down_limit"],
             ),
         )
-        self._write("suspend_d", pd.DataFrame([["000001.SZ", "20200103"]], columns=["ts_code", "trade_date"]))
         self._write(
             "stock_basic",
             pd.DataFrame(
@@ -399,6 +398,8 @@ class CollectorResumeTests(unittest.TestCase):
                     if endpoint == "index_member_all":
                         self.industry_queries.append(query)
                         return pd.DataFrame([["000001.SZ"]], columns=["ts_code"])
+                    if "trade_date" in query:
+                        return pd.DataFrame([["000001.SZ", query["trade_date"]]], columns=["ts_code", "trade_date"])
                     return pd.DataFrame()
 
                 return fetch
@@ -436,6 +437,74 @@ class CollectorResumeTests(unittest.TestCase):
             self.assertEqual(0, second["fetched_artifacts"])
             self.assertIn(f"cached={second['artifacts']} fetched=0", second_stderr.getvalue())
             self.assertEqual(2, len(client.industry_queries))
+
+    def test_empty_trading_day_is_rejected_and_never_cached(self) -> None:
+        import pandas as pd
+
+        class Client:
+            def __init__(self) -> None:
+                self.published = False
+                self.calls = 0
+
+            def daily(self, **query: object) -> object:
+                self.calls += 1
+                if not self.published:
+                    return pd.DataFrame(columns=["ts_code", "trade_date"])
+                return pd.DataFrame([["000001.SZ", query["trade_date"]]], columns=["ts_code", "trade_date"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = Client()
+            collector = TushareCollector(temporary, client=client)
+            query = {"trade_date": "20200102"}
+            with self.assertRaisesRegex(DataContractError, "not be published yet"):
+                collector.fetch_partition("daily", query, "trade_date=20200102", require_rows=True)
+            self.assertFalse(Path(temporary, "daily", "trade_date=20200102", "manifest.json").exists())
+
+            client.published = True
+            artifact = collector.fetch_partition("daily", query, "trade_date=20200102", require_rows=True)
+            self.assertEqual(1, artifact.rows)
+            self.assertEqual(2, client.calls)
+
+    def test_empty_partition_cached_by_older_versions_is_refetched(self) -> None:
+        import pandas as pd
+
+        class Client:
+            def __init__(self) -> None:
+                self.rows = 0
+                self.calls = 0
+
+            def daily(self, **query: object) -> object:
+                self.calls += 1
+                return pd.DataFrame(
+                    [["000001.SZ", query["trade_date"]]] * self.rows, columns=["ts_code", "trade_date"]
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = Client()
+            collector = TushareCollector(temporary, client=client)
+            query = {"trade_date": "20200102"}
+            stale = collector.fetch_partition("daily", query, "trade_date=20200102")
+            self.assertEqual(0, stale.rows)
+            client.rows = 1
+            repaired = collector.fetch_partition("daily", query, "trade_date=20200102", require_rows=True)
+            self.assertEqual(1, repaired.rows)
+            self.assertEqual(2, client.calls)
+
+    def test_keyboard_interrupt_is_not_retried(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def daily(self, **query: object) -> object:
+                self.calls += 1
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = Client()
+            collector = TushareCollector(temporary, client=client, retries=3, base_backoff=0)
+            with self.assertRaises(KeyboardInterrupt):
+                collector._call("daily", {"trade_date": "20200102"})
+        self.assertEqual(1, client.calls)
 
 
 if __name__ == "__main__":

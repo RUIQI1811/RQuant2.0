@@ -242,7 +242,6 @@ def _probe_tushare_permissions(token: str) -> tuple[bool, dict[str, Any]]:
         "daily": {"ts_code": "000001.SZ", "start_date": recent, "end_date": end},
         "adj_factor": {"ts_code": "000001.SZ", "start_date": recent, "end_date": end},
         "daily_basic": {"ts_code": "000001.SZ", "start_date": recent, "end_date": end},
-        "suspend_d": {"ts_code": "000001.SZ", "start_date": recent, "end_date": end},
         "stk_limit": {"ts_code": "000001.SZ", "start_date": recent, "end_date": end},
         "index_daily": {"ts_code": "399300.SZ", "start_date": recent, "end_date": end},
         "index_weight": {"index_code": "399300.SZ", "start_date": recent, "end_date": end},

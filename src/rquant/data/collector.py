@@ -111,13 +111,13 @@ class TushareCollector:
             def method(**kwargs: Any) -> Any:
                 return self.client.query(endpoint, **kwargs)
 
-        last_error: BaseException | None = None
+        last_error: Exception | None = None
         for attempt in range(self.retries):
             try:
                 # Every outbound attempt consumes capacity, including retries after provider errors.
                 self.rate_limiter.acquire()
                 return method(**query)
-            except BaseException as exc:
+            except Exception as exc:
                 last_error = exc
                 if attempt + 1 == self.retries:
                     break
@@ -134,8 +134,9 @@ class TushareCollector:
         partition: str,
         *,
         force: bool = False,
+        require_rows: bool = False,
     ) -> FetchArtifact:
-        artifact, _ = self._fetch_partition(endpoint, query, partition, force=force)
+        artifact, _ = self._fetch_partition(endpoint, query, partition, force=force, require_rows=require_rows)
         return artifact
 
     def _fetch_partition(
@@ -145,13 +146,16 @@ class TushareCollector:
         partition: str,
         *,
         force: bool = False,
+        require_rows: bool = False,
     ) -> tuple[FetchArtifact, bool]:
+        """Fetch one partition; with ``require_rows`` an empty response is an error and is never cached."""
         target_dir = self.raw_root / endpoint / partition
         target = target_dir / "data.parquet"
         manifest_path = target_dir / "manifest.json"
         if not force:
             cached = self._validated_cache(target, manifest_path, endpoint, query)
-            if cached is not None:
+            # Empty trading-day partitions cached by earlier versions are refetched instead of trusted.
+            if cached is not None and not (require_rows and cached.rows == 0):
                 return cached, True
 
         try:
@@ -168,6 +172,11 @@ class TushareCollector:
         frame.columns = [str(column) for column in frame.columns]
         if not frame.empty:
             frame = frame.drop_duplicates().reset_index(drop=True)
+        elif require_rows:
+            raise DataContractError(
+                f"Tushare {endpoint} returned no rows for {query}; the data may not be published yet. "
+                "Retry later or choose an earlier --through date"
+            )
 
         target_dir.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(prefix=".data.", suffix=".parquet", dir=target_dir)
@@ -246,9 +255,13 @@ class TushareCollector:
             ),
         )
 
-        def fetch(endpoint: str, query: dict[str, Any], partition: str) -> FetchArtifact:
+        def fetch(
+            endpoint: str, query: dict[str, Any], partition: str, *, require_rows: bool = False
+        ) -> FetchArtifact:
             nonlocal cached_artifacts, fetched_artifacts
-            artifact, cached = self._fetch_partition(endpoint, query, partition, force=force)
+            artifact, cached = self._fetch_partition(
+                endpoint, query, partition, force=force, require_rows=require_rows
+            )
             if cached:
                 cached_artifacts += 1
             else:
@@ -304,6 +317,8 @@ class TushareCollector:
                             endpoint,
                             {"trade_date": query_date},
                             f"trade_date={query_date}",
+                            # Every open trading day has quotes; an empty answer means "not published yet".
+                            require_rows=True,
                         )
                     )
 

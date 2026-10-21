@@ -95,7 +95,6 @@ class CanonicalBuilder:
         bars["amount"] = bars["raw_amount"]
         bars["vwap"] = bars["raw_vwap"] * bars["factor"]
         bars["change"] = bars["raw_close"] / bars["raw_pre_close"] - 1.0
-        bars["suspended"] = False
         bars["limit_buy"] = bars["up_limit"].notna() & bars["raw_open"].round(2).ge(bars["up_limit"].round(2))
         bars["limit_sell"] = bars["down_limit"].notna() & bars["raw_open"].round(2).le(bars["down_limit"].round(2))
 
@@ -300,11 +299,11 @@ class CanonicalBuilder:
             raise DataContractError(
                 f"Canonical bars contain {int(invalid_ohlc.sum())} invalid OHLC rows: {examples}"
             )
-        live = ~bars["suspended"]
-        if bars.loc[live, "factor"].isna().any() or bars.loc[live, "factor"].le(0).any():
+        # Tushare daily rows exist only for traded days, so every canonical bar is a live quote.
+        if bars["factor"].isna().any() or bars["factor"].le(0).any():
             raise DataContractError("Live quotes require a positive restoration factor")
-        restored = bars.loc[live, "close"] / bars.loc[live, "factor"]
-        if not np.allclose(restored, bars.loc[live, "raw_close"], rtol=1e-10, atol=1e-10, equal_nan=True):
+        restored = bars["close"] / bars["factor"]
+        if not np.allclose(restored, bars["raw_close"], rtol=1e-10, atol=1e-10, equal_nan=True):
             raise DataContractError("Qlib close/factor does not restore the raw close")
         if tuple(column for column in CANONICAL_BAR_COLUMNS if column not in bars.columns):
             missing = [column for column in CANONICAL_BAR_COLUMNS if column not in bars.columns]
