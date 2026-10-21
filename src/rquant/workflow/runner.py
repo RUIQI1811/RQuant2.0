@@ -26,6 +26,10 @@ class RollingWorkflowRunner:
         horizon: Literal["1d", "5d"],
         factor_set: FactorSet,
         seed: int = 42,
+        train_years: int = 3,
+        validation_months: int = 6,
+        formal_start_year: int = 2010,
+        universe: str = "csi300",
     ) -> None:
         self.qlib_root = Path(qlib_root)
         self.factor_root = Path(factor_root)
@@ -34,6 +38,10 @@ class RollingWorkflowRunner:
         self.horizon = horizon
         self.factor_set = factor_set
         self.seed = seed
+        self.train_years = train_years
+        self.validation_months = validation_months
+        self.formal_start_year = formal_start_year
+        self.universe = universe
         get_catalog().select(factor_set)
 
     def run(self, *, first_year: int, last_year: int, through: date) -> dict[str, Any]:
@@ -61,6 +69,9 @@ class RollingWorkflowRunner:
             last_prediction_year=last_year,
             horizon=self.horizon,
             through=through,
+            train_years=self.train_years,
+            validation_months=self.validation_months,
+            formal_start_year=self.formal_start_year,
         )
         if not windows:
             raise DataContractError("No rolling windows are available for the requested range")
@@ -105,7 +116,7 @@ class RollingWorkflowRunner:
                 handler=final_handler,
                 segments={
                     "train": (window.train_start.isoformat(), usable_refit_end.isoformat()),
-                    # DoubleEnsemble requires a validation segment. It remains inside the three-year training window.
+                    # DoubleEnsemble requires a validation segment. It remains inside the training window.
                     "valid": (window.validation_start.isoformat(), usable_refit_end.isoformat()),
                     "test": (window.test_start.isoformat(), window.test_end.isoformat()),
                 },
@@ -151,6 +162,9 @@ class RollingWorkflowRunner:
             "horizon": self.horizon,
             "factor_set": self.factor_set,
             "seed": self.seed,
+            "train_years": self.train_years,
+            "validation_months": self.validation_months,
+            "universe": self.universe,
             "windows": window_manifests,
             "prediction_rows": len(combined),
             "catalog_fingerprint": get_catalog().fingerprint_for(self.factor_set),
@@ -162,7 +176,7 @@ class RollingWorkflowRunner:
     def _handler(self, DataHandlerLP: Any, *, fit_start: date, fit_end: date, data_end: date) -> Any:
         loader = KunQuantDataLoader(str(self.factor_root), self.factor_set, self.horizon)
         return DataHandlerLP(
-            instruments="csi300",
+            instruments=self.universe,
             start_time=fit_start.isoformat(),
             end_time=data_end.isoformat(),
             data_loader=loader,

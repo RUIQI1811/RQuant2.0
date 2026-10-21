@@ -20,7 +20,12 @@ from rquant.data.collector import TushareCollector
 from rquant.data.qlib_builder import QlibProviderBuilder
 from rquant.errors import DataContractError, DependencyError, RQuantError
 from rquant.factors.catalog import CATALOG_VERSION, FactorSet, get_catalog
-from rquant.factors.engine import FactorBuildConfig, create_factor_engine, validate_factor_frame
+from rquant.factors.engine import (
+    SUPPORTED_UNIVERSES,
+    FactorBuildConfig,
+    create_factor_engine,
+    validate_factor_frame,
+)
 from rquant.factors.evaluation import FactorEvaluationConfig, FactorEvaluator
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
@@ -44,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     data = commands.add_parser("data", help="Collect and normalize market data")
     data_commands = data.add_subparsers(dest="data_command", required=True)
     sync = data_commands.add_parser("sync", help="Incrementally fetch Tushare data")
-    sync.add_argument("--through", required=True, type=_date, help="Inclusive date, YYYY-MM-DD")
+    sync.add_argument("--through", type=_date, help="Inclusive date, YYYY-MM-DD (default: data.through)")
     sync.add_argument("--force", action="store_true", help="Refetch validated partitions")
     sync.add_argument("--no-progress", action="store_true", help="Disable the terminal progress bar")
     sync.set_defaults(handler=_data_sync)
@@ -91,12 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--factor-set", choices=_factor_sets(), required=True)
     walk.add_argument("--first-year", type=int)
     walk.add_argument("--last-year", type=int)
-    walk.add_argument("--through", type=_date)
+    walk.add_argument("--through", type=_date, help="Inclusive date, YYYY-MM-DD (default: data.through)")
     walk.set_defaults(handler=_walk_forward, run_category="walk-forward")
 
     report = commands.add_parser("report", help="Run portfolio backtest and build the report for a walk-forward run")
     report.add_argument("run_id")
-    report.set_defaults(handler=_report)
+    report.set_defaults(handler=_report, run_category="report")
     return parser
 
 
@@ -264,12 +269,13 @@ def _data_sync(args: argparse.Namespace) -> int:
     def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
         data = config.get("data", {})
         max_requests_per_minute = data.get("max_requests_per_minute", 190)
+        through = _through(args, config)
         collector = TushareCollector(paths.raw, max_requests_per_minute=max_requests_per_minute)
-        run.add_input("through", args.through.isoformat())
+        run.add_input("through", through.isoformat())
         run.add_input("max_requests_per_minute", max_requests_per_minute)
         result = collector.sync(
             formal_start=_date_value(data.get("formal_start", "2010-01-01")),
-            through=args.through,
+            through=through,
             warmup_trading_days=int(data.get("warmup_trading_days", 300)),
             index_code=str(data.get("tushare_index_code", "399300.SZ")),
             force=args.force,
@@ -344,6 +350,7 @@ def _factor_build(args: argparse.Namespace) -> int:
                 input_layout=str(factor_config.get("input_layout", "TS")),
                 output_layout=str(factor_config.get("output_layout", "TS")),
                 workers=int(factor_config.get("workers", 4)),
+                universe=_universe(config),
                 external_inputs=external_inputs,
             ),
         )
@@ -461,7 +468,7 @@ def _factor_evaluate(args: argparse.Namespace) -> int:
 def _walk_forward(args: argparse.Namespace) -> int:
     def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
         workflow = config.get("workflow", {})
-        through = args.through or date.today()
+        through = _through(args, config)
         first_year = args.first_year or int(workflow.get("first_prediction_year", 2013))
         last_year = args.last_year or through.year
         run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
@@ -474,7 +481,12 @@ def _walk_forward(args: argparse.Namespace) -> int:
             horizon=args.horizon,
             factor_set=args.factor_set,
             seed=int(workflow.get("seed", config.get("project", {}).get("seed", 42))),
+            train_years=int(workflow.get("train_years", 3)),
+            validation_months=int(workflow.get("validation_months", 6)),
+            formal_start_year=_date_value(config.get("data", {}).get("formal_start", "2010-01-01")).year,
+            universe=_universe(config),
         )
+        run.add_input("through", through.isoformat())
         return runner.run(first_year=first_year, last_year=last_year, through=through)
 
     return _run(args, action)
@@ -492,13 +504,13 @@ def _resolve_report_run_directory(runs_root: str | Path, run_id: str) -> Path:
 
 
 def _report(args: argparse.Namespace) -> int:
-    config, paths = _config(args)
-    run_directory = _resolve_report_run_directory(paths.runs, args.run_id)
-    backtest = config.get("backtest", {})
-    portfolio = PortfolioBacktestRunner(
-        qlib_root=paths.qlib,
-        run_directory=run_directory,
-        config=PortfolioConfig(
+    def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
+        run_directory = _resolve_report_run_directory(paths.runs, args.run_id)
+        predictions_path = run_directory / "predictions.parquet"
+        if not predictions_path.exists():
+            raise DataContractError(f"Predictions do not exist: {predictions_path}")
+        backtest = config.get("backtest", {})
+        portfolio_config = PortfolioConfig(
             initial_capital=float(backtest.get("initial_capital", 1_000_000)),
             topk=int(backtest.get("topk", 50)),
             n_drop=int(backtest.get("n_drop", 5)),
@@ -508,21 +520,34 @@ def _report(args: argparse.Namespace) -> int:
             minimum_commission=float(backtest.get("minimum_commission", 5.0)),
             stamp_tax_before=float(backtest.get("stamp_tax_before_2023_08_28", 0.001)),
             stamp_tax_after=float(backtest.get("stamp_tax_from_2023_08_28", 0.0005)),
-        ),
-    ).run()
-    report = build_report(run_directory)
-    manifest_path = run_directory / "run.json"
-    if manifest_path.exists():
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            run_manifest = json.load(handle)
-        run_manifest.setdefault("outputs", {})["backtest"] = portfolio
-        run_manifest["outputs"]["report"] = report
-        run_manifest["report_completed_at"] = datetime.now(timezone.utc).isoformat()
-        atomic_write_json(manifest_path, run_manifest)
-        with (run_directory / "run.log").open("a", encoding="utf-8") as handle:
-            handle.write(f"{run_manifest['report_completed_at']} report completed\n")
-    print(json.dumps({"run_id": args.run_id, "backtest": portfolio, "report": report}, ensure_ascii=False, indent=2))
-    return 0
+            impact_cost=float(backtest.get("impact_cost", 0.0)),
+            universe=_universe(config),
+        )
+        run.add_input("walk_forward_run_id", args.run_id)
+        run.add_input("walk_forward_run_directory", str(run_directory))
+        run.add_input("predictions_sha256", sha256_file(predictions_path))
+        run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
+        run.add_input("portfolio", asdict(portfolio_config))
+        portfolio = PortfolioBacktestRunner(
+            qlib_root=paths.qlib,
+            run_directory=run_directory,
+            config=portfolio_config,
+        ).run()
+        report = build_report(run_directory)
+        manifest_path = run_directory / "run.json"
+        if manifest_path.exists():
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                run_manifest = json.load(handle)
+            run_manifest.setdefault("outputs", {})["backtest"] = portfolio
+            run_manifest["outputs"]["report"] = report
+            run_manifest["report_run_id"] = run.run_id
+            run_manifest["report_completed_at"] = datetime.now(timezone.utc).isoformat()
+            atomic_write_json(manifest_path, run_manifest)
+            with (run_directory / "run.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"{run_manifest['report_completed_at']} report completed run_id={run.run_id}\n")
+        return {"walk_forward_run_id": args.run_id, "backtest": portfolio, "report": report}
+
+    return _run(args, action)
 
 
 def _dependency_versions() -> dict[str, str | None]:
@@ -544,6 +569,23 @@ def _fingerprint(path: Path) -> Any:
     if payload.get("status") != "complete":
         raise DataContractError(f"Manifest is not complete: {path}")
     return payload.get("fingerprint") or payload.get("catalog_fingerprint")
+
+
+def _through(args: argparse.Namespace, config: dict[str, Any]) -> date:
+    """Resolve the inclusive end date from the command line or config; never default to the wall clock."""
+    if args.through is not None:
+        return args.through
+    configured = config.get("data", {}).get("through")
+    if configured is None:
+        raise ValueError("--through is required unless data.through is set in the configuration")
+    return _date_value(configured)
+
+
+def _universe(config: dict[str, Any]) -> str:
+    universe = str(config.get("data", {}).get("universe", "csi300"))
+    if universe not in SUPPORTED_UNIVERSES:
+        raise ValueError(f"data.universe must be one of {SUPPORTED_UNIVERSES}, got {universe!r}")
+    return universe
 
 
 def _date(value: str) -> date:

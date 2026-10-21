@@ -1,7 +1,6 @@
 project:
   data_root: data
   runs_root: runs
-  timezone: Asia/Shanghai
   seed: 42
 
 data:
@@ -19,7 +18,6 @@ factors:
   input_layout: TS
   output_layout: TS
   workers: 4
-  catalog_version: 1
 
 workflow:
   train_years: 3

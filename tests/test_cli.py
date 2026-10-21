@@ -34,7 +34,7 @@ class CliTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertTrue(callable(parser.parse_args(argv).handler))
 
-    def test_only_factor_evaluate_and_walk_forward_have_run_categories(self) -> None:
+    def test_research_commands_have_run_categories(self) -> None:
         parser = build_parser()
         factor_args = parser.parse_args(
             ["factors", "evaluate", "--factor-set", "combined", "--horizon", "20d"]
@@ -42,10 +42,12 @@ class CliTests(unittest.TestCase):
         walk_args = parser.parse_args(
             ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "combined"]
         )
+        report_args = parser.parse_args(["report", "run-id"])
         doctor_args = parser.parse_args(["doctor", "--skip-permission-check"])
 
         self.assertEqual("factors-evaluate", factor_args.run_category)
         self.assertEqual("walk-forward", walk_args.run_category)
+        self.assertEqual("report", report_args.run_category)
         self.assertFalse(hasattr(doctor_args, "run_category"))
 
     def test_run_uses_category_beneath_configured_runs_root(self) -> None:
@@ -110,6 +112,27 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(f"Run does not exist: {expected}", str(caught.exception))
             self.assertFalse(expected.exists())
+
+    def test_through_comes_from_arguments_or_config_never_the_clock(self) -> None:
+        from datetime import date
+
+        from rquant.cli import _through
+
+        self.assertEqual(
+            date(2024, 1, 5), _through(argparse.Namespace(through=date(2024, 1, 5)), {"data": {"through": None}})
+        )
+        configured = {"data": {"through": "2024-02-01"}}
+        self.assertEqual(date(2024, 2, 1), _through(argparse.Namespace(through=None), configured))
+        with self.assertRaisesRegex(ValueError, "--through is required"):
+            _through(argparse.Namespace(through=None), {"data": {"through": None}})
+
+    def test_universe_is_validated(self) -> None:
+        from rquant.cli import _universe
+
+        self.assertEqual("csi300", _universe({}))
+        self.assertEqual("all", _universe({"data": {"universe": "all"}}))
+        with self.assertRaisesRegex(ValueError, "data.universe"):
+            _universe({"data": {"universe": "csi500"}})
 
     def test_catalog_json_is_machine_readable(self) -> None:
         output = io.StringIO()

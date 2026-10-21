@@ -21,6 +21,8 @@ class PortfolioConfig:
     minimum_commission: float = 5.0
     stamp_tax_before: float = 0.001
     stamp_tax_after: float = 0.0005
+    impact_cost: float = 0.0
+    universe: str = "csi300"
 
 
 class PortfolioBacktestRunner:
@@ -75,10 +77,10 @@ class PortfolioBacktestRunner:
             freq="day",
             start_time=start_time,
             end_time=end_time,
-            codes="csi300",
+            codes=self.config.universe,
             cost_model=cost_model,
             trade_unit=self.config.trade_unit,
-            impact_cost=0.0,
+            impact_cost=self.config.impact_cost,
         )
         strategy_class = _liquidating_strategy_class(TopkDropoutStrategy)
         strategy = strategy_class(
@@ -141,7 +143,11 @@ class PortfolioBacktestRunner:
                 "t_plus_one": "TopkDropoutStrategy hold_thresh=1",
                 "suspension": "Qlib $close NaN",
                 "open_limit": "direction-aware $limit_buy/$limit_sell",
-                "market_impact": False,
+                "market_impact": (
+                    f"impact_cost * (trade_value / daily_value)^2, impact_cost={self.config.impact_cost}"
+                    if self.config.impact_cost
+                    else False
+                ),
                 "queue_model": False,
                 "capacity_model": False,
                 "terminal_liquidation": "attempted on the final available open under the same trading constraints",
