@@ -196,14 +196,18 @@ def _doctor(args: argparse.Namespace) -> int:
         try:
             importlib.import_module(module)
             record(f"import:{module}", True, "ok")
-        except BaseException as exc:
+        except Exception as exc:
             record(f"import:{module}", False, f"{type(exc).__name__}: {exc}")
-    clang = subprocess.run(["clang++", "--version"], text=True, capture_output=True, check=False)
-    record(
-        "clang++",
-        clang.returncode == 0,
-        (clang.stdout or clang.stderr).splitlines()[0] if clang.stdout or clang.stderr else "missing",
-    )
+    try:
+        clang = subprocess.run(["clang++", "--version"], text=True, capture_output=True, check=False)
+    except OSError as exc:
+        record("clang++", False, f"missing: {exc}")
+    else:
+        record(
+            "clang++",
+            clang.returncode == 0,
+            (clang.stdout or clang.stderr).splitlines()[0] if clang.stdout or clang.stderr else "missing",
+        )
     token = os.environ.get("TUSHARE_TOKEN")
     record("TUSHARE_TOKEN", bool(token), "set" if token else "missing")
     record(
@@ -260,7 +264,7 @@ def _probe_tushare_permissions(token: str) -> tuple[bool, dict[str, Any]]:
             frame = method(**query) if method else client.query(endpoint, **query)
             if frame is None:
                 failures[endpoint] = "returned None"
-        except BaseException as exc:
+        except Exception as exc:
             failures[endpoint] = f"{type(exc).__name__}: {exc}"
     return not failures, {"endpoints": sorted(probes), "failures": failures}
 
@@ -440,11 +444,11 @@ def _factor_evaluate(args: argparse.Namespace) -> int:
         data_config = config.get("data", {})
         start = args.start or _date_value(data_config.get("formal_start", "2010-01-01"))
         factor_manifest_path = paths.factors / args.factor_set / "manifest.json"
+        run.add_input("factor_manifest", _fingerprint(factor_manifest_path))
         with factor_manifest_path.open("r", encoding="utf-8") as handle:
             factor_manifest = json.load(handle)
         end = args.end or _date_value(str(factor_manifest.get("end", "")).split()[0])
         run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
-        run.add_input("factor_manifest", _fingerprint(factor_manifest_path))
         evaluation_config = FactorEvaluationConfig(
             factor_set=args.factor_set,
             horizon=args.horizon,

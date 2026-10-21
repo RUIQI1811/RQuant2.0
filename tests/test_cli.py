@@ -157,11 +157,12 @@ class CliTests(unittest.TestCase):
     def test_doctor_accepts_the_registered_factor_catalog(self) -> None:
         output = io.StringIO()
         clang = subprocess.CompletedProcess(["clang++", "--version"], 0, stdout="Apple clang version fixture\n")
+        # Replacing importlib.import_module affects how later patch targets resolve, so it must be patched last.
         with (
-            patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
-            patch("rquant.cli.importlib.import_module"),
-            patch("rquant.cli.subprocess.run", return_value=clang),
             patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
+            patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.subprocess.run", return_value=clang),
+            patch("rquant.cli.importlib.import_module"),
             redirect_stdout(output),
         ):
             code = main(["doctor", "--skip-permission-check"])
@@ -172,6 +173,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual("ok", payload["status"])
         self.assertTrue(factor_catalog["ok"])
         self.assertEqual(809, factor_catalog["detail"]["columns"])
+
+    def test_doctor_reports_missing_clang_instead_of_crashing(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
+            patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.subprocess.run", side_effect=FileNotFoundError("clang++")),
+            patch("rquant.cli.importlib.import_module"),
+            redirect_stdout(output),
+        ):
+            code = main(["doctor", "--skip-permission-check"])
+
+        payload = json.loads(output.getvalue())
+        clang = next(check for check in payload["checks"] if check["name"] == "clang++")
+        self.assertEqual(1, code)
+        self.assertFalse(clang["ok"])
+        self.assertIn("missing", clang["detail"])
 
 
 if __name__ == "__main__":
