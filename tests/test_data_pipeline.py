@@ -203,6 +203,15 @@ class DataPipelineTests(unittest.TestCase):
             warnings.simplefilter("error", FutureWarning)
             CanonicalBuilder(self.raw, self.canonical).build()
 
+    def test_rebuild_removes_stale_year_partitions(self) -> None:
+        stale = self.canonical / "bars" / "year=1999" / "bars.parquet"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"stale")
+        CanonicalBuilder(self.raw, self.canonical).build()
+        self.assertFalse(stale.exists())
+        self.assertEqual(["year=2020"], sorted(path.name for path in (self.canonical / "bars").iterdir()))
+        self.assertEqual([], list(self.canonical.glob(".bars.*")))
+
     def test_canonical_uses_only_latest_industry_snapshot(self) -> None:
         columns = ["ts_code", "in_date", "out_date", "l1_code", "l2_code", "l3_code", "is_new"]
         older = self.pd.DataFrame(

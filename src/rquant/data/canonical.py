@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from rquant.data.contracts import CANONICAL_BAR_COLUMNS
 from rquant.errors import DataContractError, DependencyError
-from rquant.io import atomic_write_json, stable_hash
+from rquant.io import atomic_replace_directory, atomic_write_json, stable_hash
 
 
 class CanonicalBuilder:
@@ -117,11 +119,18 @@ class CanonicalBuilder:
         bars = bars.loc[~invalid_ohlc].reset_index(drop=True)
         self._validate_bars(bars)
 
+        # Publish all yearly partitions at once so a narrower rebuild cannot leave stale years behind.
         bars_root = self.canonical_root / "bars"
-        for year, frame in bars.groupby(bars["datetime"].dt.year, sort=True):
-            destination = bars_root / f"year={year}" / "bars.parquet"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            frame.loc[:, CANONICAL_BAR_COLUMNS].to_parquet(destination, index=False)
+        self.canonical_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".bars.staging.", dir=self.canonical_root))
+        try:
+            for year, frame in bars.groupby(bars["datetime"].dt.year, sort=True):
+                destination = staging / f"year={year}" / "bars.parquet"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                frame.loc[:, CANONICAL_BAR_COLUMNS].to_parquet(destination, index=False)
+            atomic_replace_directory(staging, bars_root)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
         reference_root = self.canonical_root / "reference"
         reference_root.mkdir(parents=True, exist_ok=True)
