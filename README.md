@@ -132,6 +132,7 @@ rquant doctor --skip-permission-check
 | `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
 | `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
+| `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `factors.factor_set`             |   `combined` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |
