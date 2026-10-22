@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
+
+from rquant.factors.engine import cpp_compiler_available
 
 
 @unittest.skipUnless(importlib.util.find_spec("KunQuant") is not None, "KunQuant is required")
@@ -20,7 +21,7 @@ class KunQuantSmokeTests(unittest.TestCase):
         self.assertGreater(len(alpha101.ops), 101)
         self.assertGreater(len(alpha360.ops), 360)
 
-    @unittest.skipUnless(shutil.which("clang++"), "clang++ is required for KunQuant compilation")
+    @unittest.skipUnless(cpp_compiler_available(), "a C++ compiler is required for KunQuant compilation")
     def test_alpha360_graph_compiles_and_preserves_locked_lag_and_field_order(self) -> None:
         import numpy as np
 
@@ -63,7 +64,7 @@ class KunQuantSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(float(output["a360_360"][0, 0]), 0.5)
         np.testing.assert_allclose(output["a360_360"], volume / (volume + 1e-12))
 
-    @unittest.skipUnless(shutil.which("clang++"), "clang++ is required for KunQuant compilation")
+    @unittest.skipUnless(cpp_compiler_available(), "a C++ compiler is required for KunQuant compilation")
     def test_combined_graph_compiles_and_runs_all_259_outputs(self) -> None:
         import numpy as np
 

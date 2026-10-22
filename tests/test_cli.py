@@ -161,6 +161,7 @@ class CliTests(unittest.TestCase):
         with (
             patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
             patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.cpp_compiler_probe", return_value=("clang++", ["clang++", "--version"], None)),
             patch("rquant.cli.subprocess.run", return_value=clang),
             patch("rquant.cli.importlib.import_module"),
             redirect_stdout(output),
@@ -179,6 +180,7 @@ class CliTests(unittest.TestCase):
         with (
             patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
             patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.cpp_compiler_probe", return_value=("clang++", ["clang++", "--version"], None)),
             patch("rquant.cli.subprocess.run", side_effect=FileNotFoundError("clang++")),
             patch("rquant.cli.importlib.import_module"),
             redirect_stdout(output),

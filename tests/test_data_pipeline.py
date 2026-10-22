@@ -447,6 +447,47 @@ class CollectorResumeTests(unittest.TestCase):
             self.assertIn(f"cached={second['artifacts']} fetched=0", second_stderr.getvalue())
             self.assertEqual(2, len(client.industry_queries))
 
+    def test_concurrent_sync_matches_sequential_fingerprint_and_stops_on_failure(self) -> None:
+        import pandas as pd
+
+        class Client:
+            def __init__(self) -> None:
+                self.fail_date: str | None = None
+
+            def __getattr__(self, endpoint: str) -> object:
+                def fetch(**query: object) -> object:
+                    if endpoint == "trade_cal":
+                        return pd.DataFrame(
+                            [[f"202001{day:02d}", 1] for day in range(2, 10)],
+                            columns=["cal_date", "is_open"],
+                        )
+                    if endpoint == "index_member_all":
+                        return pd.DataFrame([["000001.SZ"]], columns=["ts_code"])
+                    if "trade_date" in query:
+                        if query["trade_date"] == self.fail_date:
+                            raise RuntimeError("provider outage fixture")
+                        return pd.DataFrame([["000001.SZ", query["trade_date"]]], columns=["ts_code", "trade_date"])
+                    return pd.DataFrame()
+
+                return fetch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = Client()
+            collector = TushareCollector(temporary, client=client, retries=1)
+            arguments = {"formal_start": date(2020, 1, 3), "through": date(2020, 1, 9), "warmup_trading_days": 1}
+            sequential = collector.sync(**arguments, workers=1)
+            concurrent = collector.sync(**arguments, workers=4, force=True)
+            self.assertEqual(sequential["fingerprint"], concurrent["fingerprint"])
+            self.assertEqual(concurrent["artifacts"], concurrent["fetched_artifacts"])
+
+            Path(temporary, "sync_manifest.json").unlink()
+            client.fail_date = "20200106"
+            with self.assertRaisesRegex(DataContractError, "provider outage fixture"):
+                collector.sync(**arguments, workers=4, force=True)
+            self.assertFalse(Path(temporary, "sync_manifest.json").exists())
+            with self.assertRaisesRegex(DataContractError, "positive integer"):
+                collector.sync(**arguments, workers=0)
+
     def test_empty_trading_day_is_rejected_and_never_cached(self) -> None:
         import pandas as pd
 

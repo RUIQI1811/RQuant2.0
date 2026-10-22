@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import inspect
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -20,6 +22,33 @@ from rquant.io import atomic_write_json, sha256_file, stable_hash
 
 INPUT_FIELDS = CANONICAL_INPUT_FIELDS
 FACTOR_ENGINE_VERSION = 3
+
+
+def cpp_compiler_probe() -> tuple[str, list[str], dict[str, str] | None]:
+    """Return the name, version-probe argv and environment of the C++ compiler KunQuant's JIT uses here."""
+    if sys.platform != "win32":
+        return "clang++", ["clang++", "--version"], None
+    # KunQuant compiles with MSVC on Windows and finds cl.exe through setuptools when it is not on PATH.
+    env: dict[str, str] | None = None
+    try:
+        from KunQuant.jit.env import get_compiler_env
+
+        # The discovery helper prints diagnostics to stdout, which must stay machine-readable for `doctor`.
+        with contextlib.redirect_stdout(sys.stderr):
+            env = dict(get_compiler_env())
+    except Exception:
+        env = None
+    compiler = shutil.which("cl.exe", path=(env or {}).get("PATH")) or "cl.exe"
+    # cl.exe has no version flag; invoked bare it prints its version banner and exits successfully.
+    return "cl.exe", [compiler], env
+
+
+def cpp_compiler_available() -> bool:
+    _, command, env = cpp_compiler_probe()
+    try:
+        return subprocess.run(command, capture_output=True, env=env, check=False).returncode == 0
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
