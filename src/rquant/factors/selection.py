@@ -105,3 +105,56 @@ def score_factor_stability(summary: Any, annual: Any, coverage: Any, criteria: S
         ",".join(name for name, check in checks.items() if not bool(check.loc[factor])) for factor in result.index
     ]
     return result.reset_index()
+
+
+def mean_rank_correlation(frame: Any, factor_names: list[str] | tuple[str, ...], *, min_cross_section: int = 20) -> Any:
+    """Return the mean over dates of the cross-sectional Spearman correlation between every pair of factors.
+
+    ``frame`` holds ``datetime`` plus one column per factor. Each date's values are ranked across instruments and
+    correlated pairwise over the instruments where both factors are finite; dates with fewer than
+    ``min_cross_section`` such instruments do not count for that pair.
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+    except ImportError as exc:
+        raise DependencyError("pandas and NumPy are required for factor selection") from exc
+    names = list(factor_names)
+    missing = sorted({"datetime", *names} - set(frame.columns))
+    if missing:
+        raise DataContractError(f"Factor frame is missing columns: {missing}")
+    total = np.zeros((len(names), len(names)))
+    counts = np.zeros((len(names), len(names)))
+    for _, group in frame.groupby("datetime", sort=True):
+        ranked = group[names].rank(axis=0)
+        matrix = ranked.corr(method="pearson", min_periods=min_cross_section).to_numpy()
+        valid = np.isfinite(matrix)
+        total[valid] += matrix[valid]
+        counts[valid] += 1
+    mean = np.divide(total, counts, out=np.full_like(total, np.nan), where=counts > 0)
+    return pd.DataFrame(mean, index=names, columns=names)
+
+
+def prune_correlated(
+    strength: Any, correlation: Any, *, max_abs_correlation: float
+) -> tuple[list[str], dict[str, str]]:
+    """Greedily keep the strongest factors whose absolute correlation with every kept factor stays below the limit.
+
+    ``strength`` maps factor names to the score used for ordering (for example the absolute Rank IC); ties keep the
+    input order. Returns the kept names in strength order and, for every dropped factor, the kept factor it duplicates.
+    """
+    if not 0.0 < max_abs_correlation < 1.0:
+        raise ValueError("max_abs_correlation must lie strictly between 0 and 1")
+    ordered = list(strength.sort_values(ascending=False, kind="stable").index)
+    missing = [name for name in ordered if name not in correlation.index]
+    if missing:
+        raise DataContractError(f"Correlation matrix is missing factors: {missing[:5]}")
+    kept: list[str] = []
+    dropped: dict[str, str] = {}
+    for name in ordered:
+        overlaps = correlation.loc[name, kept].abs() if kept else None
+        if overlaps is not None and (overlaps >= max_abs_correlation).any():
+            dropped[name] = str(overlaps.idxmax())
+        else:
+            kept.append(name)
+    return kept, dropped

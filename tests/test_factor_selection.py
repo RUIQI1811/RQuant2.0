@@ -15,7 +15,13 @@ from rquant.factors.libraries.base import FactorSelection, FactorSpec, PanelFact
 from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
 from rquant.factors.libraries.hquality import HQUALITY_SELECTION
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
-from rquant.factors.selection import StabilityCriteria, factor_coverage, score_factor_stability
+from rquant.factors.selection import (
+    StabilityCriteria,
+    factor_coverage,
+    mean_rank_correlation,
+    prune_correlated,
+    score_factor_stability,
+)
 from rquant.io import atomic_write_json
 
 
@@ -247,6 +253,43 @@ class FactorStabilityScoreTests(unittest.TestCase):
         coverage = factor_coverage(daily)
         self.assertAlmostEqual(1.0, coverage["full"])
         self.assertAlmostEqual(250 / 400, coverage["sparse"])
+
+
+class FactorDeduplicationTests(unittest.TestCase):
+    def _frame(self) -> pd.DataFrame:
+        rng = np.random.default_rng(7)
+        rows = []
+        for date in pd.bdate_range("2021-01-04", periods=5):
+            base = rng.normal(size=30)
+            other = rng.normal(size=30)
+            for value, independent in zip(base, other, strict=True):
+                # "mirror" is a monotone transform of "base" with the opposite sign, "noisy" is unrelated.
+                rows.append({"datetime": date, "base": value, "mirror": -np.exp(value), "noisy": independent})
+        return pd.DataFrame(rows)
+
+    # Break caught: correlation that ignores rank equivalence, or a pruner that keeps an inverted duplicate.
+    def test_monotone_and_sign_flipped_duplicates_are_pruned_in_strength_order(self) -> None:
+        correlation = mean_rank_correlation(self._frame(), ["base", "mirror", "noisy"])
+        self.assertAlmostEqual(-1.0, correlation.loc["base", "mirror"])
+        self.assertLess(abs(correlation.loc["base", "noisy"]), 0.7)
+
+        strength = pd.Series({"base": 0.02, "mirror": 0.03, "noisy": 0.01})
+        kept, dropped = prune_correlated(strength, correlation, max_abs_correlation=0.7)
+        self.assertEqual(["mirror", "noisy"], kept)
+        self.assertEqual({"base": "mirror"}, dropped)
+
+    def test_dates_below_the_cross_section_floor_do_not_count(self) -> None:
+        frame = self._frame()
+        correlation = mean_rank_correlation(frame, ["base", "noisy"], min_cross_section=31)
+        self.assertTrue(np.isnan(correlation.loc["base", "noisy"]))
+
+    def test_locked_hquality_has_no_pair_above_its_correlation_limit(self) -> None:
+        dropped = HQUALITY_SELECTION.provenance["deduplicated"]
+        kept = set(HQUALITY_SELECTION.canonical_names)
+        self.assertEqual(27, len(kept))
+        self.assertFalse(kept & set(dropped))
+        self.assertTrue(set(dropped.values()) <= kept)
+        self.assertEqual(0.7, HQUALITY_SELECTION.criteria["max_abs_rank_correlation"])
 
 
 if __name__ == "__main__":

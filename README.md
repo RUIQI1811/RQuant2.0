@@ -272,7 +272,7 @@ rquant factors catalog --factor-set combined --format csv --output factor_catalo
 - `qlib_alpha360`：`a360_001` 至 `a360_360`，共 360 列；它是 Qlib Alpha360 的六组归一化
   OHLC、VWAP 与成交量字段各取 60 个滞后期，而非 360 条手工设计的独立信号；
 - `combined`：先排列 158 列 Alpha158，再排列 101 列 Alpha101，共 259 列；
-- `Hquality`：从上述因子中按年度稳定性筛出的 43 列，跨 Alpha158、Alpha101、GTJA191 与 Alpha360，
+- `Hquality`：从上述因子中按年度稳定性筛出并按相关性去重后的 27 列，跨 Alpha158、Alpha101、GTJA191 与 Alpha360，
   成员、方向与筛选口径锁定在 `src/rquant/factors/libraries/hquality.py`（见下文“高质量因子集 Hquality”）。
 
 `combined` 保持原有 259 列契约，只包含 Alpha158 与 Alpha101，不会隐式加入 GTJA191 或 Alpha360。这样已有
@@ -292,7 +292,7 @@ src/rquant/factors/
 ├── panel_operators.py                   # 公共 Pandas 面板算子
 ├── catalog.py                           # 动态目录、稳定命名和实现指纹
 ├── engine.py                            # 后端选择、执行和标准分区写入
-├── selection.py                         # 按年度稳定性与覆盖率筛选因子
+├── selection.py                         # 按年度稳定性、覆盖率与相关性筛选因子
 └── libraries/
     ├── base.py                          # 因子库接口与输入字段契约
     ├── registry.py                      # 因子库及组合因子集注册表
@@ -412,7 +412,9 @@ rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
 - 定向年度 Rank IC 为正的年份占比不低于 75%；
 - 定向年度多空（前 20% 减后 20%）收益为正的年份占比不低于 75%；
 - 全区间 |Rank IC| 不低于 0.01；
-- 覆盖率（各交易日有效观测数之和除以当日覆盖最好的因子观测数之和）不低于 90%。
+- 覆盖率（各交易日有效观测数之和除以当日覆盖最好的因子观测数之和）不低于 90%；
+- 去重：通过以上条件的 43 个因子按 |Rank IC| 从强到弱排序，若与已保留因子的日均截面 Spearman 相关系数绝对值
+  不低于 0.7 就剔除，最终保留 27 个；被剔除因子与其对应的保留因子记在 `provenance["deduplicated"]`。
 
 成员保留源规范列名与原值，`direction=-1` 只标记反向使用，存储值不取负；树模型不受符号影响。
 
