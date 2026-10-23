@@ -20,7 +20,7 @@ class ModelConstructionTests(unittest.TestCase):
                     run_directory="unused",
                     model=name,
                     horizon="1d",
-                    factor_set="combined",
+                    factor_set="Hquality",
                 )
                 self.assertEqual(expected, type(runner._model(iterations=7, refit=True)).__name__)
 
@@ -61,7 +61,7 @@ class ModelConstructionTests(unittest.TestCase):
         dates = pd.bdate_range("2022-01-03", periods=56)
         instruments = [f"S{value:03d}" for value in range(12)]
         index = pd.MultiIndex.from_product([dates, instruments], names=["datetime", "instrument"])
-        maximum_features = len(get_catalog().canonical_names("combined"))
+        maximum_features = max(len(get_catalog().canonical_names(name)) for name in ("qlib_alpha158", "Hquality"))
         matrix = rng.normal(size=(len(index), maximum_features))
         segments = {
             "train": (dates[0], dates[34]),
@@ -69,7 +69,7 @@ class ModelConstructionTests(unittest.TestCase):
             "test": (dates[45], dates[-1]),
         }
         with R.start(experiment_name="RQuantTest", recorder_name="acceptance-grid"):
-            for factor_set in ("qlib_alpha158", "wq_alpha101", "combined"):
+            for factor_set in ("qlib_alpha158", "wq_alpha101", "Hquality"):
                 names = get_catalog().canonical_names(factor_set)
                 features = pd.DataFrame(matrix[:, : len(names)], index=index, columns=names)
                 for horizon, multiplier in (("1d", 1.0), ("5d", 5.0)):

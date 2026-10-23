@@ -304,7 +304,7 @@ DEDUPLICATED = {
 
 HQUALITY_SELECTION = FactorSelection(
     name="Hquality",
-    source_factor_sets=("combined", "gtja191"),
+    source_factor_sets=("qlib_alpha158", "wq_alpha101", "gtja191"),
     members=HQUALITY_MEMBERS,
     criteria={
         "min_year_days": 120,

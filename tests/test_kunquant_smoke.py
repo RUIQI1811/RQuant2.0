@@ -66,11 +66,21 @@ class KunQuantSmokeTests(unittest.TestCase):
         np.testing.assert_allclose(output["a360_360"], volume / (volume + 1e-12))
 
     @unittest.skipUnless(cpp_compiler_available(), "a C++ compiler is required for KunQuant compilation")
-    def test_combined_graph_compiles_and_runs_all_259_outputs(self) -> None:
+    def test_alpha158_plus_alpha101_graph_compiles_and_runs_all_259_outputs(self) -> None:
         import numpy as np
 
-        from rquant.factors.catalog import get_catalog
+        from rquant.factors.catalog import catalog_from_registry
         from rquant.factors.engine import INPUT_FIELDS, FactorBuildConfig, KunQuantFactorEngine
+        from rquant.factors.libraries.alpha101 import WorldQuantAlpha101Library
+        from rquant.factors.libraries.alpha158 import QlibAlpha158Library
+        from rquant.factors.libraries.registry import FactorLibraryRegistry
+
+        # One graph with both KunQuant libraries, as the retired combined set compiled them.
+        registry = FactorLibraryRegistry()
+        registry.register_library(QlibAlpha158Library())
+        registry.register_library(WorldQuantAlpha101Library())
+        registry.register_factor_set("smoke_alpha", ("qlib_alpha158", "wq_alpha101"))
+        catalog = catalog_from_registry(registry)
 
         # Apple Silicon requires the stock axis to align to two float64 lanes. Use an odd
         # stock count to verify that the engine pads for KunQuant and trims its outputs.
@@ -95,7 +105,9 @@ class KunQuantSmokeTests(unittest.TestCase):
         self.assertEqual(set(INPUT_FIELDS), set(inputs))
         # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
-            engine = KunQuantFactorEngine(temporary, FactorBuildConfig(factor_set="combined", workers=2))
+            engine = KunQuantFactorEngine(
+                temporary, FactorBuildConfig(factor_set="smoke_alpha", workers=2), registry=registry
+            )
             module = engine.compile()
             output = engine.run(inputs, module=module)
             padded_columns = columns + (-columns) % int(module.blocking_len)
@@ -106,7 +118,7 @@ class KunQuantSmokeTests(unittest.TestCase):
                 shape=(259, rows, padded_columns),
             )
             output_buffers = {
-                name: output_store[index] for index, name in enumerate(get_catalog().canonical_names("combined"))
+                name: output_store[index] for index, name in enumerate(catalog.canonical_names("smoke_alpha"))
             }
             mapped_output = engine.run(
                 inputs,
@@ -121,7 +133,7 @@ class KunQuantSmokeTests(unittest.TestCase):
             output_buffers.clear()
             mapped_output.clear()
             output_store._mmap.close()
-        expected = get_catalog().canonical_names("combined")
+        expected = catalog.canonical_names("smoke_alpha")
         self.assertEqual(expected, tuple(output))
         self.assertEqual((rows, columns), output["a158_001"].shape)
         self.assertEqual((rows, columns), output["a101_101"].shape)

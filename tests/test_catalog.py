@@ -30,12 +30,11 @@ class FactorCatalogTests(unittest.TestCase):
         self.assertEqual(source_names, [spec.source_name for spec in specs])
         self.assertEqual(expressions, [spec.formula for spec in specs])
 
-    # Break caught: registering standalone Alpha360 accidentally changes the locked combined
-    # Alpha158-plus-Alpha101 bundle.
-    def test_alpha360_does_not_expand_combined(self) -> None:
+    # Break caught: the retired combined bundle reappearing, or removing it dropping factors from the catalog.
+    def test_combined_is_retired_without_shrinking_the_catalog(self) -> None:
         catalog = get_catalog()
         self.assertEqual(809, len(catalog.specs))
-        self.assertEqual(259, len(catalog.select("combined")))
+        self.assertNotIn("combined", catalog.factor_sets())
 
     # Break caught: Alpha158 specs that omit, duplicate, or reorder canonical output positions.
     def test_alpha158_is_strictly_numbered(self) -> None:
@@ -54,13 +53,6 @@ class FactorCatalogTests(unittest.TestCase):
         names = get_catalog().canonical_names("wq_alpha101")
         self.assertEqual(tuple(f"a101_{value:03d}" for value in range(1, 102)), names)
         self.assertEqual(19, len(ALPHA101_UPSTREAM_MISSING))
-
-    def test_combined_order_is_locked(self) -> None:
-        names = get_catalog().canonical_names("combined")
-        self.assertEqual(259, len(names))
-        self.assertEqual("a158_158", names[157])
-        self.assertEqual("a101_001", names[158])
-        self.assertEqual("a101_101", names[-1])
 
     def test_factor_frame_accepts_only_canonical_order(self) -> None:
         expected = list(get_catalog().canonical_names("qlib_alpha158"))

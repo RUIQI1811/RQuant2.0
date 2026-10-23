@@ -32,12 +32,15 @@ qlib_alpha360
 rquant doctor
 rquant data sync --through 2026-08-04
 rquant data build-qlib
-rquant factors build --factor-set combined
-rquant factors validate --factor-set combined
+rquant factors build --factor-set qlib_alpha158
+rquant factors build --factor-set wq_alpha101
+rquant factors build --factor-set gtja191
+rquant factors build --factor-set Hquality
+rquant factors validate --factor-set Hquality
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
-rquant walk-forward --model lgb --horizon 1d --factor-set combined \
+rquant walk-forward --model lgb --horizon 1d --factor-set Hquality \
   --first-year 2013 --last-year 2026 --through 2026-08-04
   
 rquant report RUN_ID
@@ -133,7 +136,7 @@ rquant doctor --skip-permission-check
 | `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
-| `factors.factor_set`             |   `combined` | 默认因子集                   |
+| `factors.factor_set`             |   `Hquality` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |
 | `workflow.validation_months`     |          `6` | 训练窗口最后几个月用于选择迭代数 |
@@ -254,14 +257,14 @@ rquant factors catalog --factor-set qlib_alpha158
 rquant factors catalog --factor-set wq_alpha101
 rquant factors catalog --factor-set gtja191
 rquant factors catalog --factor-set qlib_alpha360
-rquant factors catalog --factor-set combined
+rquant factors catalog --factor-set Hquality
 ```
 
 导出机器可读目录：
 
 ```bash
-rquant factors catalog --factor-set combined --format json --output factor_catalog.json
-rquant factors catalog --factor-set combined --format csv --output factor_catalog.csv
+rquant factors catalog --factor-set Hquality --format json --output factor_catalog.json
+rquant factors catalog --factor-set Hquality --format csv --output factor_catalog.csv
 ```
 
 因子集：
@@ -271,12 +274,11 @@ rquant factors catalog --factor-set combined --format csv --output factor_catalo
 - `gtja191`：`gtja_001` 至 `gtja_191`（暂时排除 `gtja_030`），共 190 列；
 - `qlib_alpha360`：`a360_001` 至 `a360_360`，共 360 列；它是 Qlib Alpha360 的六组归一化
   OHLC、VWAP 与成交量字段各取 60 个滞后期，而非 360 条手工设计的独立信号；
-- `combined`：先排列 158 列 Alpha158，再排列 101 列 Alpha101，共 259 列；
 - `Hquality`：从上述因子中按年度 RankIC 稳定性筛出并按相关性去重后的 137 列，来自 Alpha158、Alpha101 与 GTJA191（不含 Alpha360），
   成员、方向与筛选口径锁定在 `src/rquant/factors/libraries/hquality.py`（见下文“高质量因子集 Hquality”）。
 
-`combined` 保持原有 259 列契约，只包含 Alpha158 与 Alpha101，不会隐式加入 GTJA191 或 Alpha360。这样已有
-模型和历史产物的列数、顺序与指纹不会因新增因子库而静默改变。
+原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
+但当前代码不再构建或读取 `data/factors/combined`。
 
 固定目录保留来源名称、公式标识、序号、最大回看期和实现方式，但模型特征只暴露规范列名。
 
@@ -396,8 +398,8 @@ rquant factors validate --factor-set qlib_alpha360
 
 ### 高质量因子集 Hquality
 
-`Hquality` 不重算公式，而是从已构建的 `combined`、`gtja191` 复制所选列，因此必须先构建这两个
-源因子集。构建会核对每个源清单的状态、目录指纹、引擎指纹、标准数据指纹与分区哈希，任一过期即失败：
+`Hquality` 不重算公式，而是从已构建的 `qlib_alpha158`、`wq_alpha101`、`gtja191` 复制所选列，因此必须先构建
+这三个源因子集。构建会核对每个源清单的状态、目录指纹、引擎指纹、标准数据指纹与分区哈希，任一过期即失败：
 
 ```bash
 rquant factors build --factor-set Hquality
@@ -410,7 +412,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
 - 方向取全区间日均 Rank IC 的符号，年度统计都按该方向定向，稳定为负的因子以 `direction=-1` 反向保留；
 - 只统计评估日数不少于 120 天的年份；
 - 定向年度 Rank IC 为正的年份占比不低于 70%；
-- 不要求年度多空收益为正：要求 75% 年份为正时只剩 43 个因子，LGB 回测年化 10.1%，明显低于 `combined`；
+- 不要求年度多空收益为正：要求 75% 年份为正时只剩 43 个因子，LGB 回测年化 10.1%，明显低于 Alpha158 加 Alpha101 的 18.7%；
 - 全区间 |Rank IC| 不低于 0.01；
 - 排除全部 Alpha360：保留其 42 个滞后特征时回测年化 16.2%、夏普 0.74，去掉后为 19.1%、0.83；
 - 覆盖率（各交易日有效观测数之和除以当日覆盖最好的因子观测数之和）不低于 80%；
@@ -419,16 +421,17 @@ rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
 
 成员保留源规范列名与原值，`direction=-1` 只标记反向使用，存储值不取负；树模型不受符号影响。
 
-完整研究通常构建组合因子集：
+完整研究先构建各个源因子集，再构建 Hquality：
 
 ```bash
-rquant factors build --factor-set combined
+rquant factors build --factor-set qlib_alpha158
+rquant factors build --factor-set Hquality
 ```
 
 如需进行限定日期的诊断构建，可以指定：
 
 ```bash
-rquant factors build --factor-set combined --start 2020-01-01 --end 2020-12-31
+rquant factors build --factor-set qlib_alpha158 --start 2020-01-01 --end 2020-12-31
 ```
 
 因子在股票池成员的全部历史行情上计算（包括入选沪深 300 之前和调出之后的日子），因此新进成分股在入选当天就有
@@ -437,8 +440,8 @@ rquant factors build --factor-set combined --start 2020-01-01 --end 2020-12-31
 因子结果按年份写入：
 
 ```text
-data/factors/combined/year=YYYY/factors.parquet
-data/factors/combined/manifest.json
+data/factors/qlib_alpha158/year=YYYY/factors.parquet
+data/factors/qlib_alpha158/manifest.json
 ```
 
 限定日期构建不能代替完整研究所需的全历史因子。开始滚动训练前，要确认因子清单覆盖所有训练、验证、测试和标签所需日期。
@@ -446,8 +449,8 @@ data/factors/combined/manifest.json
 ### 验证因子
 
 ```bash
-rquant factors validate --factor-set combined
-python -m json.tool data/factors/combined/manifest.json
+rquant factors validate --factor-set Hquality
+python -m json.tool data/factors/Hquality/manifest.json
 ```
 
 验证会检查所有分区的因子列是否完整、无重复、顺序固定，并拒绝暴露上游原始列名。清单中的
@@ -459,7 +462,7 @@ python -m json.tool data/factors/combined/manifest.json
 
 ```bash
 rquant factors evaluate \
-  --factor-set combined \
+  --factor-set Hquality \
   --horizon 1d \
   --start 2010-01-01 \
   --end 2026-08-03
@@ -505,7 +508,7 @@ annual_effectiveness.csv
 rquant walk-forward \
   --model lgb \
   --horizon 1d \
-  --factor-set combined \
+  --factor-set Hquality \
   --first-year 2013 \
   --last-year 2026 \
   --through 2026-08-04
