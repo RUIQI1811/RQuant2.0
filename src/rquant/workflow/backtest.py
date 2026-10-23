@@ -78,7 +78,10 @@ class PortfolioBacktestRunner:
             freq="day",
             start_time=start_time,
             end_time=end_time,
-            codes=self.config.universe,
+            # Quotes must cover every instrument the strategy can hold, for its whole history: a "csi300" market only
+            # returns quotes inside membership spans, so holdings that left the index could never be sold again.
+            # The signal itself is already restricted to point-in-time universe members, so buys stay in-universe.
+            codes=sorted(predictions["instrument"].unique()),
             cost_model=cost_model,
             trade_unit=self.config.trade_unit,
             impact_cost=self.config.impact_cost,
