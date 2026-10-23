@@ -49,7 +49,9 @@ class QlibProviderBuilder:
         bars_paths = sorted((self.canonical_root / "bars").glob("year=*/bars.parquet"))
         if not bars_paths:
             raise DataContractError("No canonical bar partitions found")
-        bars = pd.concat([pd.read_parquet(path) for path in bars_paths], ignore_index=True)
+        # Only the provider fields are loaded; the full canonical history does not fit in memory on smaller machines.
+        columns = ["instrument", "datetime", *QLIB_FIELDS]
+        bars = pd.concat([pd.read_parquet(path, columns=columns) for path in bars_paths], ignore_index=True)
         bars["datetime"] = pd.to_datetime(bars["datetime"])
         calendar = self._calendar(end_time=bars["datetime"].max())
         future_calendar = self._calendar()

@@ -156,11 +156,14 @@ class CliTests(unittest.TestCase):
 
     def test_doctor_accepts_the_registered_factor_catalog(self) -> None:
         output = io.StringIO()
-        clang = subprocess.CompletedProcess(["clang++", "--version"], 0, stdout="Apple clang version fixture\n")
+        clang = subprocess.CompletedProcess(
+            ["clang++", "--version"], 0, stdout=b"Apple clang version fixture\n", stderr=b""
+        )
         # Replacing importlib.import_module affects how later patch targets resolve, so it must be patched last.
         with (
             patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
             patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.cpp_compiler_probe", return_value=("clang++", ["clang++", "--version"], None)),
             patch("rquant.cli.subprocess.run", return_value=clang),
             patch("rquant.cli.importlib.import_module"),
             redirect_stdout(output),
@@ -179,6 +182,7 @@ class CliTests(unittest.TestCase):
         with (
             patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),
             patch("rquant.cli._dependency_versions", return_value=LOCKED_DEPENDENCIES),
+            patch("rquant.cli.cpp_compiler_probe", return_value=("clang++", ["clang++", "--version"], None)),
             patch("rquant.cli.subprocess.run", side_effect=FileNotFoundError("clang++")),
             patch("rquant.cli.importlib.import_module"),
             redirect_stdout(output),

@@ -49,10 +49,10 @@ rquant report RUN_ID
 
 需要：
 
-- macOS 或兼容的类 Unix 环境；
+- macOS 或兼容的类 Unix 环境；Windows 亦可运行（编译器见下一条）；
 - Conda；
 - Python 3.11；
-- `clang++`；
+- `clang++`（Windows 上为 MSVC `cl.exe`，即 Visual Studio Build Tools 的“使用 C++ 的桌面开发”工作负载）；
 - 可用的 Tushare token，以及本项目所需接口权限。
 
 项目只使用名为 `rquant` 的 Conda 环境，不要复用 `base`、`stocktrade`、旧版 RQuant 或其他项目的环境。
@@ -107,7 +107,7 @@ rquant doctor
 - Python 是否为 3.11；
 - `pyqlib==0.9.7`、`KunQuant==0.1.11`、`tushare==1.4.29`；
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
-- `clang++`；
+- KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
 - 809 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360）；
 - 默认配置和本地数据清单；
@@ -132,6 +132,7 @@ rquant doctor --skip-permission-check
 | `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
 | `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
+| `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `factors.factor_set`             |   `combined` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |

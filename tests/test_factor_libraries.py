@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-import shutil
 import tempfile
 import unittest
 
 from rquant.errors import FactorContractError
 from rquant.factors.catalog import catalog_from_registry
-from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine
+from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine, cpp_compiler_available
 from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
 
@@ -120,8 +119,8 @@ class FactorLibraryRegistryTests(unittest.TestCase):
             registry.register_library(invalid)
 
     @unittest.skipUnless(
-        importlib.util.find_spec("KunQuant") is not None and shutil.which("clang++"),
-        "KunQuant and clang++ are required",
+        importlib.util.find_spec("KunQuant") is not None and cpp_compiler_available(),
+        "KunQuant and its C++ compiler are required",
     )
     def test_custom_library_compiles_and_runs_through_generic_engine(self) -> None:
         import numpy as np
@@ -134,7 +133,8 @@ class FactorLibraryRegistryTests(unittest.TestCase):
             "low": np.array([[8.0, 18.0, 27.0], [9.0, 17.0, 28.0]]),
             "close": np.array([[12.0, 21.0, 33.0], [13.0, 22.0, 31.0]]),
         }
-        with tempfile.TemporaryDirectory() as temporary:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             engine = KunQuantFactorEngine(
                 temporary,
                 FactorBuildConfig(factor_set="custom_price", workers=1),

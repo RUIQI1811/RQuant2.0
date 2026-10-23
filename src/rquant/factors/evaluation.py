@@ -13,6 +13,7 @@ from rquant.errors import DataContractError, DependencyError
 from rquant.factors.catalog import FactorSet, get_catalog
 from rquant.io import atomic_replace_file, atomic_write_json, sha256_file
 from rquant.qlib_ext.loader import HORIZON_STEPS, LABEL_EXPRESSIONS
+from rquant.qlib_ext.runtime import qlib_init_kwargs
 
 
 @dataclass(frozen=True)
@@ -75,7 +76,7 @@ class FactorEvaluator:
         if not partitions:
             raise DataContractError(f"No factor partitions for {self.config.factor_set}: {factor_directory}")
 
-        qlib.init(provider_uri=str(self.qlib_root), region=REG_CN)
+        qlib.init(provider_uri=str(self.qlib_root), region=REG_CN, **qlib_init_kwargs())
         calendar = pd.DatetimeIndex(
             D.calendar(start_time=start_timestamp, end_time=end_timestamp, freq="day")
         ).normalize()

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import inspect
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -20,6 +23,82 @@ from rquant.io import atomic_write_json, sha256_file, stable_hash
 
 INPUT_FIELDS = CANONICAL_INPUT_FIELDS
 FACTOR_ENGINE_VERSION = 3
+
+
+def cpp_compiler_probe() -> tuple[str, list[str], dict[str, str] | None]:
+    """Return the name, version-probe argv and environment of the C++ compiler KunQuant's JIT uses here."""
+    if sys.platform != "win32":
+        return "clang++", ["clang++", "--version"], None
+    # KunQuant compiles with MSVC on Windows and finds cl.exe through setuptools when it is not on PATH.
+    env: dict[str, str] | None = None
+    try:
+        from KunQuant.jit.env import get_compiler_env
+
+        # The discovery helper prints diagnostics to stdout, which must stay machine-readable for `doctor`.
+        with contextlib.redirect_stdout(sys.stderr):
+            env = dict(get_compiler_env())
+    except Exception:
+        env = None
+    compiler = shutil.which("cl.exe", path=(env or {}).get("PATH")) or "cl.exe"
+    # cl.exe has no version flag; invoked bare it prints its version banner and exits successfully.
+    return "cl.exe", [compiler], env
+
+
+def expose_msvc_compiler() -> None:
+    """Put KunQuant's discovered cl.exe on this process's PATH.
+
+    KunQuant launches a bare ``cl.exe`` with a child environment that names the MSVC directory, but Windows resolves
+    the executable from the parent's PATH, so compilation fails whenever that PATH was not already extended.
+    """
+    if sys.platform != "win32" or shutil.which("cl.exe"):
+        return
+    _, command, _ = cpp_compiler_probe()
+    if os.path.isabs(command[0]):
+        os.environ["PATH"] = os.path.dirname(command[0]) + os.pathsep + os.environ.get("PATH", "")
+
+
+@contextlib.contextmanager
+def _stdout_to_stderr() -> Any:
+    """Send child-process output to stderr; compiler messages would otherwise corrupt the JSON printed on stdout."""
+    sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
+def load_kunquant_library(path: str) -> Any:
+    """Load a compiled KunQuant library, staging it at an ASCII path on Windows when needed.
+
+    KunRunner opens the DLL through a narrow-string Windows API, which cannot address non-ASCII paths such as a
+    project folder with Chinese characters; the cached build stays in the project and only a copy is loaded.
+    """
+    from KunQuant.runner import KunRunner
+
+    if sys.platform == "win32" and not path.isascii():
+        source = Path(path)
+        loadable = Path(tempfile.gettempdir()) / "rquant-kunquant" / source.parent.name / source.name
+        if not str(loadable).isascii():
+            raise DependencyError(
+                f"KunQuant cannot load libraries from non-ASCII paths; set TEMP to an ASCII directory (got {loadable})"
+            )
+        if not loadable.exists() or sha256_file(loadable) != sha256_file(source):
+            loadable.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, loadable)
+        path = str(loadable)
+    return KunRunner.Library.load(path)
+
+
+def cpp_compiler_available() -> bool:
+    _, command, env = cpp_compiler_probe()
+    try:
+        return subprocess.run(command, capture_output=True, env=env, check=False).returncode == 0
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -120,18 +199,22 @@ class KunQuantFactorEngine:
         except ImportError as exc:
             raise DependencyError("KunQuant==0.1.11 is required for factor computation") from exc
 
+        expose_msvc_compiler()
         fingerprint = self.compilation_fingerprint()
         target = self.cache_dir / "kunquant" / fingerprint
         target.mkdir(parents=True, exist_ok=True)
         function, compiler_config = self.build_graph()
         library_name = f"rquant_{self.config.factor_set}_{fingerprint[:12]}"
-        library = cfake.compileit(
-            [("rquant_factors", function, compiler_config)],
-            library_name,
-            cfake.CppCompilerConfig(),
-            tempdir=str(target),
-            keep_files=True,
-        )
+        with _stdout_to_stderr():
+            compiled = cfake.compileit(
+                [("rquant_factors", function, compiler_config)],
+                library_name,
+                cfake.CppCompilerConfig(),
+                tempdir=str(target),
+                keep_files=True,
+                load=False,
+            )
+        library = load_kunquant_library(compiled)
         atomic_write_json(
             target / "compile.json",
             {

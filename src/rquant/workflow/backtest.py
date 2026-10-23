@@ -8,6 +8,7 @@ from typing import Any
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.exchange import AshareCostModel, AshareExchange
+from rquant.qlib_ext.runtime import qlib_init_kwargs
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class PortfolioBacktestRunner:
         from qlib.contrib.strategy import TopkDropoutStrategy
         from qlib.data import D
 
-        qlib.init(provider_uri=str(self.qlib_root), region=REG_CN)
+        qlib.init(provider_uri=str(self.qlib_root), region=REG_CN, **qlib_init_kwargs())
         start_time = predictions["datetime"].min()
         signal_end = predictions["datetime"].max()
         later = D.calendar(start_time=signal_end, freq="day")
@@ -77,7 +78,10 @@ class PortfolioBacktestRunner:
             freq="day",
             start_time=start_time,
             end_time=end_time,
-            codes=self.config.universe,
+            # Quotes must cover every instrument the strategy can hold, for its whole history: a "csi300" market only
+            # returns quotes inside membership spans, so holdings that left the index could never be sold again.
+            # The signal itself is already restricted to point-in-time universe members, so buys stay in-universe.
+            codes=sorted(predictions["instrument"].unique()),
             cost_model=cost_model,
             trade_unit=self.config.trade_unit,
             impact_cost=self.config.impact_cost,

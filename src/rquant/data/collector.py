@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -234,14 +235,18 @@ class TushareCollector:
         index_code: str = "399300.SZ",
         force: bool = False,
         show_progress: bool = False,
+        workers: int = 1,
     ) -> dict[str, Any]:
         if through >= date.today() + timedelta(days=1):
             raise DataContractError("--through cannot be in the future")
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+            raise DataContractError("sync workers must be a positive integer")
         calendar_buffer_days = max(450, warmup_trading_days * 2)
         fetch_start = formal_start - timedelta(days=calendar_buffer_days)
         artifacts: list[FetchArtifact] = []
         cached_artifacts = 0
         fetched_artifacts = 0
+        progress_lock = threading.Lock()
         progress = tqdm(
             total=4,
             desc="Tushare preparing",
@@ -262,16 +267,17 @@ class TushareCollector:
             artifact, cached = self._fetch_partition(
                 endpoint, query, partition, force=force, require_rows=require_rows
             )
-            if cached:
-                cached_artifacts += 1
-            else:
-                fetched_artifacts += 1
-            progress.set_description_str(f"Tushare {endpoint} {partition}", refresh=False)
-            progress.set_postfix_str(
-                f"cached={cached_artifacts} fetched={fetched_artifacts}",
-                refresh=False,
-            )
-            progress.update()
+            with progress_lock:
+                if cached:
+                    cached_artifacts += 1
+                else:
+                    fetched_artifacts += 1
+                progress.set_description_str(f"Tushare {endpoint} {partition}", refresh=False)
+                progress.set_postfix_str(
+                    f"cached={cached_artifacts} fetched={fetched_artifacts}",
+                    refresh=False,
+                )
+                progress.update()
             return artifact
 
         try:
@@ -309,18 +315,12 @@ class TushareCollector:
             progress.total = 4 + len(open_dates) * len(RAW_DAILY_ENDPOINTS) + 1 + len(month_starts) + 2
             progress.refresh()
 
-            for trade_date in open_dates:
-                query_date = trade_date.strftime("%Y%m%d")
-                for endpoint in RAW_DAILY_ENDPOINTS:
-                    artifacts.append(
-                        fetch(
-                            endpoint,
-                            {"trade_date": query_date},
-                            f"trade_date={query_date}",
-                            # Every open trading day has quotes; an empty answer means "not published yet".
-                            require_rows=True,
-                        )
-                    )
+            daily_requests = [
+                (endpoint, trade_date.strftime("%Y%m%d"))
+                for trade_date in open_dates
+                for endpoint in RAW_DAILY_ENDPOINTS
+            ]
+            artifacts.extend(self._fetch_daily_partitions(daily_requests, fetch=fetch, workers=workers))
 
             artifacts.append(
                 fetch(
@@ -369,6 +369,31 @@ class TushareCollector:
             raise
         finally:
             progress.close()
+
+    @staticmethod
+    def _fetch_daily_partitions(
+        requests: list[tuple[str, str]], *, fetch: Any, workers: int
+    ) -> list[FetchArtifact]:
+        """Fetch per-trading-day partitions, overlapping request latency across ``workers`` threads.
+
+        The shared rate limiter still caps total throughput, and results keep the request order so the sync
+        fingerprint does not depend on the worker count.
+        """
+
+        def fetch_one(request: tuple[str, str]) -> FetchArtifact:
+            endpoint, query_date = request
+            # Every open trading day has quotes; an empty answer means "not published yet".
+            return fetch(endpoint, {"trade_date": query_date}, f"trade_date={query_date}", require_rows=True)
+
+        if workers == 1:
+            return [fetch_one(request) for request in requests]
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-sync")
+        futures = [executor.submit(fetch_one, request) for request in requests]
+        try:
+            return [future.result() for future in futures]
+        finally:
+            # On the first failure, stop queued requests instead of draining the whole history.
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _fetch_industry_history(self, *, fetch: Any, progress: Any, snapshot_date: date) -> list[FetchArtifact]:
         artifacts: list[FetchArtifact] = []

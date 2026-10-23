@@ -28,59 +28,19 @@ class CanonicalBuilder:
         if raw_manifest.get("status") != "complete":
             raise DataContractError("Raw sync is not complete")
 
-        daily = self._read_endpoint("daily")
-        adjustment = self._read_endpoint("adj_factor")
-        daily_basic = self._read_endpoint("daily_basic")
-        limits = self._read_endpoint("stk_limit")
         stock_basic = self._read_endpoint("stock_basic")
         industry = self._read_industry_membership(raw_manifest.get("industry_snapshot"))
         index_weight = self._read_endpoint("index_weight")
 
-        required_daily = {"ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "vol", "amount"}
-        if not required_daily.issubset(daily.columns):
-            raise DataContractError(f"daily is missing fields: {sorted(required_daily - set(daily.columns))}")
-        if not {"ts_code", "trade_date", "adj_factor"}.issubset(adjustment.columns):
-            raise DataContractError("adj_factor response lacks ts_code/trade_date/adj_factor")
-
-        daily = daily.drop_duplicates(["ts_code", "trade_date"], keep="last")
-        adjustment = adjustment.drop_duplicates(["ts_code", "trade_date"], keep="last")
-        bars = daily.merge(
-            adjustment[["ts_code", "trade_date", "adj_factor"]], on=["ts_code", "trade_date"], how="left"
-        )
-        if "total_mv" in daily_basic.columns:
-            cap = daily_basic[["ts_code", "trade_date", "total_mv"]].drop_duplicates(
-                ["ts_code", "trade_date"], keep="last"
-            )
-            cap["cap"] = pd.to_numeric(cap["total_mv"], errors="coerce") * 10_000.0
-            bars = bars.merge(cap[["ts_code", "trade_date", "cap"]], on=["ts_code", "trade_date"], how="left")
-        else:
-            bars["cap"] = np.nan
-
-        limit_columns = [
-            column for column in ("ts_code", "trade_date", "up_limit", "down_limit") if column in limits.columns
-        ]
-        if set(limit_columns) == {"ts_code", "trade_date", "up_limit", "down_limit"}:
-            bars = bars.merge(
-                limits[limit_columns].drop_duplicates(["ts_code", "trade_date"], keep="last"),
-                on=["ts_code", "trade_date"],
-                how="left",
-            )
-        else:
-            bars["up_limit"] = np.nan
-            bars["down_limit"] = np.nan
-
-        bars["datetime"] = pd.to_datetime(bars["trade_date"], format="%Y%m%d", errors="raise")
-        bars["instrument"] = bars["ts_code"].map(ts_code_to_qlib)
-        numeric = ("open", "high", "low", "close", "pre_close", "vol", "amount", "adj_factor", "up_limit", "down_limit")
-        for column in numeric:
-            bars[column] = pd.to_numeric(bars[column], errors="coerce")
-
-        bars = bars.sort_values(["instrument", "datetime"]).reset_index(drop=True)
+        bars = self._read_daily_bars()
+        bars = bars.sort_values(["datetime", "instrument"]).reset_index(drop=True)
+        # Rows are in date order within each instrument, so "first" is the earliest quote.
         first = bars.groupby("instrument", sort=False).agg(
             first_adj=("adj_factor", "first"), first_close=("close", "first")
         )
-        bars = bars.join(first, on="instrument")
-        bars["factor"] = bars["adj_factor"] / (bars["first_adj"] * bars["first_close"])
+        bars["factor"] = bars["adj_factor"] / (
+            bars["instrument"].map(first["first_adj"]) * bars["instrument"].map(first["first_close"])
+        )
 
         bars["raw_open"] = bars["open"]
         bars["raw_high"] = bars["high"]
@@ -99,10 +59,11 @@ class CanonicalBuilder:
         bars["change"] = bars["raw_close"] / bars["raw_pre_close"] - 1.0
         bars["limit_buy"] = bars["up_limit"].notna() & bars["raw_open"].round(2).ge(bars["up_limit"].round(2))
         bars["limit_sell"] = bars["down_limit"].notna() & bars["raw_open"].round(2).le(bars["down_limit"].round(2))
+        for column in ("pre_close", "vol", "adj_factor", "up_limit", "down_limit"):
+            del bars[column]
 
         bars = self._attach_index_membership(bars, index_weight)
         bars = self._attach_industry(bars, industry)
-        bars = bars.sort_values(["datetime", "instrument"]).reset_index(drop=True)
         invalid_ohlc = self._invalid_ohlc_mask(bars)
         invalid_research_rows = invalid_ohlc & bars["in_csi300"]
         if invalid_research_rows.any():
@@ -116,8 +77,10 @@ class CanonicalBuilder:
             ["ts_code", "instrument", "datetime", "raw_open", "raw_high", "raw_low", "raw_close"],
         ].copy()
         ohlc_exclusions["reason"] = "invalid_ohlc_outside_csi300"
-        bars = bars.loc[~invalid_ohlc].reset_index(drop=True)
-        self._validate_bars(bars)
+        # Excluded rows are dropped per year instead of filtering (and copying) the full-history frame.
+        kept = ~invalid_ohlc
+        if not kept.any():
+            raise DataContractError("Canonical bars are empty")
 
         # Publish all yearly partitions at once so a narrower rebuild cannot leave stale years behind.
         bars_root = self.canonical_root / "bars"
@@ -125,6 +88,10 @@ class CanonicalBuilder:
         staging = Path(tempfile.mkdtemp(prefix=".bars.staging.", dir=self.canonical_root))
         try:
             for year, frame in bars.groupby(bars["datetime"].dt.year, sort=True):
+                frame = frame.loc[kept.loc[frame.index]]
+                if frame.empty:
+                    continue
+                self._validate_bars(frame)
                 destination = staging / f"year={year}" / "bars.parquet"
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 frame.loc[:, CANONICAL_BAR_COLUMNS].to_parquet(destination, index=False)
@@ -151,28 +118,106 @@ class CanonicalBuilder:
             ),
         }
 
+        rows = int(kept.sum())
+        kept_dates = bars.loc[kept, "datetime"]
         manifest = {
             "status": "complete",
             "raw_fingerprint": raw_manifest.get("fingerprint"),
-            "rows": len(bars),
-            "instruments": int(bars["instrument"].nunique()),
-            "start": bars["datetime"].min().date().isoformat(),
-            "end": bars["datetime"].max().date().isoformat(),
+            "rows": rows,
+            "instruments": int(bars.loc[kept, "instrument"].nunique()),
+            "start": kept_dates.min().date().isoformat(),
+            "end": kept_dates.max().date().isoformat(),
             "columns": list(CANONICAL_BAR_COLUMNS),
             "quality": quality,
             "fingerprint": stable_hash(
                 {
                     "raw": raw_manifest.get("fingerprint"),
-                    "rows": len(bars),
+                    "rows": rows,
                     "columns": list(CANONICAL_BAR_COLUMNS),
-                    "start": str(bars["datetime"].min()),
-                    "end": str(bars["datetime"].max()),
+                    "start": str(kept_dates.min()),
+                    "end": str(kept_dates.max()),
                     "quality": quality,
                 }
             ),
         }
         atomic_write_json(self.canonical_root / "manifest.json", manifest)
         return manifest
+
+    def _read_daily_bars(self) -> Any:
+        """Join daily, adj_factor, daily_basic and stk_limit one raw partition at a time.
+
+        The per-day endpoints share partition names, so joining partition by partition gives the same rows as joining
+        the concatenated endpoints, without holding every endpoint's full history (and its per-row key strings) in
+        memory at once.
+        """
+        pd, np = _dependencies()
+        keys = ["ts_code", "trade_date"]
+        required_daily = [*keys, "open", "high", "low", "close", "pre_close", "vol", "amount"]
+        daily_paths = sorted((self.raw_root / "daily").glob("**/data.parquet"))
+        if not daily_paths:
+            raise DataContractError("No raw artifacts for endpoint: daily")
+        # One shared string object per code keeps the object columns at pointer size across ~15M rows.
+        ts_codes: dict[str, str] = {}
+        instruments: dict[str, str] = {}
+        frames = []
+        for daily_path in daily_paths:
+            partition = daily_path.parent.relative_to(self.raw_root / "daily")
+            daily = pd.read_parquet(daily_path).drop_duplicates()
+            if daily.empty:
+                continue
+            missing = set(required_daily) - set(daily.columns)
+            if missing:
+                raise DataContractError(f"daily is missing fields: {sorted(missing)}")
+            bars = daily[required_daily].drop_duplicates(keys, keep="last")
+
+            adjustment = self._read_partition("adj_factor", partition)
+            if adjustment is not None and not adjustment.empty:
+                if not {"ts_code", "trade_date", "adj_factor"}.issubset(adjustment.columns):
+                    raise DataContractError("adj_factor response lacks ts_code/trade_date/adj_factor")
+                adjustment = adjustment.drop_duplicates(keys, keep="last")
+                bars = bars.merge(adjustment[[*keys, "adj_factor"]], on=keys, how="left")
+            else:
+                bars["adj_factor"] = np.nan
+
+            daily_basic = self._read_partition("daily_basic", partition)
+            if daily_basic is not None and "total_mv" in daily_basic.columns:
+                cap = daily_basic[[*keys, "total_mv"]].drop_duplicates(keys, keep="last")
+                cap["cap"] = pd.to_numeric(cap["total_mv"], errors="coerce") * 10_000.0
+                bars = bars.merge(cap[[*keys, "cap"]], on=keys, how="left")
+            else:
+                bars["cap"] = np.nan
+
+            limits = self._read_partition("stk_limit", partition)
+            limit_columns = [*keys, "up_limit", "down_limit"]
+            if limits is not None and set(limit_columns).issubset(limits.columns):
+                bars = bars.merge(limits[limit_columns].drop_duplicates(keys, keep="last"), on=keys, how="left")
+            else:
+                bars["up_limit"] = np.nan
+                bars["down_limit"] = np.nan
+
+            for code in bars["ts_code"].unique():
+                if code not in ts_codes:
+                    ts_codes[code] = code
+                    instruments[code] = ts_code_to_qlib(code)
+            bars["instrument"] = bars["ts_code"].map(instruments)
+            bars["ts_code"] = bars["ts_code"].map(ts_codes)
+            bars["datetime"] = pd.to_datetime(bars["trade_date"], format="%Y%m%d", errors="raise")
+            del bars["trade_date"]
+            for column in (
+                "open", "high", "low", "close", "pre_close", "vol", "amount", "adj_factor", "up_limit", "down_limit"
+            ):
+                bars[column] = pd.to_numeric(bars[column], errors="coerce")
+            frames.append(bars)
+        if not frames:
+            raise DataContractError("No raw artifacts for endpoint: daily")
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    def _read_partition(self, endpoint: str, partition: Path) -> Any | None:
+        pd, _ = _dependencies()
+        path = self.raw_root / endpoint / partition / "data.parquet"
+        if not path.exists():
+            return None
+        return pd.read_parquet(path).drop_duplicates()
 
     def _read_endpoint(self, endpoint: str) -> Any:
         pd, _ = _dependencies()
@@ -211,8 +256,8 @@ class CanonicalBuilder:
         return with_schema[0].iloc[0:0].copy()
 
     def _attach_index_membership(self, bars: Any, snapshots: Any) -> Any:
+        """Add ``in_csi300`` in place from the latest CSI300 snapshot on or before each bar's date."""
         pd, _ = _dependencies()
-        bars = bars.copy()
         if snapshots.empty or not {"trade_date", "con_code"}.issubset(snapshots.columns):
             bars["in_csi300"] = False
             return bars
@@ -224,24 +269,20 @@ class CanonicalBuilder:
         date_map = pd.merge_asof(
             date_map, snapshot_dates, left_on="datetime", right_on="snapshot_date", direction="backward"
         )
-        bars = bars.merge(date_map, on="datetime", how="left")
-        membership["in_csi300"] = True
-        bars = bars.merge(
-            membership[["snapshot_date", "instrument", "in_csi300"]],
-            on=["snapshot_date", "instrument"],
-            how="left",
-        )
-        bars["in_csi300"] = bars["in_csi300"].astype("boolean").fillna(False).astype(bool)
-        return bars.drop(columns="snapshot_date")
+        row_snapshot = bars["datetime"].map(date_map.set_index("datetime")["snapshot_date"])
+        members = pd.MultiIndex.from_frame(membership[["snapshot_date", "instrument"]])
+        bars["in_csi300"] = pd.MultiIndex.from_arrays([row_snapshot, bars["instrument"]]).isin(members)
+        return bars
 
     def _attach_industry(self, bars: Any, industry: Any) -> Any:
+        """Add point-in-time sector/industry/subindustry codes to ``bars`` in place."""
         pd, np = _dependencies()
-        result = bars.copy()
-        for output in ("sector", "industry", "subindustry"):
-            result[output] = np.nan
+        outputs = {output: np.full(len(bars), np.nan) for output in ("sector", "industry", "subindustry")}
         required = {"ts_code", "in_date", "out_date", "l1_code", "l2_code", "l3_code"}
         if industry.empty or not required.issubset(industry.columns):
-            return result
+            for output, values in outputs.items():
+                bars[output] = values
+            return bars
 
         history = industry[list(required)].drop_duplicates().copy()
         history["instrument"] = history["ts_code"].map(ts_code_to_qlib)
@@ -256,22 +297,25 @@ class CanonicalBuilder:
             }
             for output, source in levels.items()
         }
-        for instrument, row_index in result.groupby("instrument", sort=False).groups.items():
+        all_dates = bars["datetime"].to_numpy(dtype="datetime64[ns]")
+        for instrument, rows in bars.groupby("instrument", sort=False).indices.items():
             intervals = history[history["instrument"].eq(instrument)].sort_values("in_date")
             if intervals.empty:
                 continue
-            dates = result.loc[row_index, "datetime"]
+            dates = all_dates[rows]
             starts = intervals["in_date"].to_numpy(dtype="datetime64[ns]")
-            positions = np.searchsorted(starts, dates.to_numpy(dtype="datetime64[ns]"), side="right") - 1
+            positions = np.searchsorted(starts, dates, side="right") - 1
             valid_position = positions >= 0
             safe_positions = positions.clip(min=0)
             ends = intervals["out_date"].to_numpy(dtype="datetime64[ns]")[safe_positions]
-            valid = valid_position & (dates.to_numpy(dtype="datetime64[ns]") <= ends)
+            valid = valid_position & (dates <= ends)
             for output, source in levels.items():
                 values = intervals[source].astype(str).map(code_maps[output]).to_numpy(dtype=float)[safe_positions]
                 values[~valid] = np.nan
-                result.loc[row_index, output] = values
-        return result
+                outputs[output][rows] = values
+        for output, values in outputs.items():
+            bars[output] = values
+        return bars
 
     def _build_index_daily(self, reference_root: Path) -> None:
         pd, _ = _dependencies()

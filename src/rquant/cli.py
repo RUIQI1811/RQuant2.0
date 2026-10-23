@@ -23,6 +23,7 @@ from rquant.factors.catalog import CATALOG_VERSION, FactorSet, get_catalog
 from rquant.factors.engine import (
     SUPPORTED_UNIVERSES,
     FactorBuildConfig,
+    cpp_compiler_probe,
     create_factor_engine,
     validate_factor_frame,
 )
@@ -198,15 +199,20 @@ def _doctor(args: argparse.Namespace) -> int:
             record(f"import:{module}", True, "ok")
         except Exception as exc:
             record(f"import:{module}", False, f"{type(exc).__name__}: {exc}")
+    compiler_name, compiler_command, compiler_env = cpp_compiler_probe()
     try:
-        clang = subprocess.run(["clang++", "--version"], text=True, capture_output=True, check=False)
+        compiler = subprocess.run(compiler_command, capture_output=True, env=compiler_env, check=False)
     except OSError as exc:
-        record("clang++", False, f"missing: {exc}")
+        record(compiler_name, False, f"missing: {exc}")
     else:
+        # cl.exe writes its version banner to stderr in the console (OEM) code page; clang++ writes to stdout.
+        streams = (compiler.stderr, compiler.stdout) if sys.platform == "win32" else (compiler.stdout, compiler.stderr)
+        encoding = "oem" if sys.platform == "win32" else "utf-8"
+        banner = next((stream for stream in streams if stream), b"").decode(encoding, errors="replace")
         record(
-            "clang++",
-            clang.returncode == 0,
-            (clang.stdout or clang.stderr).splitlines()[0] if clang.stdout or clang.stderr else "missing",
+            compiler_name,
+            compiler.returncode == 0,
+            banner.splitlines()[0] if banner else "missing",
         )
     token = os.environ.get("TUSHARE_TOKEN")
     record("TUSHARE_TOKEN", bool(token), "set" if token else "missing")
@@ -273,10 +279,12 @@ def _data_sync(args: argparse.Namespace) -> int:
     def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
         data = config.get("data", {})
         max_requests_per_minute = data.get("max_requests_per_minute", 190)
+        sync_workers = data.get("sync_workers", 8)
         through = _through(args, config)
         collector = TushareCollector(paths.raw, max_requests_per_minute=max_requests_per_minute)
         run.add_input("through", through.isoformat())
         run.add_input("max_requests_per_minute", max_requests_per_minute)
+        run.add_input("sync_workers", sync_workers)
         result = collector.sync(
             formal_start=_date_value(data.get("formal_start", "2010-01-01")),
             through=through,
@@ -284,6 +292,7 @@ def _data_sync(args: argparse.Namespace) -> int:
             index_code=str(data.get("tushare_index_code", "399300.SZ")),
             force=args.force,
             show_progress=not args.no_progress,
+            workers=sync_workers,
         )
         return result
 

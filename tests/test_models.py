@@ -39,7 +39,8 @@ class ModelConstructionTests(unittest.TestCase):
         from rquant.workflow.runner import RollingWorkflowRunner
 
         rng = np.random.default_rng(42)
-        temporary = tempfile.TemporaryDirectory()
+        # MLflow keeps its SQLite file open for the process lifetime, which blocks deletion on Windows.
+        temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         provider = root / "provider"

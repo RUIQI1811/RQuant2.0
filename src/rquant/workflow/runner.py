@@ -10,6 +10,7 @@ from rquant.errors import DataContractError, DependencyError
 from rquant.factors.catalog import FactorSet, get_catalog
 from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.loader import KunQuantDataLoader
+from rquant.qlib_ext.runtime import qlib_init_kwargs
 from rquant.workflow.rolling import generate_rolling_windows, previous_trading_day
 
 ModelName = Literal["lgb", "double-ensemble"]
@@ -57,6 +58,7 @@ class RollingWorkflowRunner:
                 "module_path": "qlib.workflow.expm",
                 "kwargs": {"uri": tracking_uri, "default_exp_name": "RQuant"},
             },
+            **qlib_init_kwargs(),
         )
         from qlib.data import D
 
