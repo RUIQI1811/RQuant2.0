@@ -108,7 +108,8 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   `src/rquant/factors/libraries/registry.py` 注册；CLI 的 `--factor-set` 选项、目录和执行后端应由注册表派生，
   不要在 CLI、加载器和引擎中重复硬编码新名称；
 - 一个组合因子集内的库必须使用同一执行后端：全部为 `kunquant` 或全部为 `panel`；当前通用引擎
-  不支持在同一 factor set 中混合两种后端；
+  不支持在同一 factor set 中混合两种后端。唯一例外是用 `register_factor_selection` 注册的选择型因子集
+  （如 `Hquality`）：它不重算公式，只从已构建且指纹为当前的源因子集复制所选列，因此成员可以跨后端；
 - KunQuant 因子优先组合其公共算子，只有现有算子无法表达的最小能力才可加入 `extensions/kunquant.py`；
   Pandas 面板算子必须明确行是交易日、列是证券，并锁定窗口、NaN、排名和回归语义；
 - 从第三方迁入或改写公式时，必须保留来源、版本、修改边界和许可证文本，并同步更新
@@ -139,6 +140,10 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 当前注册表共有 809 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
   `qlib_alpha360=360`。`combined` 是兼容性因子集，只按顺序包含 Alpha158 与 Alpha101 的 259 列，
   不得因注册 GTJA191、Alpha360 或自定义库而隐式扩容；若要组合新库，应注册一个新的、名称稳定的因子集；
+- `Hquality` 是选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/hquality.py`（当前 43 列），
+  由 `rquant.factors.selection` 按 1d 单因子评估的年度稳定性与覆盖率筛出。成员保留源规范列名和原值，
+  `direction=-1` 只表示反向使用，存储值不取负。构建前 `combined`、`gtja191`、`qlib_alpha360` 必须已按当前代码
+  和标准数据构建完成；改变成员会改变其目录与引擎指纹；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖 `data/canonical/reference/index_daily.parquet`
@@ -189,7 +194,7 @@ python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); prin
 ```
 
 当前预期为唯一目录（unique catalog）`809`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`combined=259`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+`qlib_alpha360=360`、`combined=259`、`Hquality=43`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：
@@ -233,6 +238,8 @@ rquant factors build --factor-set gtja191
 rquant factors validate --factor-set gtja191
 rquant factors build --factor-set qlib_alpha360
 rquant factors validate --factor-set qlib_alpha360
+rquant factors build --factor-set Hquality
+rquant factors validate --factor-set Hquality
 rquant walk-forward --model lgb --horizon 1d --factor-set combined
 rquant report RUN_ID
 ```

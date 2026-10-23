@@ -41,6 +41,42 @@ class FactorSpec:
     catalog_version: int
 
 
+@dataclass(frozen=True)
+class SelectedFactor:
+    canonical_name: str
+    # +1 when larger values predict higher returns, -1 when the factor is used inverted. Stored values are never
+    # negated, so a column keeps the same meaning in every factor set; consumers that need orientation read it here.
+    direction: int
+
+
+@dataclass(frozen=True)
+class FactorSelection:
+    """A named factor set published from columns of already-built source factor sets.
+
+    Members can come from libraries with different execution backends, because the selection never recomputes a
+    formula: it copies the published source columns after checking that every source store is current.
+    """
+
+    name: FactorSet
+    source_factor_sets: tuple[FactorSet, ...]
+    members: tuple[SelectedFactor, ...]
+    criteria: Mapping[str, Any]
+    provenance: Mapping[str, Any]
+
+    @property
+    def canonical_names(self) -> tuple[str, ...]:
+        return tuple(member.canonical_name for member in self.members)
+
+    def definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "source_factor_sets": list(self.source_factor_sets),
+            "members": [{"canonical_name": m.canonical_name, "direction": m.direction} for m in self.members],
+            "criteria": dict(self.criteria),
+            "provenance": dict(self.provenance),
+        }
+
+
 class FactorLibrary(ABC):
     """A named group of formulas with a declared execution backend."""
 

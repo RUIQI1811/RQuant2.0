@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib.metadata
 import inspect
 import json
@@ -587,6 +588,231 @@ class PanelFactorEngine:
                 shutil.rmtree(staging_root, ignore_errors=True)
 
 
+class SelectionFactorEngine:
+    """Publish a registered factor selection by copying columns from current source factor stores.
+
+    No formula is recomputed, so members may come from KunQuant and Pandas-panel libraries alike. Every source store
+    must be complete, built from the current canonical dataset and match the current source engine fingerprint;
+    otherwise the build fails instead of mixing stale artifacts into the selection.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        config: FactorBuildConfig,
+        *,
+        registry: FactorLibraryRegistry | None = None,
+    ) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.config = config
+        self.registry = registry or get_library_registry()
+        self.catalog = catalog_from_registry(self.registry)
+        selection = self.registry.selection(config.factor_set)
+        if selection is None:
+            raise FactorContractError(f"Factor set {config.factor_set} is not a registered factor selection")
+        self.selection = selection
+        self.libraries = self.registry.select(config.factor_set)
+        self.input_fields = self.registry.required_inputs(config.factor_set)
+        self.sources = {name: self.registry.source_factor_set(selection, name) for name in selection.canonical_names}
+        self.source_engines = {
+            source: create_factor_engine(
+                cache_dir, dataclasses.replace(config, factor_set=source), registry=self.registry
+            )
+            for source in selection.source_factor_sets
+            if source in self.sources.values()
+        }
+
+    def compilation_fingerprint(self) -> str:
+        return stable_hash(
+            {
+                "backend": "selection_v1",
+                "factor_engine_version": FACTOR_ENGINE_VERSION,
+                "catalog": self.catalog.fingerprint_for(self.config.factor_set),
+                "factor_set": self.config.factor_set,
+                "selection": self.selection.definition(),
+                "sources": {source: engine.compilation_fingerprint() for source, engine in self.source_engines.items()},
+            }
+        )
+
+    def build_from_canonical(
+        self,
+        canonical_root: str | Path,
+        output_root: str | Path,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise DependencyError("pandas and pyarrow are required to publish a factor selection") from exc
+
+        canonical_manifest_path = Path(canonical_root) / "manifest.json"
+        if not canonical_manifest_path.exists():
+            raise DataContractError(f"Canonical manifest does not exist: {canonical_manifest_path}")
+        with canonical_manifest_path.open("r", encoding="utf-8") as handle:
+            canonical_manifest = json.load(handle)
+        if canonical_manifest.get("status") != "complete":
+            raise DataContractError("Canonical dataset is not complete")
+
+        output_root = Path(output_root)
+        source_manifests = {
+            source: _current_source_manifest(
+                output_root / source, source, engine, self.catalog, canonical_manifest, self.config.universe
+            )
+            for source, engine in self.source_engines.items()
+        }
+        years = {source: set(manifest["partitions"]) for source, manifest in source_manifests.items()}
+        if len({frozenset(value) for value in years.values()}) != 1:
+            raise DataContractError(f"Source factor stores cover different years: {years}")
+
+        expected = self.catalog.canonical_names(self.config.factor_set)
+        by_source: dict[str, list[str]] = {}
+        for name in expected:
+            by_source.setdefault(self.sources[name], []).append(name)
+        start_timestamp = pd.Timestamp(start) if start else None
+        end_timestamp = pd.Timestamp(end) if end else None
+
+        output_root.mkdir(parents=True, exist_ok=True)
+        rows = max(int(manifest["rows"]) for manifest in source_manifests.values())
+        required_free_bytes = len(expected) * rows * 8 * 2 + 1024**3
+        free_bytes = shutil.disk_usage(output_root).free
+        if free_bytes < required_free_bytes:
+            raise DataContractError(
+                "Insufficient free disk for atomic factor build: "
+                f"need at least {required_free_bytes / 1024**3:.1f} GiB, "
+                f"have {free_bytes / 1024**3:.1f} GiB"
+            )
+        final_root = output_root / self.config.factor_set
+        staging_root = Path(tempfile.mkdtemp(prefix=f".{self.config.factor_set}.staging.", dir=output_root))
+        partition_hashes: dict[str, str] = {}
+        total_rows = 0
+        instruments: set[str] = set()
+        first_datetime = last_datetime = None
+        try:
+            for year in sorted(next(iter(years.values())), key=int):
+                frame = _read_selected_columns(pd, output_root, source_manifests, by_source, year)
+                frame = frame.loc[:, ["datetime", "instrument", *expected]]
+                if start_timestamp is not None:
+                    frame = frame[pd.to_datetime(frame["datetime"]) >= start_timestamp]
+                if end_timestamp is not None:
+                    frame = frame[pd.to_datetime(frame["datetime"]) <= end_timestamp]
+                if frame.empty:
+                    continue
+                destination = staging_root / f"year={year}" / "factors.parquet"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                frame.to_parquet(destination, index=False)
+                partition_hashes[year] = sha256_file(destination)
+                total_rows += len(frame)
+                instruments.update(frame["instrument"].unique())
+                year_first, year_last = frame["datetime"].min(), frame["datetime"].max()
+                first_datetime = year_first if first_datetime is None else min(first_datetime, year_first)
+                last_datetime = year_last if last_datetime is None else max(last_datetime, year_last)
+                print(
+                    f"factors {self.config.factor_set}: year={year} rows={len(frame)} columns={len(expected)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                del frame
+            if not total_rows:
+                raise DataContractError(f"Factor build for {self.config.factor_set} produced no rows")
+
+            metadata = {
+                "status": "complete",
+                "factor_set": self.config.factor_set,
+                "catalog_fingerprint": self.catalog.fingerprint_for(self.config.factor_set),
+                "compilation_fingerprint": self.compilation_fingerprint(),
+                "canonical_fingerprint": canonical_manifest.get("fingerprint"),
+                "factor_libraries": [library.family for library in self.libraries],
+                "input_fields": list(self.input_fields),
+                "source_factor_sets": {
+                    source: {
+                        "fingerprint": manifest["fingerprint"],
+                        "compilation_fingerprint": manifest["compilation_fingerprint"],
+                        "columns": by_source[source],
+                    }
+                    for source, manifest in source_manifests.items()
+                },
+                "selection": self.selection.definition(),
+                "start": str(first_datetime),
+                "end": str(last_datetime),
+                "instruments": len(instruments),
+                "universe": self.config.universe,
+                "rows": total_rows,
+                "columns": len(expected),
+                "partitions": partition_hashes,
+                "execution": {"backend": "selection_v1", "output_storage": "copied_source_columns"},
+            }
+            metadata["fingerprint"] = stable_hash(metadata)
+            atomic_write_json(staging_root / "manifest.json", metadata)
+            _atomic_replace_directory(staging_root, final_root)
+            return metadata
+        finally:
+            if staging_root.exists():
+                shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def _current_source_manifest(
+    directory: Path,
+    factor_set: str,
+    engine: Any,
+    catalog: Any,
+    canonical_manifest: dict[str, Any],
+    universe: str,
+) -> dict[str, Any]:
+    """Load a source factor-store manifest and refuse it unless it describes the current code and data."""
+    path = directory / "manifest.json"
+    if not path.exists():
+        raise DataContractError(f"Source factor set {factor_set} is not built: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if manifest.get("status") != "complete" or manifest.get("factor_set") != factor_set:
+        raise DataContractError(f"Source factor manifest is not complete for {factor_set}: {path}")
+    payload = dict(manifest)
+    if payload.pop("fingerprint", None) != stable_hash(payload):
+        raise DataContractError(f"Source factor manifest fingerprint is invalid: {path}")
+    if manifest.get("catalog_fingerprint") != catalog.fingerprint_for(factor_set):
+        raise DataContractError(f"Source factor set {factor_set} was built from a stale catalog; rebuild it")
+    if manifest.get("compilation_fingerprint") != engine.compilation_fingerprint():
+        raise DataContractError(f"Source factor set {factor_set} was built by stale factor code; rebuild it")
+    if manifest.get("canonical_fingerprint") != canonical_manifest.get("fingerprint"):
+        raise DataContractError(f"Source factor set {factor_set} was not built from the current canonical dataset")
+    if manifest.get("universe") != universe:
+        raise DataContractError(f"Source factor set {factor_set} uses universe {manifest.get('universe')!r}")
+    return manifest
+
+
+def _read_selected_columns(
+    pd: Any,
+    output_root: Path,
+    source_manifests: dict[str, dict[str, Any]],
+    by_source: dict[str, list[str]],
+    year: str,
+) -> Any:
+    """Read one year of the selected columns, requiring every source to publish identical row keys."""
+    frame = None
+    for source, names in by_source.items():
+        partition = output_root / source / f"year={year}" / "factors.parquet"
+        if not partition.exists() or sha256_file(partition) != source_manifests[source]["partitions"][year]:
+            raise DataContractError(f"Factor partition is missing or differs from its manifest: {partition}")
+        part = pd.read_parquet(partition, columns=["datetime", "instrument", *names])
+        if frame is None:
+            frame = part
+            continue
+        same_keys = (
+            len(part) == len(frame)
+            and (part["datetime"].to_numpy() == frame["datetime"].to_numpy()).all()
+            and (part["instrument"].to_numpy() == frame["instrument"].to_numpy()).all()
+        )
+        if not same_keys:
+            raise DataContractError(f"Source factor stores have different rows in year={year}: {source}")
+        for name in names:
+            frame[name] = part[name].to_numpy()
+    if frame is None:
+        raise DataContractError("Factor selection has no source columns")
+    return frame
+
+
 SUPPORTED_UNIVERSES = ("csi300", "all")
 
 
@@ -754,8 +980,10 @@ def create_factor_engine(
     config: FactorBuildConfig,
     *,
     registry: FactorLibraryRegistry | None = None,
-) -> KunQuantFactorEngine | PanelFactorEngine:
+) -> KunQuantFactorEngine | PanelFactorEngine | SelectionFactorEngine:
     selected_registry = registry or get_library_registry()
+    if selected_registry.selection(config.factor_set) is not None:
+        return SelectionFactorEngine(cache_dir, config, registry=selected_registry)
     backends = {library.backend for library in selected_registry.select(config.factor_set)}
     if backends == {"kunquant"}:
         return KunQuantFactorEngine(cache_dir, config, registry=selected_registry)

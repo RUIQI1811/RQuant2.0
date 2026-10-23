@@ -271,7 +271,9 @@ rquant factors catalog --factor-set combined --format csv --output factor_catalo
 - `gtja191`：`gtja_001` 至 `gtja_191`（暂时排除 `gtja_030`），共 190 列；
 - `qlib_alpha360`：`a360_001` 至 `a360_360`，共 360 列；它是 Qlib Alpha360 的六组归一化
   OHLC、VWAP 与成交量字段各取 60 个滞后期，而非 360 条手工设计的独立信号；
-- `combined`：先排列 158 列 Alpha158，再排列 101 列 Alpha101，共 259 列。
+- `combined`：先排列 158 列 Alpha158，再排列 101 列 Alpha101，共 259 列；
+- `Hquality`：从上述因子中按年度稳定性筛出的 43 列，跨 Alpha158、Alpha101、GTJA191 与 Alpha360，
+  成员、方向与筛选口径锁定在 `src/rquant/factors/libraries/hquality.py`（见下文“高质量因子集 Hquality”）。
 
 `combined` 保持原有 259 列契约，只包含 Alpha158 与 Alpha101，不会隐式加入 GTJA191 或 Alpha360。这样已有
 模型和历史产物的列数、顺序与指纹不会因新增因子库而静默改变。
@@ -290,6 +292,7 @@ src/rquant/factors/
 ├── panel_operators.py                   # 公共 Pandas 面板算子
 ├── catalog.py                           # 动态目录、稳定命名和实现指纹
 ├── engine.py                            # 后端选择、执行和标准分区写入
+├── selection.py                         # 按年度稳定性与覆盖率筛选因子
 └── libraries/
     ├── base.py                          # 因子库接口与输入字段契约
     ├── registry.py                      # 因子库及组合因子集注册表
@@ -297,6 +300,7 @@ src/rquant/factors/
     ├── alpha101.py                      # 101 条本地 Alpha101 公式
     ├── alpha360.py                      # 6 个归一化字段各 60 个滞后期的 Alpha360 图
     ├── gtja191.py                       # 完整 GTJA191 提供者与公式语义说明
+    ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -389,6 +393,28 @@ rquant factors validate --factor-set qlib_alpha360
 
 完整构建会在完成 staging 后原子替换整个 `data/factors/qlib_alpha360/` 目录，而不是向既有年度分区追加；本文
 不执行该构建。
+
+### 高质量因子集 Hquality
+
+`Hquality` 不重算公式，而是从已构建的 `combined`、`gtja191`、`qlib_alpha360` 复制所选列，因此必须先构建这三个
+源因子集。构建会核对每个源清单的状态、目录指纹、引擎指纹、标准数据指纹与分区哈希，任一过期即失败：
+
+```bash
+rquant factors build --factor-set Hquality
+rquant factors validate --factor-set Hquality
+rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
+```
+
+筛选口径（`StabilityCriteria` 默认值，基于 2010-01-01 至 2026-10-19 的 1d 单因子评估）：
+
+- 方向取全区间日均 Rank IC 的符号，年度统计都按该方向定向，稳定为负的因子以 `direction=-1` 反向保留；
+- 只统计评估日数不少于 120 天的年份；
+- 定向年度 Rank IC 为正的年份占比不低于 75%；
+- 定向年度多空（前 20% 减后 20%）收益为正的年份占比不低于 75%；
+- 全区间 |Rank IC| 不低于 0.01；
+- 覆盖率（各交易日有效观测数之和除以当日覆盖最好的因子观测数之和）不低于 90%。
+
+成员保留源规范列名与原值，`direction=-1` 只标记反向使用，存储值不取负；树模型不受符号影响。
 
 完整研究通常构建组合因子集：
 
