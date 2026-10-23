@@ -16,9 +16,16 @@ CATALOG_VERSION = 2
 
 
 class FactorCatalog:
-    def __init__(self, specs: Iterable[FactorSpec], factor_sets: Mapping[str, tuple[str, ...]]) -> None:
+    def __init__(
+        self,
+        specs: Iterable[FactorSpec],
+        factor_sets: Mapping[str, tuple[str, ...]],
+        selections: Mapping[str, tuple[str, ...]] | None = None,
+    ) -> None:
         self.specs = tuple(specs)
         self._factor_sets = dict(factor_sets)
+        # Factor sets that publish an explicit, ordered subset of canonical names instead of whole families.
+        self._selections = dict(selections or {})
         self.validate()
 
     def factor_sets(self) -> tuple[str, ...]:
@@ -29,6 +36,9 @@ class FactorCatalog:
             families = self._factor_sets[factor_set]
         except KeyError as exc:
             raise FactorContractError(f"Unknown factor set: {factor_set}") from exc
+        if factor_set in self._selections:
+            by_name = {spec.canonical_name: spec for spec in self.specs}
+            return tuple(by_name[name] for name in self._selections[factor_set])
         by_family = {family: [] for family in families}
         for spec in self.specs:
             if spec.family in by_family:
@@ -69,6 +79,13 @@ class FactorCatalog:
                 raise FactorContractError(f"Source name leaked as canonical name: {spec.source_name}")
             if spec.ordinal < 1 or spec.max_lookback < 1:
                 raise FactorContractError(f"Invalid factor metadata: {spec.canonical_name}")
+        known = set(canonical)
+        for factor_set, names in self._selections.items():
+            if factor_set not in self._factor_sets:
+                raise FactorContractError(f"Factor selection is not a registered factor set: {factor_set}")
+            unknown = [name for name in names if name not in known]
+            if unknown or len(names) != len(set(names)):
+                raise FactorContractError(f"Factor selection {factor_set} has unknown or duplicate factors")
         for factor_set in self._factor_sets:
             selected = self.select(factor_set)
             if not selected:
@@ -110,7 +127,12 @@ def catalog_from_registry(registry: FactorLibraryRegistry) -> FactorCatalog:
         for factor_set in registry.factor_sets()
     }
     specs = tuple(spec for library in registry.libraries() for spec in library.specs)
-    return FactorCatalog(specs, factor_sets)
+    selections = {
+        factor_set: selection.canonical_names
+        for factor_set in registry.factor_sets()
+        if (selection := registry.selection(factor_set)) is not None
+    }
+    return FactorCatalog(specs, factor_sets, selections)
 
 
 def get_catalog() -> FactorCatalog:
