@@ -57,6 +57,20 @@ def expose_msvc_compiler() -> None:
         os.environ["PATH"] = os.path.dirname(command[0]) + os.pathsep + os.environ.get("PATH", "")
 
 
+@contextlib.contextmanager
+def _stdout_to_stderr() -> Any:
+    """Send child-process output to stderr; compiler messages would otherwise corrupt the JSON printed on stdout."""
+    sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
 def load_kunquant_library(path: str) -> Any:
     """Load a compiled KunQuant library, staging it at an ASCII path on Windows when needed.
 
@@ -191,14 +205,15 @@ class KunQuantFactorEngine:
         target.mkdir(parents=True, exist_ok=True)
         function, compiler_config = self.build_graph()
         library_name = f"rquant_{self.config.factor_set}_{fingerprint[:12]}"
-        compiled = cfake.compileit(
-            [("rquant_factors", function, compiler_config)],
-            library_name,
-            cfake.CppCompilerConfig(),
-            tempdir=str(target),
-            keep_files=True,
-            load=False,
-        )
+        with _stdout_to_stderr():
+            compiled = cfake.compileit(
+                [("rquant_factors", function, compiler_config)],
+                library_name,
+                cfake.CppCompilerConfig(),
+                tempdir=str(target),
+                keep_files=True,
+                load=False,
+            )
         library = load_kunquant_library(compiled)
         atomic_write_json(
             target / "compile.json",
