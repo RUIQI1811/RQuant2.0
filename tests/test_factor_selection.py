@@ -286,7 +286,7 @@ class FactorDeduplicationTests(unittest.TestCase):
     def test_locked_hquality_has_no_pair_above_its_correlation_limit(self) -> None:
         dropped = HQUALITY_SELECTION.provenance["deduplicated"]
         kept = set(HQUALITY_SELECTION.canonical_names)
-        self.assertEqual(177, len(kept))
+        self.assertEqual(137, len(kept))
         self.assertFalse(kept & set(dropped))
         self.assertTrue(set(dropped.values()) <= kept)
         self.assertEqual(0.8, HQUALITY_SELECTION.criteria["max_abs_rank_correlation"])
