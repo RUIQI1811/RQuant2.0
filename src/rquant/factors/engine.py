@@ -57,6 +57,28 @@ def expose_msvc_compiler() -> None:
         os.environ["PATH"] = os.path.dirname(command[0]) + os.pathsep + os.environ.get("PATH", "")
 
 
+def load_kunquant_library(path: str) -> Any:
+    """Load a compiled KunQuant library, staging it at an ASCII path on Windows when needed.
+
+    KunRunner opens the DLL through a narrow-string Windows API, which cannot address non-ASCII paths such as a
+    project folder with Chinese characters; the cached build stays in the project and only a copy is loaded.
+    """
+    from KunQuant.runner import KunRunner
+
+    if sys.platform == "win32" and not path.isascii():
+        source = Path(path)
+        loadable = Path(tempfile.gettempdir()) / "rquant-kunquant" / source.parent.name / source.name
+        if not str(loadable).isascii():
+            raise DependencyError(
+                f"KunQuant cannot load libraries from non-ASCII paths; set TEMP to an ASCII directory (got {loadable})"
+            )
+        if not loadable.exists() or sha256_file(loadable) != sha256_file(source):
+            loadable.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, loadable)
+        path = str(loadable)
+    return KunRunner.Library.load(path)
+
+
 def cpp_compiler_available() -> bool:
     _, command, env = cpp_compiler_probe()
     try:
@@ -169,13 +191,15 @@ class KunQuantFactorEngine:
         target.mkdir(parents=True, exist_ok=True)
         function, compiler_config = self.build_graph()
         library_name = f"rquant_{self.config.factor_set}_{fingerprint[:12]}"
-        library = cfake.compileit(
+        compiled = cfake.compileit(
             [("rquant_factors", function, compiler_config)],
             library_name,
             cfake.CppCompilerConfig(),
             tempdir=str(target),
             keep_files=True,
+            load=False,
         )
+        library = load_kunquant_library(compiled)
         atomic_write_json(
             target / "compile.json",
             {
