@@ -115,6 +115,10 @@ class PanelFactorLibrary(FactorLibrary):
     def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         """Return source-name to aligned panel mappings."""
 
+    def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
+        """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""
+        return {}, {}
+
     def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
         outputs = self.calculate(inputs)
         for spec in self.specs:

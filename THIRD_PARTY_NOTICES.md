@@ -36,3 +36,14 @@ metadata, implementation fingerprinting, and KunQuant execution; it does not
 copy Qlib into this repository.
 
 See `licenses/Qlib-0.9.7-LICENSE.txt` for the complete license text.
+
+## ChinaAShareEquityCharacteristics (characteristic definitions only)
+
+`src/rquant/factors/libraries/china_chars.py` implements a daily, point-in-time
+version of the characteristic list published by
+https://github.com/Quantactix/ChinaAShareEquityCharacteristics (`char_list.csv`
+and the accompanying academic definitions, mainly Hou, Xue and Zhang's anomaly
+catalog). No source code from that GPL-3.0 project was copied or translated:
+RQuant re-implements each characteristic from its published definition with
+Tushare inputs, its own windows and its own point-in-time rules, and omits the
+characteristics that need data RQuant does not collect.

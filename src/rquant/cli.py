@@ -18,6 +18,7 @@ from rquant.config import ProjectPaths, load_config, resolve_paths
 from rquant.data.canonical import CanonicalBuilder
 from rquant.data.collector import TushareCollector
 from rquant.data.qlib_builder import QlibProviderBuilder
+from rquant.data.reference import ReferenceBuilder
 from rquant.errors import DataContractError, DependencyError, RQuantError
 from rquant.factors.catalog import CATALOG_VERSION, FactorSet, get_catalog
 from rquant.factors.engine import (
@@ -54,8 +55,21 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--force", action="store_true", help="Refetch validated partitions")
     sync.add_argument("--no-progress", action="store_true", help="Disable the terminal progress bar")
     sync.set_defaults(handler=_data_sync)
-    build_qlib = data_commands.add_parser("build-qlib", help="Build canonical Parquet and Qlib provider")
+    sync_fundamentals = data_commands.add_parser(
+        "sync-fundamentals", help="Fetch per-stock Tushare financial statements for the research universe"
+    )
+    sync_fundamentals.add_argument("--through", type=_date, help="Inclusive date, YYYY-MM-DD (default: data.through)")
+    sync_fundamentals.add_argument("--force", action="store_true", help="Refetch validated partitions")
+    sync_fundamentals.add_argument("--no-progress", action="store_true", help="Disable the terminal progress bar")
+    sync_fundamentals.set_defaults(handler=_data_sync_fundamentals)
+    build_qlib = data_commands.add_parser(
+        "build-qlib", help="Build canonical Parquet, reference data and Qlib provider"
+    )
     build_qlib.set_defaults(handler=_data_build_qlib)
+    build_reference = data_commands.add_parser(
+        "build-reference", help="Rebuild only the point-in-time reference data next to the canonical bars"
+    )
+    build_reference.set_defaults(handler=_data_build_reference)
 
     factors = commands.add_parser("factors", help="Inspect, build and validate factor stores")
     factor_commands = factors.add_subparsers(dest="factor_command", required=True)
@@ -218,7 +232,7 @@ def _doctor(args: argparse.Namespace) -> int:
     record("TUSHARE_TOKEN", bool(token), "set" if token else "missing")
     record(
         "factor_catalog",
-        len(get_catalog().specs) == 809,
+        len(get_catalog().specs) == 918,
         {"columns": len(get_catalog().specs), "fingerprint": get_catalog().fingerprint},
     )
     config_path = Path(args.config)
@@ -299,12 +313,56 @@ def _data_sync(args: argparse.Namespace) -> int:
     return _run(args, action)
 
 
+def _data_sync_fundamentals(args: argparse.Namespace) -> int:
+    def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
+        data = config.get("data", {})
+        max_requests_per_minute = data.get("max_requests_per_minute", 190)
+        sync_workers = data.get("sync_workers", 8)
+        start_year = int(data.get("fundamentals_start_year", 2004))
+        window_years = int(data.get("fundamentals_window_years", 6))
+        through = _through(args, config)
+        collector = TushareCollector(paths.raw, max_requests_per_minute=max_requests_per_minute)
+        run.add_input("through", through.isoformat())
+        run.add_input("universe", _universe(config))
+        run.add_input("fundamentals_start_year", start_year)
+        run.add_input("fundamentals_window_years", window_years)
+        run.add_input("max_requests_per_minute", max_requests_per_minute)
+        run.add_input("sync_workers", sync_workers)
+        result = collector.sync_fundamentals(
+            through=through,
+            start_year=start_year,
+            universe=_universe(config),
+            window_years=window_years,
+            force=args.force,
+            show_progress=not args.no_progress,
+            workers=sync_workers,
+        )
+        # The full artifact list stays in data/raw/fundamentals_manifest.json; the run manifest keeps the summary.
+        return {key: value for key, value in result.items() if key != "files"}
+
+    return _run(args, action)
+
+
 def _data_build_qlib(args: argparse.Namespace) -> int:
     def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
         canonical = CanonicalBuilder(paths.raw, paths.canonical).build()
         run.add_input("raw_fingerprint", canonical.get("raw_fingerprint"))
+        reference = ReferenceBuilder(paths.raw, paths.canonical).build()
         provider = QlibProviderBuilder(paths.canonical, paths.qlib).build()
-        return {"canonical": canonical, "qlib": provider}
+        return {"canonical": canonical, "reference": reference, "qlib": provider}
+
+    return _run(args, action)
+
+
+def _data_build_reference(args: argparse.Namespace) -> int:
+    def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
+        canonical_manifest = paths.canonical / "manifest.json"
+        run.add_input("canonical_manifest", _fingerprint(canonical_manifest))
+        with canonical_manifest.open("r", encoding="utf-8") as handle:
+            canonical_raw = json.load(handle).get("raw_fingerprint")
+        if canonical_raw != _fingerprint(paths.raw / "sync_manifest.json"):
+            raise DataContractError("Raw sync changed after the canonical build; run `rquant data build-qlib` instead")
+        return ReferenceBuilder(paths.raw, paths.canonical).build()
 
     return _run(args, action)
 
