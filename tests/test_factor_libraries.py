@@ -133,7 +133,8 @@ class FactorLibraryRegistryTests(unittest.TestCase):
             "low": np.array([[8.0, 18.0, 27.0], [9.0, 17.0, 28.0]]),
             "close": np.array([[12.0, 21.0, 33.0], [13.0, 22.0, 31.0]]),
         }
-        with tempfile.TemporaryDirectory() as temporary:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             engine = KunQuantFactorEngine(
                 temporary,
                 FactorBuildConfig(factor_set="custom_price", workers=1),

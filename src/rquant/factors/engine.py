@@ -4,6 +4,7 @@ import contextlib
 import importlib.metadata
 import inspect
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,19 @@ def cpp_compiler_probe() -> tuple[str, list[str], dict[str, str] | None]:
     compiler = shutil.which("cl.exe", path=(env or {}).get("PATH")) or "cl.exe"
     # cl.exe has no version flag; invoked bare it prints its version banner and exits successfully.
     return "cl.exe", [compiler], env
+
+
+def expose_msvc_compiler() -> None:
+    """Put KunQuant's discovered cl.exe on this process's PATH.
+
+    KunQuant launches a bare ``cl.exe`` with a child environment that names the MSVC directory, but Windows resolves
+    the executable from the parent's PATH, so compilation fails whenever that PATH was not already extended.
+    """
+    if sys.platform != "win32" or shutil.which("cl.exe"):
+        return
+    _, command, _ = cpp_compiler_probe()
+    if os.path.isabs(command[0]):
+        os.environ["PATH"] = os.path.dirname(command[0]) + os.pathsep + os.environ.get("PATH", "")
 
 
 def cpp_compiler_available() -> bool:
@@ -149,6 +163,7 @@ class KunQuantFactorEngine:
         except ImportError as exc:
             raise DependencyError("KunQuant==0.1.11 is required for factor computation") from exc
 
+        expose_msvc_compiler()
         fingerprint = self.compilation_fingerprint()
         target = self.cache_dir / "kunquant" / fingerprint
         target.mkdir(parents=True, exist_ok=True)

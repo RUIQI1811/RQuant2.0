@@ -156,7 +156,9 @@ class CliTests(unittest.TestCase):
 
     def test_doctor_accepts_the_registered_factor_catalog(self) -> None:
         output = io.StringIO()
-        clang = subprocess.CompletedProcess(["clang++", "--version"], 0, stdout="Apple clang version fixture\n")
+        clang = subprocess.CompletedProcess(
+            ["clang++", "--version"], 0, stdout=b"Apple clang version fixture\n", stderr=b""
+        )
         # Replacing importlib.import_module affects how later patch targets resolve, so it must be patched last.
         with (
             patch.dict("os.environ", {"TUSHARE_TOKEN": "fixture"}),

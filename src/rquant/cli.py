@@ -201,13 +201,14 @@ def _doctor(args: argparse.Namespace) -> int:
             record(f"import:{module}", False, f"{type(exc).__name__}: {exc}")
     compiler_name, compiler_command, compiler_env = cpp_compiler_probe()
     try:
-        compiler = subprocess.run(
-            compiler_command, text=True, capture_output=True, env=compiler_env, check=False, errors="replace"
-        )
+        compiler = subprocess.run(compiler_command, capture_output=True, env=compiler_env, check=False)
     except OSError as exc:
         record(compiler_name, False, f"missing: {exc}")
     else:
-        banner = compiler.stdout or compiler.stderr
+        # cl.exe writes its version banner to stderr in the console (OEM) code page; clang++ writes to stdout.
+        streams = (compiler.stderr, compiler.stdout) if sys.platform == "win32" else (compiler.stdout, compiler.stderr)
+        encoding = "oem" if sys.platform == "win32" else "utf-8"
+        banner = next((stream for stream in streams if stream), b"").decode(encoding, errors="replace")
         record(
             compiler_name,
             compiler.returncode == 0,

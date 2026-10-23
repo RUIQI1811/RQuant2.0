@@ -45,7 +45,8 @@ class KunQuantSmokeTests(unittest.TestCase):
             "volume": volume,
             "vwap": vwap,
         }
-        with tempfile.TemporaryDirectory() as temporary:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             engine = KunQuantFactorEngine(
                 temporary,
                 FactorBuildConfig(factor_set="qlib_alpha360", workers=1),
@@ -92,7 +93,8 @@ class KunQuantSmokeTests(unittest.TestCase):
             "subindustry": groups,
         }
         self.assertEqual(set(INPUT_FIELDS), set(inputs))
-        with tempfile.TemporaryDirectory() as temporary:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             engine = KunQuantFactorEngine(temporary, FactorBuildConfig(factor_set="combined", workers=2))
             module = engine.compile()
             output = engine.run(inputs, module=module)
