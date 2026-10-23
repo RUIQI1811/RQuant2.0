@@ -8,6 +8,7 @@ from typing import Any
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.exchange import AshareCostModel, AshareExchange
+from rquant.qlib_ext.runtime import qlib_init_kwargs
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class PortfolioBacktestRunner:
         from qlib.contrib.strategy import TopkDropoutStrategy
         from qlib.data import D
 
-        qlib.init(provider_uri=str(self.qlib_root), region=REG_CN)
+        qlib.init(provider_uri=str(self.qlib_root), region=REG_CN, **qlib_init_kwargs())
         start_time = predictions["datetime"].min()
         signal_end = predictions["datetime"].max()
         later = D.calendar(start_time=signal_end, freq="day")

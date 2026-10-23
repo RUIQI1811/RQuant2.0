@@ -49,10 +49,10 @@ rquant report RUN_ID
 
 需要：
 
-- macOS 或兼容的类 Unix 环境；
+- macOS 或兼容的类 Unix 环境；Windows 亦可运行（编译器见下一条）；
 - Conda；
 - Python 3.11；
-- `clang++`；
+- `clang++`（Windows 上为 MSVC `cl.exe`，即 Visual Studio Build Tools 的“使用 C++ 的桌面开发”工作负载）；
 - 可用的 Tushare token，以及本项目所需接口权限。
 
 项目只使用名为 `rquant` 的 Conda 环境，不要复用 `base`、`stocktrade`、旧版 RQuant 或其他项目的环境。
@@ -107,7 +107,7 @@ rquant doctor
 - Python 是否为 3.11；
 - `pyqlib==0.9.7`、`KunQuant==0.1.11`、`tushare==1.4.29`；
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
-- `clang++`；
+- KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
 - 809 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360）；
 - 默认配置和本地数据清单；
