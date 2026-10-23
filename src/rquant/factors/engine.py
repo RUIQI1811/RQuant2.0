@@ -791,6 +791,7 @@ def _read_selected_columns(
 ) -> Any:
     """Read one year of the selected columns, requiring every source to publish identical row keys."""
     frame = None
+    parts = []
     for source, names in by_source.items():
         partition = output_root / source / f"year={year}" / "factors.parquet"
         if not partition.exists() or sha256_file(partition) != source_manifests[source]["partitions"][year]:
@@ -798,6 +799,7 @@ def _read_selected_columns(
         part = pd.read_parquet(partition, columns=["datetime", "instrument", *names])
         if frame is None:
             frame = part
+            parts.append(part)
             continue
         same_keys = (
             len(part) == len(frame)
@@ -806,11 +808,11 @@ def _read_selected_columns(
         )
         if not same_keys:
             raise DataContractError(f"Source factor stores have different rows in year={year}: {source}")
-        for name in names:
-            frame[name] = part[name].to_numpy()
+        parts.append(part.loc[:, names].set_axis(frame.index))
     if frame is None:
         raise DataContractError("Factor selection has no source columns")
-    return frame
+    # One concat instead of a column-by-column insert, which fragments the frame for hundreds of members.
+    return pd.concat(parts, axis=1)
 
 
 SUPPORTED_UNIVERSES = ("csi300", "all")

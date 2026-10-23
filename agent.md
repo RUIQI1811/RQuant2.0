@@ -140,9 +140,9 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 当前注册表共有 809 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
   `qlib_alpha360=360`。`combined` 是兼容性因子集，只按顺序包含 Alpha158 与 Alpha101 的 259 列，
   不得因注册 GTJA191、Alpha360 或自定义库而隐式扩容；若要组合新库，应注册一个新的、名称稳定的因子集；
-- `Hquality` 是选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/hquality.py`（当前 43 列），
-  由 `rquant.factors.selection` 按 1d 单因子评估的年度稳定性与覆盖率筛出。成员保留源规范列名和原值，
-  `direction=-1` 只表示反向使用，存储值不取负。构建前 `combined`、`gtja191`、`qlib_alpha360` 必须已按当前代码
+- `Hquality` 是选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/hquality.py`（当前 177 列），
+  由 `rquant.factors.selection` 按 1d 单因子评估的年度稳定性与覆盖率筛出，再按截面秩相关去重。成员保留源规范列名
+  和原值，`direction=-1` 只表示反向使用，存储值不取负。构建前 `combined`、`gtja191`、`qlib_alpha360` 必须已按当前代码
   和标准数据构建完成；改变成员会改变其目录与引擎指纹；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
@@ -194,7 +194,7 @@ python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); prin
 ```
 
 当前预期为唯一目录（unique catalog）`809`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`combined=259`、`Hquality=43`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+`qlib_alpha360=360`、`combined=259`、`Hquality=177`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：
