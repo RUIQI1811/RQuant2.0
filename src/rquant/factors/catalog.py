@@ -45,7 +45,7 @@ class FactorCatalog:
                 by_family[spec.family].append(spec)
         return tuple(spec for family in families for spec in by_family[family])
 
-    def canonical_names(self, factor_set: FactorSet = "combined") -> tuple[str, ...]:
+    def canonical_names(self, factor_set: FactorSet = "Hquality") -> tuple[str, ...]:
         return tuple(spec.canonical_name for spec in self.select(factor_set))
 
     def source_to_canonical(self, factor_set: FactorSet) -> dict[str, str]:
@@ -91,10 +91,10 @@ class FactorCatalog:
             if not selected:
                 raise FactorContractError(f"Factor set is empty: {factor_set}")
 
-    def rows(self, factor_set: FactorSet = "combined") -> list[dict[str, object]]:
+    def rows(self, factor_set: FactorSet = "Hquality") -> list[dict[str, object]]:
         return [asdict(spec) for spec in self.select(factor_set)]
 
-    def export(self, destination: str | Path, *, factor_set: FactorSet = "combined", format: str = "json") -> None:
+    def export(self, destination: str | Path, *, factor_set: FactorSet = "Hquality", format: str = "json") -> None:
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = self.rows(factor_set)

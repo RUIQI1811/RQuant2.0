@@ -138,11 +138,11 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   `a360_001` 至 `a360_360` 的 360 列；不得暴露上游原始名称。Alpha360 是六组归一化 OHLC、VWAP 与成交量字段
   各取 60 个滞后期，不是 360 条手工设计信号；
 - 当前注册表共有 809 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-  `qlib_alpha360=360`。`combined` 是兼容性因子集，只按顺序包含 Alpha158 与 Alpha101 的 259 列，
-  不得因注册 GTJA191、Alpha360 或自定义库而隐式扩容；若要组合新库，应注册一个新的、名称稳定的因子集；
-- `Hquality` 是选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/hquality.py`（当前 177 列），
+  `qlib_alpha360=360`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
+  应注册一个新的、名称稳定的因子集；
+- `Hquality` 是选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/hquality.py`（当前 137 列），
   由 `rquant.factors.selection` 按 1d 单因子评估的年度稳定性与覆盖率筛出，再按截面秩相关去重。成员保留源规范列名
-  和原值，`direction=-1` 只表示反向使用，存储值不取负。构建前 `combined`、`gtja191`、`qlib_alpha360` 必须已按当前代码
+  和原值，`direction=-1` 只表示反向使用，存储值不取负。构建前 `qlib_alpha158`、`wq_alpha101`、`gtja191` 必须已按当前代码
   和标准数据构建完成；改变成员会改变其目录与引擎指纹；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
@@ -194,7 +194,7 @@ python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); prin
 ```
 
 当前预期为唯一目录（unique catalog）`809`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`combined=259`、`Hquality=177`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+`qlib_alpha360=360`、`Hquality=137`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：
@@ -206,7 +206,7 @@ from pathlib import Path
 
 from rquant.factors.engine import FactorBuildConfig, create_factor_engine
 
-for factor_set in ("combined", "gtja191"):
+for factor_set in ("qlib_alpha158", "wq_alpha101", "gtja191"):
     path = Path("data/factors") / factor_set / "manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
     current = create_factor_engine(Path("data/cache"), FactorBuildConfig(factor_set=factor_set))
@@ -232,15 +232,17 @@ conda activate rquant
 rquant doctor
 rquant data sync --through YYYY-MM-DD
 rquant data build-qlib
-rquant factors build --factor-set combined
-rquant factors validate --factor-set combined
+rquant factors build --factor-set qlib_alpha158
+rquant factors validate --factor-set qlib_alpha158
+rquant factors build --factor-set wq_alpha101
+rquant factors validate --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
 rquant factors validate --factor-set gtja191
 rquant factors build --factor-set qlib_alpha360
 rquant factors validate --factor-set qlib_alpha360
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
-rquant walk-forward --model lgb --horizon 1d --factor-set combined
+rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
 rquant report RUN_ID
 ```
 

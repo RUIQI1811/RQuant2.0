@@ -104,7 +104,7 @@ def cpp_compiler_available() -> bool:
 
 @dataclass(frozen=True)
 class FactorBuildConfig:
-    factor_set: FactorSet = "combined"
+    factor_set: FactorSet = "qlib_alpha158"
     dtype: str = "double"
     input_layout: str = "TS"
     output_layout: str = "TS"

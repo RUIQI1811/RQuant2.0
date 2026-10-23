@@ -37,7 +37,7 @@ class FactorLibraryRegistryTests(unittest.TestCase):
         registry = get_library_registry()
 
         self.assertEqual(
-            ("qlib_alpha158", "wq_alpha101", "gtja191", "qlib_alpha360", "combined", "Hquality"),
+            ("qlib_alpha158", "wq_alpha101", "gtja191", "qlib_alpha360", "Hquality"),
             registry.factor_sets(),
         )
         self.assertEqual(

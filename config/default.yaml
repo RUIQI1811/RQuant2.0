@@ -14,7 +14,7 @@ data:
   sync_workers: 8
 
 factors:
-  factor_set: combined
+  factor_set: Hquality
   dtype: double
   input_layout: TS
   output_layout: TS

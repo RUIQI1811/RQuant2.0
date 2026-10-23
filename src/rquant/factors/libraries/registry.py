@@ -130,7 +130,6 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(WorldQuantAlpha101Library())
     registry.register_library(GTJA191Library())
     registry.register_library(QlibAlpha360Library())
-    registry.register_factor_set("combined", ("qlib_alpha158", "wq_alpha101"))
     registry.register_factor_selection(HQUALITY_SELECTION)
     return registry
 
