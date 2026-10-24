@@ -112,11 +112,11 @@ rquant doctor
 `doctor` 会检查：
 
 - Python 是否为 3.11；
-- `pyqlib==0.9.7`、`KunQuant==0.1.11`、`tushare==1.4.29`；
+- `pyqlib==0.9.7`、`KunQuant==0.1.11`、`tushare==1.4.29`、`TA-Lib==0.8.2`；
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 939 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china）；
+- 1064 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -313,7 +313,8 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `china_chars`：`cnc_001` 至 `cnc_109`，共 109 列中国 A 股股票特征（流动性、风险、动量、盈利、价值、投资等），
   见下文“中国 A 股股票特征 china_chars”；
 - `size_value_china`：`svc_001` 至 `svc_021`，共 21 列，Liu-Stambaugh-Yuan“Size and Value in China”的
-  规模、EP、异常换手率以及 CH-3/CH-4 因子载荷，见下文“Size and Value in China 因子集 size_value_china”。
+  规模、EP、异常换手率以及 CH-3/CH-4 因子载荷，见下文“Size and Value in China 因子集 size_value_china”；
+- `talib`：`ta_001` 至 `ta_125`，共 125 列，TA-Lib 经典技术指标（64 列）与 K 线形态（61 列），见下文“TA-Lib 因子集 talib”。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -343,6 +344,7 @@ src/rquant/factors/
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
+    ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -544,6 +546,31 @@ rquant data build-reference
 rquant factors build --factor-set size_value_china
 rquant factors validate --factor-set size_value_china
 rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
+```
+
+### TA-Lib 因子集 talib
+
+`talib` 逐只股票调用 TA-Lib C 库（`TA-Lib==0.8.2` Python 包，自带 Windows/macOS/Linux 预编译 wheel，无需另装 C 库），
+定义锁定在 `src/rquant/factors/libraries/talib_indicators.py`：
+
+- 只用 OHLCV，不需要参考数据；每只股票先去掉停牌和上市前的空行，再按自身连续交易日计算，所以 EMA、Wilder 平滑、
+  希尔伯特变换等递归指标不会被停牌缺口重置；每只股票最初 `lookback` 个交易日（TA-Lib 无值，K 线形态会给占位 0）为空；
+- 范围是经典 TA-Lib 0.4 的函数表，不含数学运算与数学变换；TA-Lib 0.6 以后新增的指标未纳入；
+- 后复权价格的水平对每只股票是任意的，所以价格单位的输出都做了无量纲化：均线类（SMA、EMA、KAMA、MAMA、SAR、
+  线性回归等）为 `指标 / close - 1`，价差类（MACD、DM、TRANGE、STDDEV、斜率、HT_PHASOR）为 `指标 / close`，
+  布林带改为 %B 与带宽，OBV、AD 为 20 日累计线变化除以这 20 日成交量，ADOSC 除以 10 日均量；
+  `tests/test_talib_indicators.py` 用价格乘 7、成交量除 7 的数据验证全部输出不变；
+- 去掉了与另一个已发布输出成精确仿射关系的列（ROCP/ROCR/ROCR100、CMO = 2·RSI − 100、MA、TYPPRICE、WCLPRICE、VAR、
+  ATR）和近似重复的列（MACDFIX、MACDEXT、SAREXT、MAVP、MOM、APO）；LINEARREG_ANGLE 依赖价格尺度、BETA 缺少市场输入，
+  也未纳入；
+- 61 个 K 线形态输出为 TA-Lib 原值：形态完成当天看涨 +100 / 看跌 -100（少数形态为 ±200），否则为 0。
+
+因子清单的实现指纹包含 TA-Lib Python 包与 C 库版本，升级 TA-Lib 会使旧的 `data/factors/talib` 失效。
+
+```bash
+rquant factors build --factor-set talib
+rquant factors validate --factor-set talib
+rquant walk-forward --model lgb --horizon 1d --factor-set talib
 ```
 
 ### 验证因子

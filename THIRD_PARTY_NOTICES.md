@@ -47,3 +47,16 @@ catalog). No source code from that GPL-3.0 project was copied or translated:
 RQuant re-implements each characteristic from its published definition with
 Tushare inputs, its own windows and its own point-in-time rules, and omits the
 characteristics that need data RQuant does not collect.
+
+## TA-Lib 0.8.2
+
+`src/rquant/factors/libraries/talib_indicators.py` calls functions of the
+TA-Lib technical analysis library through the `TA-Lib==0.8.2` Python package
+(https://github.com/TA-Lib/ta-lib-python), whose wheels bundle the TA-Lib C
+library (https://github.com/TA-Lib/ta-lib). No TA-Lib source is copied into
+this repository: RQuant only chooses functions and parameters, runs them per
+stock over its own trading days and rescales price-unit outputs.
+
+The Python wrapper is licensed under the BSD 2-Clause License and the C library
+under the BSD 3-Clause License. See `licenses/TA-Lib-0.8.2-LICENSE.txt` for the
+license text shipped with the installed package.

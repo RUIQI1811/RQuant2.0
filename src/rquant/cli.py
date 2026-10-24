@@ -35,7 +35,7 @@ from rquant.runs import RunContext
 from rquant.workflow.backtest import PortfolioBacktestRunner, PortfolioConfig
 from rquant.workflow.runner import RollingWorkflowRunner
 
-LOCKED_DEPENDENCIES = {"pyqlib": "0.9.7", "KunQuant": "0.1.11", "tushare": "1.4.29"}
+LOCKED_DEPENDENCIES = {"pyqlib": "0.9.7", "KunQuant": "0.1.11", "tushare": "1.4.29", "TA-Lib": "0.8.2"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,7 +207,7 @@ def _doctor(args: argparse.Namespace) -> int:
     for package, expected in LOCKED_DEPENDENCIES.items():
         actual = versions.get(package)
         record(package, actual == expected, {"expected": expected, "actual": actual})
-    for module in ("qlib", "KunQuant", "tushare", "lightgbm"):
+    for module in ("qlib", "KunQuant", "tushare", "lightgbm", "talib"):
         try:
             importlib.import_module(module)
             record(f"import:{module}", True, "ok")
@@ -232,7 +232,7 @@ def _doctor(args: argparse.Namespace) -> int:
     record("TUSHARE_TOKEN", bool(token), "set" if token else "missing")
     record(
         "factor_catalog",
-        len(get_catalog().specs) == 939,
+        len(get_catalog().specs) == 1064,
         {"columns": len(get_catalog().specs), "fingerprint": get_catalog().fingerprint},
     )
     config_path = Path(args.config)
