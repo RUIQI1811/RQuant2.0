@@ -352,7 +352,7 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `size_value_china`：`svc_001` 至 `svc_021`，共 21 列，Liu-Stambaugh-Yuan“Size and Value in China”的
   规模、EP、异常换手率以及 CH-3/CH-4 因子载荷，见下文“Size and Value in China 因子集 size_value_china”；
 - `talib`：`ta_001` 至 `ta_125`，共 125 列，TA-Lib 经典技术指标（64 列）与 K 线形态（61 列），见下文“TA-Lib 因子集 talib”。
-- `recent`：从上述七个库中挑出 2022 年以后单因子 RankIC 依然显著且稳定的因子，按相关性去重后共 96 列，成员、方向与
+- `recent`：从上述七个库中挑出 2020 年以后单因子 RankIC 依然显著且稳定的因子，按相关性去重后共 117 列，成员、方向与
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
@@ -399,7 +399,7 @@ src/rquant/factors/
     ├── alpha360.py                      # 6 个归一化字段各 60 个滞后期的 Alpha360 图
     ├── gtja191.py                       # 190 条 GTJA191 KunQuant 公式与语义说明
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
-    ├── recent.py                        # recent（2022 年以后仍有效）选择型因子集的锁定成员与方向
+    ├── recent.py                        # recent（2020 年以后仍有效）选择型因子集的锁定成员与方向
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
@@ -562,7 +562,7 @@ data/factors/qlib_alpha158/manifest.json
 
 ### 近期有效因子集 recent
 
-所有因子集的 LGB 预测 RankIC 在 2022、2023 年都衰减到 0.01-0.02。`recent` 只保留 2022 年以后单因子依然有效的因子，
+所有因子集的 LGB 预测 RankIC 在 2022、2023 年都衰减到 0.01-0.02。`recent` 只保留 2020 年以后单因子依然有效的因子，
 同样不重算公式，而是从已构建的 `qlib_alpha158`、`wq_alpha101`、`gtja191`、`qlib_alpha360`、`china_chars`、
 `size_value_china`、`talib` 复制所选列，因此必须先构建这七个源因子集：
 
@@ -572,26 +572,27 @@ rquant factors validate --factor-set recent
 rquant walk-forward --model lgb --horizon 1d --factor-set recent
 ```
 
-筛选口径（锁定在 `recent.py` 的 `criteria`，基于 2022-01-04 至 2026-10-21 对七个库分别执行的
-`rquant factors evaluate --horizon 1d --start 2022-01-01 --end 2026-10-21`）：
+筛选口径（锁定在 `recent.py` 的 `criteria`，基于 2020-01-02 至 2026-10-21 对七个库分别执行的
+`rquant factors evaluate --horizon 1d --start 2020-01-01 --end 2026-10-21`）：
 
-- 方向取 2022 年以来日均 Rank IC 的符号，年度统计都按该方向定向；
-- 只统计评估日数不少于 120 天的年份（2022-2026 共 5 年，2026 年为 189 天）；
-- 定向年度 Rank IC 为正的年份不少于 80%（5 年中至少 4 年）；
-- 2022 年以来 |Rank IC| 不低于 0.01，且其 t 统计量（日 Rank ICIR 乘以天数的平方根）绝对值不低于 3；
+- 方向取 2020 年以来日均 Rank IC 的符号，年度统计都按该方向定向；
+- 只统计评估日数不少于 120 天的年份（2020-2026 共 7 年，2026 年为 189 天）；
+- 定向年度 Rank IC 为正的年份不少于 80%（7 年中至少 6 年）；
+- 2020 年以来 |Rank IC| 不低于 0.01，且其 t 统计量（日 Rank ICIR 乘以天数的平方根）绝对值不低于 3；
 - 与 Hquality 一样不要求年度多空收益为正；
 - 覆盖率（七个评估合并后，各交易日有效观测数之和除以当日覆盖最好的因子观测数之和）不低于 80%；
-- 去重：通过以上条件的 183 个因子按 |Rank IC| 从强到弱排序，与已保留因子的日均截面 Spearman 相关系数（每隔 5 个
-  交易日取样）绝对值不低于 0.8 就剔除，最终保留 96 个（china_chars 31、gtja191 17、wq_alpha101 16、
-  qlib_alpha158 15、size_value_china 7、qlib_alpha360 6、talib 4）。
+- 去重：通过以上条件的 213 个因子按 |Rank IC| 从强到弱排序，与已保留因子的日均截面 Spearman 相关系数（每隔 5 个
+  交易日取样）绝对值不低于 0.8 就剔除，最终保留 117 个（gtja191 27、qlib_alpha158 21、wq_alpha101 21、
+  china_chars 20、qlib_alpha360 20、size_value_china 4、talib 4）。
 
-成员选择用到了 2022 年以后的收益：walk-forward 中 2022 年及以后的测试年份对选择而言是样本内，结果偏乐观；
-2013-2021 年虽未用到当年收益，但用的是事后才知道的“哪些因子 2022 年后仍有效”，同样不是干净的历史回测。
+成员选择用到了 2020 年以后的收益：walk-forward 中 2020 年及以后的测试年份对选择而言是样本内，结果偏乐观；
+2013-2019 年虽未用到当年收益，但用的是事后才知道的“哪些因子 2020 年后仍有效”，同样不是干净的历史回测。
 
-LGB 1d walk-forward（2013-2026，run `20261024T092049Z-405a155f`）：预测 RankIC 全区间 0.070、2022 年以来 0.040
-（Hquality 0.072 / 0.036，Alpha158 0.067 / 0.032），2023 年从 0.019（Hquality）提高到 0.034；组合年化 17.9%、夏普 0.79、
-最大回撤 -46.8%，低于 Hquality 的 19.1% / 0.83 和 Alpha158 的 19.5% / 0.86。2022 年以来累计收益 +26.9%，与 Alpha158 的
-+24.8% 接近，高于 Hquality 的 +3.0%，但这段是样本内。
+LGB 1d walk-forward（2013-2026，run `20261024T100453Z-6304df62`）：预测 RankIC 全区间 0.074、2022 年以来 0.042，
+都高于 Hquality（0.072 / 0.036）和 Alpha158（0.067 / 0.032），但 2022 年只有 0.005；组合年化 18.5%、夏普 0.80、
+最大回撤 -44.5%，仍低于 Hquality 的 19.1% / 0.83 和 Alpha158 的 19.5% / 0.86。2022 年以来累计收益 -3.4%（2022 年 -26.2%），
+Hquality 为 +3.0%，Alpha158 为 +24.8%。此前按 2022 年以后筛选的 96 因子版本（run `20261024T092049Z-405a155f`）年化 17.9%、
+夏普 0.79，2022 年以来累计 +26.9%。
 
 ### 中国 A 股股票特征 china_chars
 
