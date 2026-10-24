@@ -293,6 +293,27 @@ class DataPipelineTests(unittest.TestCase):
         trades = self.pd.read_parquet(run_directory / "trades.parquet")
         self.assertEqual("sell", trades.iloc[-1]["direction"])
 
+    def test_portfolio_backtest_ignores_signals_between_rebalance_dates(self) -> None:
+        CanonicalBuilder(self.raw, self.canonical).build()
+        QlibProviderBuilder(self.canonical, self.qlib).build()
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        self.pd.DataFrame(
+            [
+                [self.pd.Timestamp("2020-01-02"), "SZ000002", 1.0],
+                [self.pd.Timestamp("2020-01-03"), "SZ000001", 1.0],
+            ],
+            columns=["datetime", "instrument", "score"],
+        ).to_parquet(run_directory / "predictions.parquet", index=False)
+        result = PortfolioBacktestRunner(
+            qlib_root=self.qlib,
+            run_directory=run_directory,
+            config=PortfolioConfig(initial_capital=100_000, topk=1, n_drop=1, rebalance_days=2),
+        ).run()
+        self.assertEqual(1, result["signal_days"])
+        trades = self.pd.read_parquet(run_directory / "trades.parquet")
+        self.assertEqual({"SZ000002"}, set(trades["instrument"]))
+
 
 @unittest.skipUnless(HAS_PARQUET, "pandas and pyarrow are required")
 class CollectorResumeTests(unittest.TestCase):

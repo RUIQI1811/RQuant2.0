@@ -149,7 +149,8 @@ rquant doctor --skip-permission-check
 | `workflow.first_prediction_year` |       `2013` | 第一个样本外预测年           |
 | `backtest.initial_capital`       |    `1000000` | 初始资金，人民币             |
 | `backtest.topk`                  |         `50` | 目标持股数量                 |
-| `backtest.n_drop`                |          `5` | 每期最多换出数量             |
+| `backtest.n_drop`                |         `50` | 每次调仓最多换出数量；等于 `topk` 时全量调整到最新前 `topk` 名 |
+| `backtest.rebalance_days`        |          `5` | 每隔多少个交易日调仓一次（从第一个预测日起算），其余交易日不下单 |
 | `backtest.impact_cost`           |        `0.0` | Qlib 二次冲击成本系数，按成交额占当日成交额比例的平方计费 |
 
 如需使用其他配置文件，所有命令都可以在主命令前指定：
@@ -739,7 +740,8 @@ rquant report RUN_ID
 报告命令使用该运行的样本外预测执行 A 股约束下的 long-only TopkDropout 回测：
 
 - 初始资金 100 万元；
-- 目标持股 50 只，每期最多换出 5 只；
+- 目标持股 50 只，每 5 个交易日调仓一次：按调仓日的最新预测把持仓换成前 50 名，其余交易日不交易；
+  调仓日未能卖出的持仓（停牌、开盘跌停）保留到下一次调仓；
 - 等权、多头；
 - 信号后的下一可用开盘成交；
 - 买入按 100 股整数单位；
@@ -748,6 +750,12 @@ rquant report RUN_ID
 - 按方向执行开盘涨停不可买、开盘跌停不可卖；
 - 佣金、最低佣金、印花税和可选的冲击成本（`backtest.impact_cost`）来自 `config/default.yaml`；
 - 最后一个可用开盘尝试在相同约束下清仓，无法卖出的证券会明确保留在清单中。
+
+组合参数可以在命令行临时覆盖配置，例如复现旧的每日最多换 5 只：
+
+```bash
+rquant report RUN_ID --n-drop 5 --rebalance-days 1
+```
 
 `report` 自身也会创建 `runs/report/<report-run-id>/run.json`，记录所用的组合参数、预测文件哈希和 Qlib
 指纹；失败时状态为 `failed`。回测产物仍写回滚动训练的运行目录，同一 `RUN_ID` 重跑会覆盖上一次的回测产物，
@@ -855,7 +863,7 @@ python -m ruff check src tests
 - 研究股票池：历史时点可知的沪深 300；
 - 标签：下一开盘到再下一开盘的 1 日收益，或下一开盘到第六个开盘的 5 日收益；
 - 滚动评估：前三个完整自然年训练，下一年样本外测试；
-- 组合：long-only TopkDropout，持股 50，只换出 5；
+- 组合：long-only TopkDropout，持股 50，每 5 个交易日全量调整到最新前 50 名；
 - 初始资金：人民币 1,000,000 元；
 - 执行：下一开盘、100 股买入单位、T+1、停牌与开盘涨跌停限制；
 - 期末：在最后可用开盘尝试受约束清仓，未能卖出的持仓不会被静默当作已卖出。
