@@ -6,6 +6,7 @@ Factor libraries that read it record the hashes of the files they consumed in th
 * ``daily_basic/year=YYYY/data.parquet``: per-stock valuation, share-count and turnover fields for every A share.
 * ``market_factors.parquet``: daily value-weighted A-share market return plus Fama-French SMB and HML, all built from
   the full A-share cross-section with previous-day weights and month-start portfolio formation.
+* ``ch4_factors.parquet``: daily Liu-Stambaugh-Yuan CH-3/CH-4 factor returns (``rquant.data.ch4_factors``).
 * ``fundamentals.parquet``: one first-reported row per stock and fiscal quarter, with the trading-day-independent
   announcement date after which the whole row is known.
 """
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from rquant.data.canonical import ts_code_to_qlib
+from rquant.data.ch4_factors import CH4_FACTORS, CH4FactorBuilder
 from rquant.data.collector import FUNDAMENTALS_MANIFEST
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS, STATEMENT_KEY_FIELDS
 from rquant.errors import DataContractError, DependencyError
@@ -38,7 +40,7 @@ DAILY_BASIC_FIELDS = (
     "total_mv",
     "circ_mv",
 )
-REFERENCE_VERSION = 1
+REFERENCE_VERSION = 2
 # Newly listed stocks trade outside normal price limits; they join the factor portfolios after this many calendar days.
 MARKET_FACTOR_SEASONING_DAYS = 30
 MARKET_FACTOR_MIN_STOCKS = 100
@@ -61,7 +63,7 @@ class ReferenceBuilder:
         daily_root = self.reference_root / "daily_basic"
         staging = Path(tempfile.mkdtemp(prefix=".daily_basic.staging.", dir=self.reference_root))
         try:
-            factors = self._stream_daily(staging, list_dates)
+            factors, ch4 = self._stream_daily(staging, list_dates)
             atomic_replace_directory(staging, daily_root)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -69,6 +71,8 @@ class ReferenceBuilder:
             files[path.relative_to(self.reference_root).as_posix()] = sha256_file(path)
         _write_parquet(factors, self.reference_root / "market_factors.parquet")
         files["market_factors.parquet"] = sha256_file(self.reference_root / "market_factors.parquet")
+        _write_parquet(ch4, self.reference_root / "ch4_factors.parquet")
+        files["ch4_factors.parquet"] = sha256_file(self.reference_root / "ch4_factors.parquet")
 
         fundamentals_manifest = self.raw_root / FUNDAMENTALS_MANIFEST
         fundamentals_fingerprint = None
@@ -88,6 +92,7 @@ class ReferenceBuilder:
             "raw_fingerprint": raw_manifest.get("fingerprint"),
             "fundamentals_fingerprint": fundamentals_fingerprint,
             "market_factor_days": int(factors["mkt"].notna().sum()),
+            "ch4_factor_days": int(ch4["pmo"].notna().sum()),
             "files": files,
         }
         manifest["fingerprint"] = stable_hash(manifest)
@@ -105,13 +110,18 @@ class ReferenceBuilder:
         listed = pd.to_datetime(basic["list_date"], format="%Y%m%d", errors="coerce")
         return dict(zip(basic["ts_code"], listed, strict=True))
 
-    def _stream_daily(self, staging: Path, list_dates: dict[str, Any]) -> Any:
-        """Write yearly daily_basic partitions and return daily market factors, one trading date at a time."""
+    def _stream_daily(self, staging: Path, list_dates: dict[str, Any]) -> tuple[Any, Any]:
+        """Write yearly daily_basic partitions and return daily market and CH-4 factors, one trading date at a time.
+
+        Published daily_basic rows gain ``turnover_total``: share volume over total shares, as a fraction.
+        """
         pd, np = _dependencies()
         daily_paths = sorted((self.raw_root / "daily").glob("**/data.parquet"))
         if not daily_paths:
             raise DataContractError("No raw artifacts for endpoint: daily")
         rows: list[dict[str, Any]] = []
+        ch4_rows: list[dict[str, Any]] = []
+        ch4 = CH4FactorBuilder(list_dates)
         year_frames: list[Any] = []
         current_year: int | None = None
         previous: Any = None
@@ -130,7 +140,9 @@ class ReferenceBuilder:
         for daily_path in daily_paths:
             partition = daily_path.parent.relative_to(self.raw_root / "daily")
             basic_path = self.raw_root / "daily_basic" / partition / "data.parquet"
-            daily = pd.read_parquet(daily_path, columns=["ts_code", "trade_date", "close", "pre_close"])
+            daily = pd.read_parquet(daily_path)
+            daily = daily[[column for column in ("ts_code", "trade_date", "close", "pre_close", "vol")
+                           if column in daily.columns]]
             if daily.empty:
                 continue
             if not basic_path.exists():
@@ -144,6 +156,15 @@ class ReferenceBuilder:
             published = basic[["ts_code", *fields]].copy()
             for field in fields:
                 published[field] = pd.to_numeric(published[field], errors="coerce")
+            today = daily.drop_duplicates("ts_code", keep="last").set_index("ts_code")
+            volume = pd.to_numeric(today["vol"], errors="coerce") if "vol" in today.columns else today["close"] * np.nan
+            if "total_share" in published.columns:
+                # Tushare vol is in lots of 100 shares and total_share in units of 10,000 shares.
+                shares = published.set_index("ts_code")["total_share"]
+                turnover = (volume.reindex(shares.index) / (shares.where(shares > 0) * 100.0)).astype(float)
+            else:
+                turnover = pd.Series(np.nan, index=published["ts_code"].to_numpy(), dtype=float)
+            published["turnover_total"] = turnover.to_numpy()
             published.insert(0, "datetime", trade_date)
             published.insert(0, "instrument", published.pop("ts_code").map(ts_code_to_qlib))
             if current_year != trade_date.year:
@@ -151,12 +172,17 @@ class ReferenceBuilder:
                 current_year = trade_date.year
             year_frames.append(published)
 
-            today = daily.drop_duplicates("ts_code", keep="last").set_index("ts_code")
             today["ret"] = pd.to_numeric(today["close"], errors="coerce") / pd.to_numeric(
                 today["pre_close"], errors="coerce"
             ) - 1.0
-            state = basic.set_index("ts_code")[[f for f in ("circ_mv", "total_mv", "pb") if f in basic.columns]]
+            state = basic.set_index("ts_code")[
+                [f for f in ("circ_mv", "total_mv", "pb", "pe_ttm") if f in basic.columns]
+            ]
             state = state.apply(pd.to_numeric, errors="coerce")
+            if "total_mv" in state.columns:
+                ch4_rows.append(ch4.update(trade_date, today["ret"], state, turnover.reindex(today.index)))
+            else:
+                ch4_rows.append({"datetime": trade_date, **{name: np.nan for name in CH4_FACTORS}, "ch4_stocks": 0})
             listed = pd.Series(list_dates).reindex(today.index)
             seasoned = (trade_date - listed).dt.days >= MARKET_FACTOR_SEASONING_DAYS
             eligible = ~today.index.str.endswith(".BJ") & seasoned.fillna(False).to_numpy()
@@ -178,7 +204,12 @@ class ReferenceBuilder:
         flush(current_year)
         if not rows:
             raise DataContractError("No daily partitions to build reference data from")
-        return pd.DataFrame(rows, columns=["datetime", "mkt", "smb", "hml", "stocks"])
+        return (
+            pd.DataFrame(rows, columns=["datetime", "mkt", "smb", "hml", "stocks"]),
+            pd.DataFrame(ch4_rows, columns=["datetime", *CH4_FACTORS, "ch4_stocks"]).rename(
+                columns={"ch4_stocks": "stocks"}
+            ),
+        )
 
     def _fundamentals(self, source: dict[str, Any]) -> Any:
         """Merge first-reported statements into one row per stock and quarter end."""

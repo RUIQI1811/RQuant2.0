@@ -134,7 +134,7 @@ class FactorSelectionRegistryTests(unittest.TestCase):
 
         self.assertIs(HQUALITY_SELECTION, selection)
         self.assertEqual(HQUALITY_SELECTION.canonical_names, catalog.canonical_names("Hquality"))
-        self.assertEqual(918, len(catalog.specs))
+        self.assertEqual(939, len(catalog.specs))
         for name in selection.canonical_names:
             self.assertIn(registry.source_factor_set(selection, name), ("qlib_alpha158", "wq_alpha101", "gtja191"))
         self.assertNotIn("gtja_030", selection.canonical_names)
