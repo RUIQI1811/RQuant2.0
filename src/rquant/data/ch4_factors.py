@@ -6,7 +6,8 @@ to daily returns:
 * Portfolios are formed on the first trading day of each month from data through the previous trading day (the last
   trading day of the prior month) and held for the month.
 * The universe is Shanghai and Shenzhen main-board and ChiNext stocks (codes 60, 00 and 30) listed for at least six
-  months, with at least 120 trading days over the past 250 trading days and at least 15 in the most recent month.
+  months, with at least 120 trading days over the past 250 trading days and at least 15 in the most recent month
+  (three quarters of the month's trading days when the market itself was open fewer than 20 days).
   The smallest 30% by total market value, ranked before the trading filters, is removed as shell-value contaminated.
 * Size is total market value (all shares, tradable or not). Earnings-to-price is the reciprocal of Tushare's trailing
   ``pe_ttm``; Tushare leaves ``pe_ttm`` empty for loss-making firms, and those stocks are placed in the growth group
@@ -35,6 +36,7 @@ CH4_SEASONING_DAYS = 183
 CH4_YEAR_DAYS = 250
 CH4_YEAR_MIN_DAYS = 120
 CH4_MONTH_MIN_DAYS = 15
+CH4_MONTH_MIN_SHARE = 0.75
 CH4_TURNOVER_DAYS = 20
 CH4_MIN_STOCKS = 100
 
@@ -91,12 +93,16 @@ class CH4FactorBuilder:
         last_month = (self.previous_date.year, self.previous_date.month)
         year_days = pd.Series(0, index=size.index)
         month_days = pd.Series(0, index=size.index)
+        market_days = 0
         for day, traded, _ in self.history:
             present = size.index.isin(traded).astype(int)
             year_days += present
             if (day.year, day.month) == last_month:
                 month_days += present
-        traded = (year_days >= CH4_YEAR_MIN_DAYS) & (month_days >= CH4_MONTH_MIN_DAYS)
+                market_days += 1
+        # A Spring Festival February can have fewer than 15 trading days, so the month rule scales with short months.
+        month_minimum = min(CH4_MONTH_MIN_DAYS, int(np.ceil(CH4_MONTH_MIN_SHARE * market_days)))
+        traded = (year_days >= CH4_YEAR_MIN_DAYS) & (month_days >= month_minimum)
         eligible = seasoned & traded.to_numpy()
         size = size[eligible]
         if len(size) < CH4_MIN_STOCKS:
