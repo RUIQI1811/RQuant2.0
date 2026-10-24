@@ -37,10 +37,11 @@ rquant factors build --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
-rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 需要
+rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 与 jq240 需要
 rquant data build-reference
 rquant factors build --factor-set china_chars
 rquant factors build --factor-set size_value_china    # 只需 build-reference，不需要财报
+rquant factors build --factor-set jq240
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -116,7 +117,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 1064 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib）；
+- 1297 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -317,6 +318,8 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `talib`：`ta_001` 至 `ta_125`，共 125 列，TA-Lib 经典技术指标（64 列）与 K 线形态（61 列），见下文“TA-Lib 因子集 talib”。
 - `recent`：从上述七个库中挑出 2022 年以后单因子 RankIC 依然显著且稳定的因子，按相关性去重后共 96 列，成员、方向与
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
+- `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
+  动量与风格因子，见下文“聚宽因子集 jq240”。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -348,6 +351,7 @@ src/rquant/factors/
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
+    ├── jq240.py                         # 233 个按聚宽因子库定义重写的日频因子
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -607,6 +611,35 @@ rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
 rquant factors build --factor-set talib
 rquant factors validate --factor-set talib
 rquant walk-forward --model lgb --horizon 1d --factor-set talib
+```
+
+### 聚宽因子集 jq240
+
+`jq240` 按聚宽（JoinQuant）因子库 `jqfactor` 公开的因子名称与定义独立重写，不使用聚宽代码或数据，只用 Tushare，
+定义锁定在 `src/rquant/factors/libraries/jq240.py`，来源名就是聚宽因子名（如 `roe_ttm`、`VOL20`、`BIAS10`、`size`）。
+九个类别：质量 66、基础科目及衍生 36、情绪 36、动量 34、每股 15、技术 15、风险 12、风格 10、成长 9。
+
+- 财报取 `fundamentals.parquet` 的首次披露值，沿用 `china_chars` 的季度网格：报告期在公告日之后、且更早报告期都已
+  公告后才可用；`_ttm` 为最近四个单季之和，聚宽按报告期给出的非 TTM 流量项取最近单季，资产负债项取最近报告期，
+  “平均”余额为本期与上年同期的均值，同比增长除以基期绝对值；
+- 价量指标在每只股票自己的交易日上计算（停牌行先剔除再写回为空），窗口数的是有行情的天数；
+  均线、EMA、布林带、MACD 按聚宽口径除以收盘价，ATR 与多空力道也除以收盘价，`price_no_fq` 是 daily_basic 的不复权收盘价；
+  成交量是标准数据的复权成交量，成交额为元，换手率为 daily_basic 的流通股换手率（%）；
+- 风格因子按聚宽文档的 Barra CNE5 描述子计算（beta 半衰期 63、RSTR 504 日滞后 21 日、DASTD/CMRA/HSIGMA 等），
+  截面标准化、排序和正交化只用当日的沪深 300 成分股，市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
+- 未实现：`non_recurring_gain_loss` 与 `adjusted_profit_to_total_profit`（需要 `fina_indicator` 的扣非净利润），
+  以及风格因子中依赖分析师预期的 EPIBS、EGRLF、EGRSF（其权重按比例分给其余描述子）。
+
+`jq240` 需要的财报字段比 `china_chars` 多，`FUNDAMENTAL_ENDPOINT_FIELDS` 增加字段后旧的财报分区查询指纹会失效，需要
+重新同步（`csi300` 股票池约一万个分区，按默认限流约一小时）并重建参考数据；`fundamentals.parquet` 的哈希随之改变，
+已构建的 `china_chars` 也要重建。`tests/test_jq240.py` 用截断数据重算、停牌窗口与直接公式回归验证。
+
+```bash
+rquant data sync-fundamentals --through 2026-08-04
+rquant data build-reference
+rquant factors build --factor-set jq240
+rquant factors validate --factor-set jq240
+rquant walk-forward --model lgb --horizon 1d --factor-set jq240
 ```
 
 ### 验证因子
