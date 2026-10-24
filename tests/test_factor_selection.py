@@ -14,6 +14,7 @@ from rquant.factors.engine import FactorBuildConfig, SelectionFactorEngine, crea
 from rquant.factors.libraries.base import FactorSelection, FactorSpec, PanelFactorLibrary, SelectedFactor
 from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
 from rquant.factors.libraries.hquality import HQUALITY_SELECTION
+from rquant.factors.libraries.recent import RECENT_SELECTION
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
 from rquant.factors.selection import (
     StabilityCriteria,
@@ -139,6 +140,19 @@ class FactorSelectionRegistryTests(unittest.TestCase):
             self.assertIn(registry.source_factor_set(selection, name), ("qlib_alpha158", "wq_alpha101", "gtja191"))
         self.assertNotIn("gtja_030", selection.canonical_names)
 
+    # Break caught: a recent member whose only source is a factor set the selection does not declare.
+    def test_default_registry_publishes_recent_from_all_library_factor_sets(self) -> None:
+        registry = get_library_registry()
+        catalog = get_catalog()
+        selection = registry.selection("recent")
+
+        self.assertIs(RECENT_SELECTION, selection)
+        self.assertEqual(RECENT_SELECTION.canonical_names, catalog.canonical_names("recent"))
+        self.assertEqual(96, len(selection.canonical_names))
+        sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
+        self.assertEqual(set(selection.source_factor_sets), sources)
+        self.assertEqual({"kunquant", "panel"}, {library.backend for library in registry.select("recent")})
+
 
 class SelectionFactorEngineTests(unittest.TestCase):
     def _build_sources(self, root: Path, registry: FactorLibraryRegistry, canonical: Path) -> None:
@@ -215,8 +229,10 @@ class FactorStabilityScoreTests(unittest.TestCase):
                        "long_short_return": 0.3})
         summary = pd.DataFrame(
             [
-                {"factor": "steady", "rank_ic_mean": -0.03, "rank_icir": -0.2, "long_short_return": -1.0},
-                {"factor": "flaky", "rank_ic_mean": 0.01, "rank_icir": 0.05, "long_short_return": 0.2},
+                {"factor": "steady", "rank_ic_mean": -0.03, "rank_icir": -0.2, "rank_ic_days": 1920,
+                 "long_short_return": -1.0},
+                {"factor": "flaky", "rank_ic_mean": 0.01, "rank_icir": 0.05, "rank_ic_days": 1920,
+                 "long_short_return": 0.2},
             ]
         )
         return summary, pd.DataFrame(annual)
@@ -233,6 +249,23 @@ class FactorStabilityScoreTests(unittest.TestCase):
         self.assertAlmostEqual(1.0, scored.loc["steady", "oriented_long_short_return"])
         self.assertFalse(scored.loc["flaky", "selected"])
         self.assertIn("rank_ic_years", scored.loc["flaky", "failed_checks"])
+
+    # Break caught: a t-statistic built from the per-day ICIR alone, which ignores how many days back the mean.
+    def test_rank_ic_t_stat_scales_daily_icir_by_square_root_of_days(self) -> None:
+        summary, annual = self._frames()
+        coverage = pd.Series({"steady": 0.99, "flaky": 0.99})
+        scored = score_factor_stability(
+            summary, annual, coverage, StabilityCriteria(min_abs_rank_ic_t_stat=8.0)
+        ).set_index("factor")
+        self.assertAlmostEqual(-0.2 * np.sqrt(1920), scored.loc["steady", "rank_ic_t_stat"])
+        self.assertTrue(scored.loc["steady", "selected"])
+
+        short = summary.assign(rank_ic_days=100)
+        scored = score_factor_stability(
+            short, annual, coverage, StabilityCriteria(min_abs_rank_ic_t_stat=8.0)
+        ).set_index("factor")
+        self.assertFalse(scored.loc["steady", "selected"])
+        self.assertEqual("rank_ic_t_stat", scored.loc["steady", "failed_checks"])
 
     def test_low_coverage_blocks_selection(self) -> None:
         summary, annual = self._frames()
@@ -290,6 +323,14 @@ class FactorDeduplicationTests(unittest.TestCase):
         self.assertFalse(kept & set(dropped))
         self.assertTrue(set(dropped.values()) <= kept)
         self.assertEqual(0.8, HQUALITY_SELECTION.criteria["max_abs_rank_correlation"])
+
+    def test_locked_recent_has_no_pair_above_its_correlation_limit(self) -> None:
+        dropped = RECENT_SELECTION.provenance["deduplicated"]
+        kept = set(RECENT_SELECTION.canonical_names)
+        self.assertEqual(96, len(kept))
+        self.assertFalse(kept & set(dropped))
+        self.assertTrue(set(dropped.values()) <= kept)
+        self.assertEqual(0.8, RECENT_SELECTION.criteria["max_abs_rank_correlation"])
 
 
 if __name__ == "__main__":

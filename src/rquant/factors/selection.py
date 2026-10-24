@@ -24,6 +24,8 @@ class StabilityCriteria:
     min_positive_long_short_year_ratio: float = 0.75
     # Absolute full-period mean daily Rank IC.
     min_abs_rank_ic: float = 0.01
+    # Absolute t-statistic of the full-period mean daily Rank IC (daily Rank ICIR times the square root of its days).
+    min_abs_rank_ic_t_stat: float = 0.0
     # Published factor values divided by the largest observation count of any factor, summed over dates.
     min_coverage: float = 0.9
 
@@ -60,7 +62,7 @@ def score_factor_stability(summary: Any, annual: Any, coverage: Any, criteria: S
     except ImportError as exc:
         raise DependencyError("pandas and NumPy are required for factor selection") from exc
     for name, frame, columns in (
-        ("summary", summary, {"factor", "rank_ic_mean", "rank_icir", "long_short_return"}),
+        ("summary", summary, {"factor", "rank_ic_mean", "rank_icir", "rank_ic_days", "long_short_return"}),
         ("annual", annual, {"factor", "year", "return_days", "rank_ic_mean", "long_short_return"}),
     ):
         if not columns.issubset(frame.columns):
@@ -83,6 +85,7 @@ def score_factor_stability(summary: Any, annual: Any, coverage: Any, criteria: S
     result["direction"] = direction.fillna(0.0).astype(int)
     result["rank_ic_mean"] = full["rank_ic_mean"]
     result["rank_icir"] = full["rank_icir"]
+    result["rank_ic_t_stat"] = full["rank_icir"] * np.sqrt(full["rank_ic_days"].astype(float))
     result["oriented_long_short_return"] = full["long_short_return"] * direction
     result["counted_years"] = counted.reindex(result.index).fillna(0).astype(int)
     result["positive_rank_ic_years"] = positive_ic.reindex(result.index).fillna(0).astype(int)
@@ -95,6 +98,7 @@ def score_factor_stability(summary: Any, annual: Any, coverage: Any, criteria: S
     checks = {
         "direction": result["direction"] != 0,
         "rank_ic": result["rank_ic_mean"].abs() >= criteria.min_abs_rank_ic,
+        "rank_ic_t_stat": result["rank_ic_t_stat"].abs().fillna(0.0) >= criteria.min_abs_rank_ic_t_stat,
         "rank_ic_years": result["positive_rank_ic_year_ratio"] >= criteria.min_positive_rank_ic_year_ratio,
         "long_short_years": result["positive_long_short_year_ratio"]
         >= criteria.min_positive_long_short_year_ratio,
