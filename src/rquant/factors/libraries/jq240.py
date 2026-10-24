@@ -588,7 +588,7 @@ class JQ240Library(PanelFactorLibrary):
         )
         members["datetime"] = pd.to_datetime(members["datetime"])
         membership = members.pivot(index="datetime", columns="instrument", values="in_csi300")
-        inputs["universe"] = membership.reindex(index=dates, columns=instruments).fillna(False).astype(bool)
+        inputs["universe"] = membership.reindex(index=dates, columns=instruments).eq(True)
         hashes = {
             "jq240_reference": manifest["fingerprint"],
             "jq240_daily_basic": stable_hash({name: files[name] for name in daily_files}),
@@ -663,7 +663,7 @@ class JQFactors:
         self.cap = self._panel("cap").where(self._panel("cap") > 0)
         self.shares = self._panel("basic_total_share").where(self._panel("basic_total_share") > 0)
         self.universe = (
-            self._panel("universe").reindex(index=self.dates, columns=self.instruments).fillna(False).astype(bool)
+            self._panel("universe").reindex(index=self.dates, columns=self.instruments).eq(True)
         )
 
     def calculate(self, name: str) -> Panel:
