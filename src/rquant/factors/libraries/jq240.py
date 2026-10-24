@@ -50,7 +50,7 @@ Panel = pd.DataFrame
 Formula = Callable[["JQFactors"], Any]
 YEAR = 252
 RISK_FREE = 0.04
-COLUMN_BLOCK = 64
+COLUMN_BLOCK = 32
 JQ240_DAILY_BASIC = {"close": 1.0, "turnover_rate": 1.0, "circ_mv": 10_000.0, "total_share": 10_000.0, "pe_ttm": 1.0}
 
 # Missing statement lines that mean "none reported" once the statement itself exists, keyed by the line that shows
@@ -560,8 +560,11 @@ class JQ240Library(PanelFactorLibrary):
             if sha256_file(root / name) != files[name]:
                 raise DataContractError(f"Reference file differs from its manifest: {root / name}")
         columns = ["instrument", "datetime", *JQ240_DAILY_BASIC]
-        daily = pd.concat([pd.read_parquet(root / name, columns=columns) for name in daily_files], ignore_index=True)
-        daily = daily[daily["instrument"].isin(set(instruments))]
+        # Reading only the panel's instruments keeps the all-A daily_basic partitions out of memory.
+        wanted = [("instrument", "in", list(instruments))]
+        daily = pd.concat(
+            [pd.read_parquet(root / name, columns=columns, filters=wanted) for name in daily_files], ignore_index=True
+        )
         inputs: dict[str, Any] = {}
         for field, scale in JQ240_DAILY_BASIC.items():
             panel = daily.pivot(index="datetime", columns="instrument", values=field)
@@ -577,7 +580,10 @@ class JQ240Library(PanelFactorLibrary):
         if not bar_files:
             raise DataContractError(f"Canonical bars do not exist under {canonical_root / 'bars'}")
         members = pd.concat(
-            [pd.read_parquet(path, columns=["datetime", "instrument", "in_csi300"]) for path in bar_files],
+            [
+                pd.read_parquet(path, columns=["datetime", "instrument", "in_csi300"], filters=wanted)
+                for path in bar_files
+            ],
             ignore_index=True,
         )
         members["datetime"] = pd.to_datetime(members["datetime"])
