@@ -165,6 +165,11 @@ class ReferenceBuilderTests(unittest.TestCase):
         daily_basic = pd.read_parquet(self.canonical / "reference" / "daily_basic")
         self.assertLessEqual({"SH600000", "BJ830001"}, set(daily_basic["instrument"]))
         self.assertNotIn("fundamentals.parquet", manifest["files"])
+        self.assertIn("turnover_total", daily_basic.columns)
+        ch4 = pd.read_parquet(self.canonical / "reference" / "ch4_factors.parquet")
+        self.assertEqual(["datetime", "mkt", "smb", "vmg", "pmo", "smb4", "stocks"], list(ch4.columns))
+        self.assertEqual(len(self.days), len(ch4))
+        self.assertIn("ch4_factors.parquet", manifest["files"])
         self.assertEqual(manifest, load_reference_manifest(self.canonical))
 
     def test_fundamentals_merge_first_reported_statements(self) -> None:

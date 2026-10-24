@@ -40,6 +40,7 @@ rquant factors validate --factor-set Hquality
 rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 需要
 rquant data build-reference
 rquant factors build --factor-set china_chars
+rquant factors build --factor-set size_value_china    # 只需 build-reference，不需要财报
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -115,7 +116,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 918 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars）；
+- 939 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -255,9 +256,12 @@ python -m json.tool data/qlib/manifest.json
 `data/canonical/reference/` 中除沪深 300 日线、行业和成分快照外，还有供 `china_chars` 使用的扩展参考数据。
 它们不进入标准日线列，也不改变标准数据指纹，所以构建它们不会让已有因子库过期：
 
-- `daily_basic/year=YYYY/data.parquet`：全 A 股的换手率、流通/总市值、估值和未复权收盘价；
+- `daily_basic/year=YYYY/data.parquet`：全 A 股的换手率、流通/总市值、估值和未复权收盘价，以及
+  `turnover_total`（成交股数 / 总股本）；
 - `market_factors.parquet`：全 A 股（不含北交所、上市不足 30 天的新股）按前一日流通市值加权的市场收益，以及每月初按
   前一日总市值与 1/PB 分组的 Fama-French 2x3 SMB、HML 日收益；
+- `ch4_factors.parquet`：Liu-Stambaugh-Yuan（2019）CH-3/CH-4 日收益 `mkt`、`smb`、`vmg`、`pmo`、`smb4`，
+  口径见下文“Size and Value in China 因子集 size_value_china”；
 - `fundamentals.parquet`：利润表、资产负债表、现金流量表合并报表的首次披露值，每只股票每个报告期一行，
   `ann_date` 为三张表都已公告的日期；
 - `manifest.json`：上述文件的哈希、所依据的原始同步指纹和财报同步指纹。
@@ -307,7 +311,9 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `Hquality`：从上述因子中按年度 RankIC 稳定性筛出并按相关性去重后的 137 列，来自 Alpha158、Alpha101 与 GTJA191（不含 Alpha360），
   成员、方向与筛选口径锁定在 `src/rquant/factors/libraries/hquality.py`（见下文“高质量因子集 Hquality”）；
 - `china_chars`：`cnc_001` 至 `cnc_109`，共 109 列中国 A 股股票特征（流动性、风险、动量、盈利、价值、投资等），
-  见下文“中国 A 股股票特征 china_chars”。
+  见下文“中国 A 股股票特征 china_chars”；
+- `size_value_china`：`svc_001` 至 `svc_021`，共 21 列，Liu-Stambaugh-Yuan“Size and Value in China”的
+  规模、EP、异常换手率以及 CH-3/CH-4 因子载荷，见下文“Size and Value in China 因子集 size_value_china”。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -336,6 +342,7 @@ src/rquant/factors/
     ├── gtja191.py                       # 完整 GTJA191 提供者与公式语义说明
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
+    ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -505,6 +512,39 @@ rquant walk-forward --model lgb --horizon 1d --factor-set china_chars
 原始 118 个特征中，Tushare 当前权限拿不到或原实现未完成的 10 个未纳入：员工数（hn、lfe）、广告费（adm、gad）、
 CH-4 因子载荷（mkt_beta、vmg_beta、smb_beta、pmo_beta）、q 因子残差矩（idvq、idsq）；原项目的 tail 未完成，也未纳入。
 因子清单的 `reference_inputs` 记录所读参考文件的哈希。
+
+### Size and Value in China 因子集 size_value_china
+
+`size_value_china` 按 Liu、Stambaugh、Yuan（2019，JFE）“Size and Value in China”公布的 CH-3/CH-4 定义用 Tushare
+独立实现。`rquant data build-reference` 先从全 A 股截面构建日度因子收益 `reference/ch4_factors.parquet`
+（`src/rquant/data/ch4_factors.py`）：
+
+- 每月第一个交易日用截至上一交易日（上月最后交易日）的数据分组，持有一个月；日收益按前一日总市值加权；
+- 样本为代码以 60、00、30 开头的沪深主板和创业板股票，上市满 6 个月，过去 250 个交易日至少 120 天有交易、
+  上个月至少 15 天有交易（春节所在月份全市场不足 20 个交易日时，改为至少该月交易日的 75%）；按总市值剔除最小的 30%（壳价值污染），剔除在交易过滤之前排序；
+- 规模为总市值（含非流通股）；EP 为 `1 / pe_ttm`。论文用最近披露的年化扣非净利润，Tushare 全市场日频只有
+  滚动四季净利润，所以用它代替；`pe_ttm` 对亏损公司为空，这些股票按论文对负 EP 的处理放入成长组；
+- 异常换手率为近 20 日平均日换手（成交股数 / 总股本）除以近 250 日平均；
+- 规模按中位数两分，EP 与异常换手率按剩余样本的 30%/70% 分位三分；`smb`、`vmg` 来自规模 x EP，`pmo` 在规模组内
+  做多低异常换手（悲观）、做空高异常换手（乐观），`smb4` 是 EP 中性与换手中性 SMB 的平均（CH-4 的规模因子）；
+  `mkt` 是剩余样本的市值加权收益，不扣一年期存款利率（只影响截距）。
+
+个股列（日频、停牌日为空）：
+
+- `size`、`ep`、`abturn`：上述三个分组变量本身；
+- `ch3_*`：对 `mkt`、`smb`、`vmg` 的 120 日滚动回归载荷与残差波动；
+- `ch4_*`：对 `mkt`、`smb4`、`vmg`、`pmo` 的 120 日载荷、残差波动、R²；`*_y` 为 250 日载荷、残差波动与截距；
+- `ch4_resrev`：120 日拟合中最近 21 日残差的均值 / 标准差（残差反转）；`ch4_resmom`：250 日拟合中 t-249..t-21
+  日残差的均值 / 标准差（残差动量）。
+
+沪深 300 成分股基本都不在最小 30% 中，所以剔除只影响因子收益的构建，不影响个股样本。
+
+```bash
+rquant data build-reference
+rquant factors build --factor-set size_value_china
+rquant factors validate --factor-set size_value_china
+rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
+```
 
 ### 验证因子
 
