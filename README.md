@@ -37,10 +37,12 @@ rquant factors build --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
-rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 需要
+rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 与 barra_cne6 需要
 rquant data build-reference
 rquant factors build --factor-set china_chars
 rquant factors build --factor-set size_value_china    # 只需 build-reference，不需要财报
+rquant factors build --factor-set barra_cne6
+rquant factors build --factor-set tushare_tech        # 只用 OHLCV
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -116,7 +118,8 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 1064 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib）；
+- 1176 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、
+  barra_cne6、tushare_tech）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -317,6 +320,10 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `talib`：`ta_001` 至 `ta_125`，共 125 列，TA-Lib 经典技术指标（64 列）与 K 线形态（61 列），见下文“TA-Lib 因子集 talib”。
 - `recent`：从上述七个库中挑出 2022 年以后单因子 RankIC 依然显著且稳定的因子，按相关性去重后共 96 列，成员、方向与
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
+- `barra_cne6`：`cne6_001` 至 `cne6_037`，共 37 列，按 MSCI Barra CNE6 公开定义重写的风格描述子（descriptor），
+  见下文“Barra CNE6 因子集 barra_cne6”。
+- `tushare_tech`：`tst_001` 至 `tst_075`，共 75 列，Tushare `stk_factor_pro` 接口的技术指标按通达信公式与 Tushare 参数重算，
+  见下文“Tushare 技术因子集 tushare_tech”。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -348,6 +355,8 @@ src/rquant/factors/
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
+    ├── barra_cne6.py                    # 37 个 Barra CNE6 风格描述子
+    ├── tushare_tech.py                  # 75 个 Tushare stk_factor_pro 技术指标
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -607,6 +616,48 @@ rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
 rquant factors build --factor-set talib
 rquant factors validate --factor-set talib
 rquant walk-forward --model lgb --horizon 1d --factor-set talib
+```
+
+### Barra CNE6 因子集 barra_cne6
+
+`barra_cne6` 按 MSCI 公布的 Barra 中国股票模型（CNE6）描述子定义独立实现，不使用 MSCI 代码或数据，只用 Tushare，
+定义锁定在 `src/rquant/factors/libraries/barra_cne6.py`。发布的是描述子本身，不合成风格因子，权重交给模型：
+
+- 规模 LNCAP、MIDCAP；贝塔与残差波动 HBETA、HSIGMA、DASTD、CMRA；流动性 STOM、STOQ、STOA、ATVR；
+  动量 STREV、SEASON、INDMOM、RSTR；长期反转 LTRSTR、LTHALPHA；估值与盈利收益率 BTOP、ETOP、CETOP、EM；
+  杠杆 MLEV、BLEV、DTOA；盈利波动 VSAL、VERN、VFLO；盈利质量 ABS；盈利能力 ATO、GP、GPM、ROA；
+  投资质量 AGRO、IGRO、CXGRO；成长 EGRO、SGRO；分红 DTOP；
+- 收益为后复权收盘价的日收益，市场收益为参考数据中的全 A 市值加权收益，不扣无风险利率；指数加权窗口最新一行权重为 1，
+  每过一个半衰期减半；带滞后的描述子（STREV 滞后 1-3、RSTR 11-21、LTRSTR/LTHALPHA 273-283）对各滞后取平均；
+- 财报沿用 `china_chars` 的首次披露季度网格；比率用 TTM 流量，五年描述子用最近五个财年（Q4）值，至少需要三年；
+- MIDCAP 与 INDMOM 两个截面描述子只用当日沪深 300 成分股做标准化、正交化和行业加权（行业为申万一级，权重为市值平方根）；
+- 未实现：依赖分析师预期的 EPIBS、EGRLF、ETOPF_STD、DPIBS（Tushare 预期接口在当前账户只能每分钟调用一次），
+  以及需要投资活动现金流的 ACF（当前财报字段没有该项）。
+
+```bash
+rquant factors build --factor-set barra_cne6
+rquant factors validate --factor-set barra_cne6
+rquant walk-forward --model lgb --horizon 1d --factor-set barra_cne6
+```
+
+### Tushare 技术因子集 tushare_tech
+
+Tushare `stk_factor_pro` 每天给出约三十类通达信常用指标，但该接口需要更高积分，当前账户无权限。`tushare_tech` 按标准通达信
+公式和 Tushare 文档里的参数在本地重算，不使用 Tushare 的结果，定义锁定在 `src/rquant/factors/libraries/tushare_tech.py`：
+
+- 指标：ASI、ATR、BBI、BIAS、BOLL、BRAR、CCI、CR、DMA（dfma）、DMI、DPO、EMA（5 至 250 日）、EMV、EXPMA、KDJ、KTN、
+  MA（5 至 250 日）、MACD、MASS、MFI、MTM、OBV、PSY、ROC、RSI、TAQ、TRIX、VR、WR、XSII，以及连涨、连跌天数和
+  `topdays`、`lowdays`；
+- 与 `talib` 一样逐只股票按自身交易日计算，停牌行先剔除再写回为空；`EMA(X,N)` 权重 2/(N+1)、`SMA(X,N,M)` 权重 M/N，
+  都从首个有效值开始，每只股票最初 `lookback` 个交易日为空；
+- 价格单位的输出无量纲化：均线、通道、布林带为 `线 / close - 1`，差值与区间（ATR、MACD、MTM、DPO、DMA、ASI）为
+  `值 / close`，OBV 为 20 日变化除以这 20 日成交量；`tests/test_tushare_tech.py` 验证价格与成交量缩放不变；
+- BBI 用标准的 3、6、12、24 日均线；去掉与另一输出成精确仿射关系的 `boll_mid`（即 MA20）以及 `xsii_td2`、`xsii_td4`。
+
+```bash
+rquant factors build --factor-set tushare_tech
+rquant factors validate --factor-set tushare_tech
+rquant walk-forward --model lgb --horizon 1d --factor-set tushare_tech
 ```
 
 ### 验证因子

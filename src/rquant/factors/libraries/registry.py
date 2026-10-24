@@ -129,6 +129,7 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.recent import RECENT_SELECTION
     from rquant.factors.libraries.size_value_china import SizeValueChinaLibrary
     from rquant.factors.libraries.talib_indicators import TALibLibrary
+    from rquant.factors.libraries.tushare_tech import TushareTechLibrary
 
     registry = FactorLibraryRegistry()
     registry.register_library(QlibAlpha158Library())
@@ -141,6 +142,7 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(TALibLibrary())
     registry.register_factor_selection(RECENT_SELECTION)
     registry.register_library(BarraCNE6Library())
+    registry.register_library(TushareTechLibrary())
     return registry
 
 
