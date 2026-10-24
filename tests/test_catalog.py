@@ -33,7 +33,7 @@ class FactorCatalogTests(unittest.TestCase):
     # Break caught: the retired combined bundle reappearing, or removing it dropping factors from the catalog.
     def test_combined_is_retired_without_shrinking_the_catalog(self) -> None:
         catalog = get_catalog()
-        self.assertEqual(939, len(catalog.specs))
+        self.assertEqual(1064, len(catalog.specs))
         self.assertNotIn("combined", catalog.factor_sets())
 
     # Break caught: Alpha158 specs that omit, duplicate, or reorder canonical output positions.
