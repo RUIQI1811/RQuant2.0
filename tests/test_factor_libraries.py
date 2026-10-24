@@ -38,7 +38,7 @@ class FactorLibraryRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             ("qlib_alpha158", "wq_alpha101", "gtja191", "qlib_alpha360", "Hquality", "china_chars", "size_value_china",
-             "talib", "recent", "jq240"),
+             "talib", "recent", "jq240", "barra_cne6", "tushare_tech", "jkp153"),
             registry.factor_sets(),
         )
         self.assertEqual(
@@ -60,6 +60,9 @@ class FactorLibraryRegistryTests(unittest.TestCase):
         self.assertEqual(
             ("open", "high", "low", "close", "volume", "amount", "cap"), registry.required_inputs("jq240")
         )
+        self.assertEqual(("close", "cap", "sector"), registry.required_inputs("barra_cne6"))
+        self.assertEqual(("open", "high", "low", "close", "volume"), registry.required_inputs("tushare_tech"))
+        self.assertEqual(("high", "low", "close", "amount", "cap"), registry.required_inputs("jkp153"))
 
     # Break caught: a local Alpha360 catalog that changes feature count or delegates formula ownership outside RQuant.
     def test_alpha_formulas_are_complete_and_repository_owned(self) -> None:

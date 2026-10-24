@@ -37,11 +37,14 @@ rquant factors build --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
-rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 与 jq240 需要
+rquant data sync-fundamentals --through 2026-08-04   # china_chars、jq240、barra_cne6、jkp153 需要
 rquant data build-reference
 rquant factors build --factor-set china_chars
 rquant factors build --factor-set size_value_china    # 只需 build-reference，不需要财报
 rquant factors build --factor-set jq240
+rquant factors build --factor-set barra_cne6
+rquant factors build --factor-set tushare_tech        # 只用 OHLCV
+rquant factors build --factor-set jkp153
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -117,7 +120,8 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 1297 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240）；
+- 1554 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、
+  barra_cne6、tushare_tech、jkp153）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -320,6 +324,12 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
+- `barra_cne6`：`cne6_001` 至 `cne6_038`，共 38 列，按 MSCI Barra CNE6 公开定义重写的风格描述子（descriptor），
+  见下文“Barra CNE6 因子集 barra_cne6”。
+- `tushare_tech`：`tst_001` 至 `tst_075`，共 75 列，Tushare `stk_factor_pro` 接口的技术指标按通达信公式与 Tushare 参数重算，
+  见下文“Tushare 技术因子集 tushare_tech”。
+- `jkp153`：`jkp_001` 至 `jkp_144`，共 144 列，Jensen-Kelly-Pedersen 153 个全球因子特征中能用 Tushare 构建的部分，
+  见下文“JKP 因子集 jkp153”。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -352,6 +362,9 @@ src/rquant/factors/
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
     ├── jq240.py                         # 233 个按聚宽因子库定义重写的日频因子
+    ├── barra_cne6.py                    # 38 个 Barra CNE6 风格描述子
+    ├── tushare_tech.py                  # 75 个 Tushare stk_factor_pro 技术指标
+    ├── jkp153.py                        # 144 个 JKP 全球因子特征的日频版本
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -640,6 +653,76 @@ rquant data build-reference
 rquant factors build --factor-set jq240
 rquant factors validate --factor-set jq240
 rquant walk-forward --model lgb --horizon 1d --factor-set jq240
+```
+
+### Barra CNE6 因子集 barra_cne6
+
+`barra_cne6` 按 MSCI 公布的 Barra 中国股票模型（CNE6）描述子定义独立实现，不使用 MSCI 代码或数据，只用 Tushare，
+定义锁定在 `src/rquant/factors/libraries/barra_cne6.py`。发布的是描述子本身，不合成风格因子，权重交给模型：
+
+- 规模 LNCAP、MIDCAP；贝塔与残差波动 HBETA、HSIGMA、DASTD、CMRA；流动性 STOM、STOQ、STOA、ATVR；
+  动量 STREV、SEASON、INDMOM、RSTR；长期反转 LTRSTR、LTHALPHA；估值与盈利收益率 BTOP、ETOP、CETOP、EM；
+  杠杆 MLEV、BLEV、DTOA；盈利波动 VSAL、VERN、VFLO；盈利质量 ABS、ACF；盈利能力 ATO、GP、GPM、ROA；
+  投资质量 AGRO、IGRO、CXGRO；成长 EGRO、SGRO；分红 DTOP；
+- 收益为后复权收盘价的日收益，市场收益为参考数据中的全 A 市值加权收益，不扣无风险利率；指数加权窗口最新一行权重为 1，
+  每过一个半衰期减半；带滞后的描述子（STREV 滞后 1-3、RSTR 11-21、LTRSTR/LTHALPHA 273-283）对各滞后取平均；
+- 财报沿用 `china_chars` 的首次披露季度网格；比率用 TTM 流量，五年描述子用最近五个财年（Q4）值，至少需要三年；
+- MIDCAP 与 INDMOM 两个截面描述子只用当日沪深 300 成分股做标准化、正交化和行业加权（行业为申万一级，权重为市值平方根）；
+- 未实现：依赖分析师预期的 EPIBS、EGRLF、ETOPF_STD、DPIBS（Tushare 预期接口在当前账户只能每分钟调用一次）；
+  ACF 用到 jq240 引入的投资活动现金流字段 `n_cashflow_inv_act`。
+
+```bash
+rquant factors build --factor-set barra_cne6
+rquant factors validate --factor-set barra_cne6
+rquant walk-forward --model lgb --horizon 1d --factor-set barra_cne6
+```
+
+### Tushare 技术因子集 tushare_tech
+
+Tushare `stk_factor_pro` 每天给出约三十类通达信常用指标，但该接口需要更高积分，当前账户无权限。`tushare_tech` 按标准通达信
+公式和 Tushare 文档里的参数在本地重算，不使用 Tushare 的结果，定义锁定在 `src/rquant/factors/libraries/tushare_tech.py`：
+
+- 指标：ASI、ATR、BBI、BIAS、BOLL、BRAR、CCI、CR、DMA（dfma）、DMI、DPO、EMA（5 至 250 日）、EMV、EXPMA、KDJ、KTN、
+  MA（5 至 250 日）、MACD、MASS、MFI、MTM、OBV、PSY、ROC、RSI、TAQ、TRIX、VR、WR、XSII，以及连涨、连跌天数和
+  `topdays`、`lowdays`；
+- 与 `talib` 一样逐只股票按自身交易日计算，停牌行先剔除再写回为空；`EMA(X,N)` 权重 2/(N+1)、`SMA(X,N,M)` 权重 M/N，
+  都从首个有效值开始，每只股票最初 `lookback` 个交易日为空；
+- 价格单位的输出无量纲化：均线、通道、布林带为 `线 / close - 1`，差值与区间（ATR、MACD、MTM、DPO、DMA、ASI）为
+  `值 / close`，OBV 为 20 日变化除以这 20 日成交量；`tests/test_tushare_tech.py` 验证价格与成交量缩放不变；
+- BBI 用标准的 3、6、12、24 日均线；去掉与另一输出成精确仿射关系的 `boll_mid`（即 MA20）以及 `xsii_td2`、`xsii_td4`。
+
+```bash
+rquant factors build --factor-set tushare_tech
+rquant factors validate --factor-set tushare_tech
+rquant walk-forward --model lgb --horizon 1d --factor-set tushare_tech
+```
+
+### JKP 因子集 jkp153
+
+`jkp153` 按 Jensen、Kelly、Pedersen《Is There a Replication Crisis in Finance?》（Journal of Finance 2023）公开的 153 个
+特征（作者 `factor_details` 表与公开代码的构造）独立重写为日频 point-in-time 版本，不使用上游代码或数据，只用 Tushare，
+定义锁定在 `src/rquant/factors/libraries/jkp153.py`，来源名就是 JKP 特征名（如 `be_me`、`ret_12_1`、`ivol_ff3_21d`、`qmj`）：
+
+- 月度窗口换成交易日：一个月 21 天、一年 252 天，`_21d`/`_126d`/`_252d`/`_1260d`、`ret_x_y`、`seas_*` 都按交易日或 21 日块计算；
+  市场、SMB、HML 收益取参考数据中的全 A 市值加权序列；
+- 财报沿用 `china_chars` 的首次披露季度网格；JKP 的年度 `_x` 科目用 TTM（按季度刷新），`q` 科目用最近单季，12 个月滞后为
+  4 个季度；Compustat 科目与 Tushare 科目的对应见模块中的 `ITEMS`、`FLOWS`；中国现金流量表没有单列回购，按 0 处理；
+  分红为 daily_basic 的 `dv_ttm` 乘总市值；
+- 截面合成特征（mispricing、quality-minus-junk）只用当日沪深 300 成分股排序；
+- 未实现 9 个：员工数相关的 `emp_gr1`、`sale_emp_gr1`，q 因子模型的 `ivol_hxz4_21d`、`iskew_hxz4_21d`，
+  数据起点之前的 `seas_11_15*`、`seas_16_20*`，以及没有回购时与 `div12m_me` 相同的 `eqpo_me`；共 144 列 `jkp_001` 至 `jkp_144`。
+
+`jkp153` 在 jq240 的财报字段之外还需要 `FUNDAMENTAL_ENDPOINT_FIELDS` 中标注为 jkp153 的 6 个字段（`taxes_payable`、
+`defer_tax_liab`、`c_recp_cap_contrib`、`c_recp_borrow`、`proc_issue_bonds`、`c_prepay_amt_borr`），新增后资产负债表与
+现金流量表分区需要重新同步（利润表分区可复用），并重建参考数据与 `china_chars`、`jq240`、`barra_cne6`。
+`tests/test_jkp153.py` 用截断数据重算、直接公式与截面排序回归验证。
+
+```bash
+rquant data sync-fundamentals --through 2026-08-04
+rquant data build-reference
+rquant factors build --factor-set jkp153
+rquant factors validate --factor-set jkp153
+rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 ```
 
 ### 验证因子

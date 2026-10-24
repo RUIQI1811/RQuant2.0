@@ -122,13 +122,16 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.alpha101 import WorldQuantAlpha101Library
     from rquant.factors.libraries.alpha158 import QlibAlpha158Library
     from rquant.factors.libraries.alpha360 import QlibAlpha360Library
+    from rquant.factors.libraries.barra_cne6 import BarraCNE6Library
     from rquant.factors.libraries.china_chars import ChinaCharsLibrary
     from rquant.factors.libraries.gtja191 import GTJA191Library
     from rquant.factors.libraries.hquality import HQUALITY_SELECTION
+    from rquant.factors.libraries.jkp153 import JKP153Library
     from rquant.factors.libraries.jq240 import JQ240Library
     from rquant.factors.libraries.recent import RECENT_SELECTION
     from rquant.factors.libraries.size_value_china import SizeValueChinaLibrary
     from rquant.factors.libraries.talib_indicators import TALibLibrary
+    from rquant.factors.libraries.tushare_tech import TushareTechLibrary
 
     registry = FactorLibraryRegistry()
     registry.register_library(QlibAlpha158Library())
@@ -141,6 +144,9 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(TALibLibrary())
     registry.register_factor_selection(RECENT_SELECTION)
     registry.register_library(JQ240Library())
+    registry.register_library(BarraCNE6Library())
+    registry.register_library(TushareTechLibrary())
+    registry.register_library(JKP153Library())
     return registry
 
 
