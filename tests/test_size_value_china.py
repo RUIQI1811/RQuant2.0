@@ -236,6 +236,17 @@ class CH4FactorBuilderTests(unittest.TestCase):
         self.assertAlmostEqual(pmo, row["pmo"])
         self.assertAlmostEqual(smb, row["smb"])
 
+    # Break caught: a 14-day Spring Festival February emptying the next month's universe under a fixed 15-day rule.
+    def test_short_month_keeps_the_next_month_populated(self) -> None:
+        days = self.market["days"]
+        short = [entry for entry in days if (entry[0].year, entry[0].month) == (2019, 8)][14:]
+        builder = CH4FactorBuilder(self.market["list_dates"])
+        rows = [builder.update(*entry) for entry in days if entry not in short]
+        factors = pd.DataFrame(rows).set_index("datetime")
+        september = factors[(factors.index.year == 2019) & (factors.index.month == 9)]
+        self.assertFalse(september.empty)
+        self.assertTrue(np.isfinite(september[list(CH4_FACTORS)]).all().all())
+
     def test_loss_makers_sort_into_growth(self) -> None:
         day = self.market["dates"][-1]
         groups = self.groups[day]
