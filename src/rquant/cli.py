@@ -232,7 +232,7 @@ def _doctor(args: argparse.Namespace) -> int:
     record("TUSHARE_TOKEN", bool(token), "set" if token else "missing")
     record(
         "factor_catalog",
-        len(get_catalog().specs) == 918,
+        len(get_catalog().specs) == 939,
         {"columns": len(get_catalog().specs), "fingerprint": get_catalog().fingerprint},
     )
     config_path = Path(args.config)

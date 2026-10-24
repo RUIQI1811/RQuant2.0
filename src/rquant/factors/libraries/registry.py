@@ -125,6 +125,7 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.china_chars import ChinaCharsLibrary
     from rquant.factors.libraries.gtja191 import GTJA191Library
     from rquant.factors.libraries.hquality import HQUALITY_SELECTION
+    from rquant.factors.libraries.size_value_china import SizeValueChinaLibrary
 
     registry = FactorLibraryRegistry()
     registry.register_library(QlibAlpha158Library())
@@ -133,6 +134,7 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(QlibAlpha360Library())
     registry.register_factor_selection(HQUALITY_SELECTION)
     registry.register_library(ChinaCharsLibrary())
+    registry.register_library(SizeValueChinaLibrary())
     return registry
 
 
