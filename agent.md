@@ -148,10 +148,10 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   由 `rquant.factors.selection` 按 1d 单因子评估的年度稳定性与覆盖率筛出，再按截面秩相关去重。成员保留源规范列名
   和原值，`direction=-1` 只表示反向使用，存储值不取负。构建前 `qlib_alpha158`、`wq_alpha101`、`gtja191` 必须已按当前代码
   和标准数据构建完成；改变成员会改变其目录与引擎指纹；
-- `recent` 是第二个选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/recent.py`（当前 96 列），按 2022-01-04 至
-  2026-10-21 的 1d 单因子评估筛选（|RankIC| >= 0.01、|t| >= 3、5 年中至少 4 年定向 RankIC 为正、覆盖率 >= 80%），
+- `recent` 是第二个选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/recent.py`（当前 117 列），按 2020-01-02 至
+  2026-10-21 的 1d 单因子评估筛选（|RankIC| >= 0.01、|t| >= 3、7 年中至少 6 年定向 RankIC 为正、覆盖率 >= 80%），
   再按截面秩相关 0.8 去重。成员来自全部七个库因子集，构建前它们都必须已按当前代码和标准数据构建完成；由于筛选用到了
-  2022 年以后的收益，walk-forward 中 2022 年以后的测试年份对成员选择而言属于样本内；
+  2020 年以后的收益，walk-forward 中 2020 年以后的测试年份对成员选择而言属于样本内；
 - `china_chars` 列名为 `cnc_001` 至 `cnc_109`，来源名为特征简称；它是按 Quantactix/ChinaAShareEquityCharacteristics
   公布定义独立重写的日频版本（未使用其 GPL 代码），读取参考数据中的 daily_basic、市场因子和财报。财报必须是
   首次披露值，报告期从公告日起且所有更早报告期都已公告后才可用；任何特征都不得使用当日之后的行情、市场收益或
@@ -214,7 +214,7 @@ python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); prin
 ```
 
 当前预期为唯一目录（unique catalog）`1064`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`Hquality=137`、`china_chars=109`、`size_value_china=21`、`talib=125`、`recent=96`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+`qlib_alpha360=360`、`Hquality=137`、`china_chars=109`、`size_value_china=21`、`talib=125`、`recent=117`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：

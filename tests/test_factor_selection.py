@@ -148,7 +148,7 @@ class FactorSelectionRegistryTests(unittest.TestCase):
 
         self.assertIs(RECENT_SELECTION, selection)
         self.assertEqual(RECENT_SELECTION.canonical_names, catalog.canonical_names("recent"))
-        self.assertEqual(96, len(selection.canonical_names))
+        self.assertEqual(117, len(selection.canonical_names))
         sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
         self.assertEqual(set(selection.source_factor_sets), sources)
         self.assertEqual({"kunquant", "panel"}, {library.backend for library in registry.select("recent")})
@@ -327,7 +327,7 @@ class FactorDeduplicationTests(unittest.TestCase):
     def test_locked_recent_has_no_pair_above_its_correlation_limit(self) -> None:
         dropped = RECENT_SELECTION.provenance["deduplicated"]
         kept = set(RECENT_SELECTION.canonical_names)
-        self.assertEqual(96, len(kept))
+        self.assertEqual(117, len(kept))
         self.assertFalse(kept & set(dropped))
         self.assertTrue(set(dropped.values()) <= kept)
         self.assertEqual(0.8, RECENT_SELECTION.criteria["max_abs_rank_correlation"])
