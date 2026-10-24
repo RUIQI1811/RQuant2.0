@@ -519,6 +519,11 @@ rquant walk-forward --model lgb --horizon 1d --factor-set recent
 成员选择用到了 2022 年以后的收益：walk-forward 中 2022 年及以后的测试年份对选择而言是样本内，结果偏乐观；
 2013-2021 年虽未用到当年收益，但用的是事后才知道的“哪些因子 2022 年后仍有效”，同样不是干净的历史回测。
 
+LGB 1d walk-forward（2013-2026，run `20261024T092049Z-405a155f`）：预测 RankIC 全区间 0.070、2022 年以来 0.040
+（Hquality 0.072 / 0.036，Alpha158 0.067 / 0.032），2023 年从 0.019（Hquality）提高到 0.034；组合年化 17.9%、夏普 0.79、
+最大回撤 -46.8%，低于 Hquality 的 19.1% / 0.83 和 Alpha158 的 19.5% / 0.86。2022 年以来累计收益 +26.9%，与 Alpha158 的
++24.8% 接近，高于 Hquality 的 +3.0%，但这段是样本内。
+
 ### 中国 A 股股票特征 china_chars
 
 `china_chars` 按 [Quantactix/ChinaAShareEquityCharacteristics](https://github.com/Quantactix/ChinaAShareEquityCharacteristics)
