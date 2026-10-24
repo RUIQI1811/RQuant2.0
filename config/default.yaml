@@ -12,6 +12,9 @@ data:
   tushare_index_code: 399300.SZ
   max_requests_per_minute: 190
   sync_workers: 8
+  # Financial statements (data sync-fundamentals) start at this announcement year, fetched in fixed-year windows.
+  fundamentals_start_year: 2004
+  fundamentals_window_years: 6
 
 factors:
   factor_set: Hquality

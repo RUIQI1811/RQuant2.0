@@ -8,7 +8,7 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算 Alpha158、Alpha101、Alpha360 因子；GTJA191 使用独立的 Pandas 面板后端；
+- KunQuant 用于编译和计算 Alpha158、Alpha101、Alpha360 因子；GTJA191 与 china_chars 使用 Pandas 面板后端；
 - Alpha158、Alpha101、Alpha360 和 GTJA191 的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
   不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；
 - 当前工程独立于旧版 RQuant 与 StockTradebyZ，禁止从那些工程隐式导入、复制运行产物或混用环境；
@@ -72,7 +72,9 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - `config/default.yaml`：默认研究和执行参数；
 - `data/raw/`：不可变的 Tushare 分区、分区级清单及总同步清单；
 - `data/canonical/`：标准化、可审计的日线数据；
-- `data/canonical/reference/`：从原始分区构建的 point-in-time 参考序列，包括 GTJA191 使用的沪深 300 日线；
+- `data/canonical/reference/`：从原始分区构建的 point-in-time 参考序列，包括 GTJA191 使用的沪深 300 日线，以及
+  `china_chars` 使用的 daily_basic 年度分区、全 A 市场/SMB/HML 日收益和首次披露财报（由 `ReferenceBuilder` 生成，
+  自带 `manifest.json`，不改变标准数据指纹）；
 - `data/qlib/`：Qlib provider；
 - `data/factors/`：按因子集和年份分区的因子结果；
 - `data/cache/`：因子执行缓存（当前主要为 KunQuant 编译缓存）；
@@ -137,13 +139,17 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   `a101_101`，GTJA191 当前为 `gtja_001` 至 `gtja_191` 中除 `gtja_030` 外的 190 列，Alpha360 为
   `a360_001` 至 `a360_360` 的 360 列；不得暴露上游原始名称。Alpha360 是六组归一化 OHLC、VWAP 与成交量字段
   各取 60 个滞后期，不是 360 条手工设计信号；
-- 当前注册表共有 809 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-  `qlib_alpha360=360`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
+- 当前注册表共有 918 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+  `qlib_alpha360=360`、`china_chars=109`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
   应注册一个新的、名称稳定的因子集；
 - `Hquality` 是选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/hquality.py`（当前 137 列），
   由 `rquant.factors.selection` 按 1d 单因子评估的年度稳定性与覆盖率筛出，再按截面秩相关去重。成员保留源规范列名
   和原值，`direction=-1` 只表示反向使用，存储值不取负。构建前 `qlib_alpha158`、`wq_alpha101`、`gtja191` 必须已按当前代码
   和标准数据构建完成；改变成员会改变其目录与引擎指纹；
+- `china_chars` 列名为 `cnc_001` 至 `cnc_109`，来源名为特征简称；它是按 Quantactix/ChinaAShareEquityCharacteristics
+  公布定义独立重写的日频版本（未使用其 GPL 代码），读取参考数据中的 daily_basic、市场因子和财报。财报必须是
+  首次披露值，报告期从公告日起且所有更早报告期都已公告后才可用；任何特征都不得使用当日之后的行情、市场收益或
+  财报，`tests/test_china_chars.py` 用截断数据重算来回归验证；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖 `data/canonical/reference/index_daily.parquet`
@@ -193,8 +199,8 @@ python -m ruff check src tests
 python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
 ```
 
-当前预期为唯一目录（unique catalog）`809`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`Hquality=137`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+当前预期为唯一目录（unique catalog）`918`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+`qlib_alpha360=360`、`Hquality=137`、`china_chars=109`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：
@@ -232,6 +238,8 @@ conda activate rquant
 rquant doctor
 rquant data sync --through YYYY-MM-DD
 rquant data build-qlib
+rquant data sync-fundamentals --through YYYY-MM-DD
+rquant data build-reference
 rquant factors build --factor-set qlib_alpha158
 rquant factors validate --factor-set qlib_alpha158
 rquant factors build --factor-set wq_alpha101
@@ -242,6 +250,8 @@ rquant factors build --factor-set qlib_alpha360
 rquant factors validate --factor-set qlib_alpha360
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
+rquant factors build --factor-set china_chars
+rquant factors validate --factor-set china_chars
 rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
 rquant report RUN_ID
 ```

@@ -37,6 +37,9 @@ rquant factors build --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
+rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 需要
+rquant data build-reference
+rquant factors build --factor-set china_chars
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -112,7 +115,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 809 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360）；
+- 918 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -136,6 +139,8 @@ rquant doctor --skip-permission-check
 | `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
+| `data.fundamentals_start_year`   |       `2004` | `data sync-fundamentals` 抓取财报的最早公告年份 |
+| `data.fundamentals_window_years` |          `6` | 财报按公告日分窗抓取的年数；已结束的窗口会缓存复用 |
 | `factors.factor_set`             |   `Hquality` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |
@@ -211,10 +216,11 @@ ls -td runs/* | head
 rquant data build-qlib
 ```
 
-该命令依次完成两项工作：
+该命令依次完成三项工作：
 
 1. 将不可变 Tushare 分区转换为 `data/canonical/` 下的标准日线契约；
-2. 从标准数据构建 `data/qlib/` 下的 Qlib provider。
+2. 在 `data/canonical/reference/` 下构建扩展参考数据（见下文“参考数据”）；
+3. 从标准数据构建 `data/qlib/` 下的 Qlib provider。
 
 标准数据会处理：
 
@@ -243,6 +249,30 @@ python -m json.tool data/qlib/manifest.json
 - 标准数据的 `raw_fingerprint` 与原始同步结果一致；
 - Qlib 的 `canonical_fingerprint` 与标准数据一致；
 - 起止日期、行数、证券数量和字段符合预期。
+
+### 参考数据与财务报表
+
+`data/canonical/reference/` 中除沪深 300 日线、行业和成分快照外，还有供 `china_chars` 使用的扩展参考数据。
+它们不进入标准日线列，也不改变标准数据指纹，所以构建它们不会让已有因子库过期：
+
+- `daily_basic/year=YYYY/data.parquet`：全 A 股的换手率、流通/总市值、估值和未复权收盘价；
+- `market_factors.parquet`：全 A 股（不含北交所、上市不足 30 天的新股）按前一日流通市值加权的市场收益，以及每月初按
+  前一日总市值与 1/PB 分组的 Fama-French 2x3 SMB、HML 日收益；
+- `fundamentals.parquet`：利润表、资产负债表、现金流量表合并报表的首次披露值，每只股票每个报告期一行，
+  `ann_date` 为三张表都已公告的日期；
+- `manifest.json`：上述文件的哈希、所依据的原始同步指纹和财报同步指纹。
+
+财报需要单独同步（按股票、按公告日窗口请求单股接口，不需要 `*_vip` 批量接口权限）：
+
+```bash
+rquant data sync-fundamentals --through 2026-08-04
+rquant data build-reference
+```
+
+`sync-fundamentals` 只抓取股票池可能包含的股票（`csi300` 为全部历史成分，`all` 为全部 A 股），结果清单写在
+`data/raw/fundamentals_manifest.json`，不改动 `data sync` 的清单。已结束的公告日窗口不会再变，再次同步只重抓
+截至 `--through` 的最后一个窗口。某个窗口返回达到 100 行时，Tushare 可能截断了结果，会自动按年拆分重抓。
+`build-reference` 只重建参考数据，要求原始同步与标准数据一致；原始数据变化后应改跑 `build-qlib`。
 
 重建 Qlib provider 时采用临时目录和原子替换；已有 provider 会保存为带时间戳的
 `data/qlib.previous.<时间>/` 备份。确认新 provider 正常后再考虑清理旧备份。
@@ -275,7 +305,9 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `qlib_alpha360`：`a360_001` 至 `a360_360`，共 360 列；它是 Qlib Alpha360 的六组归一化
   OHLC、VWAP 与成交量字段各取 60 个滞后期，而非 360 条手工设计的独立信号；
 - `Hquality`：从上述因子中按年度 RankIC 稳定性筛出并按相关性去重后的 137 列，来自 Alpha158、Alpha101 与 GTJA191（不含 Alpha360），
-  成员、方向与筛选口径锁定在 `src/rquant/factors/libraries/hquality.py`（见下文“高质量因子集 Hquality”）。
+  成员、方向与筛选口径锁定在 `src/rquant/factors/libraries/hquality.py`（见下文“高质量因子集 Hquality”）；
+- `china_chars`：`cnc_001` 至 `cnc_109`，共 109 列中国 A 股股票特征（流动性、风险、动量、盈利、价值、投资等），
+  见下文“中国 A 股股票特征 china_chars”。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -303,6 +335,7 @@ src/rquant/factors/
     ├── alpha360.py                      # 6 个归一化字段各 60 个滞后期的 Alpha360 图
     ├── gtja191.py                       # 完整 GTJA191 提供者与公式语义说明
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
+    ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -445,6 +478,33 @@ data/factors/qlib_alpha158/manifest.json
 ```
 
 限定日期构建不能代替完整研究所需的全历史因子。开始滚动训练前，要确认因子清单覆盖所有训练、验证、测试和标签所需日期。
+
+### 中国 A 股股票特征 china_chars
+
+`china_chars` 按 [Quantactix/ChinaAShareEquityCharacteristics](https://github.com/Quantactix/ChinaAShareEquityCharacteristics)
+公布的特征定义（月频、基于 CSMAR，源自 Hou-Xue-Zhang 异象列表）用 Tushare 数据独立重写，没有使用其代码；
+每个特征都改成在可知当天的日频 point-in-time 值。它依赖上节的参考数据和财报：
+
+```bash
+rquant data sync-fundamentals --through 2026-08-04
+rquant data build-reference
+rquant factors build --factor-set china_chars
+rquant factors validate --factor-set china_chars
+rquant walk-forward --model lgb --horizon 1d --factor-set china_chars
+```
+
+口径：
+
+- 一个月按 21 个交易日、一个季度 63 个、一年 252 个；滚动回归、波动和偏度默认 120 日窗口、至少 40 个观测；
+- 市场模型和三因子模型使用参考数据中的市场收益、SMB、HML，不扣无风险利率（只影响截距）；
+- Dimson beta 的领先项只用到当日已知的市场收益，即窗口截至前一日；
+- 财报取首次披露值；一个报告期在公告日（非交易日顺延到下一交易日）起可用，而且必须等所有更早的已披露报告期
+  都已公告，因此滞后报告期不会比锚定报告期更新；利润表和现金流量表由累计值换算为单季值，估值比率用滚动四季；
+- 停牌日不输出特征。
+
+原始 118 个特征中，Tushare 当前权限拿不到或原实现未完成的 10 个未纳入：员工数（hn、lfe）、广告费（adm、gad）、
+CH-4 因子载荷（mkt_beta、vmg_beta、smb_beta、pmo_beta）、q 因子残差矩（idvq、idsq）；原项目的 tail 未完成，也未纳入。
+因子清单的 `reference_inputs` 记录所读参考文件的哈希。
 
 ### 验证因子
 

@@ -16,9 +16,14 @@ from typing import Any
 
 from tqdm import tqdm
 
-from rquant.data.contracts import RAW_DAILY_ENDPOINTS
+from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS, RAW_DAILY_ENDPOINTS
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+# Tushare caps some statement responses at 100 rows without saying so; a window that reaches the cap is refetched
+# year by year instead of being trusted.
+STATEMENT_ROW_GUARD = 100
+FUNDAMENTALS_MANIFEST = "fundamentals_manifest.json"
 
 
 @dataclass(frozen=True)
@@ -190,7 +195,9 @@ class TushareCollector:
             temporary.unlink(missing_ok=True)
             raise
 
-        date_column = next((name for name in ("trade_date", "cal_date", "in_date") if name in frame.columns), None)
+        date_column = next(
+            (name for name in ("trade_date", "cal_date", "in_date", "ann_date") if name in frame.columns), None
+        )
         min_date = str(frame[date_column].min()) if date_column and not frame.empty else None
         max_date = str(frame[date_column].max()) if date_column and not frame.empty else None
         artifact = FetchArtifact(
@@ -369,6 +376,186 @@ class TushareCollector:
             raise
         finally:
             progress.close()
+
+    def sync_fundamentals(
+        self,
+        *,
+        through: date,
+        start_year: int,
+        universe: str = "csi300",
+        window_years: int = 6,
+        force: bool = False,
+        show_progress: bool = False,
+        workers: int = 1,
+    ) -> dict[str, Any]:
+        """Fetch income, balance-sheet and cash-flow statements for every stock the research universe can contain.
+
+        Statements are queried per stock by announcement-date window. Closed windows never change, so a later sync only
+        refetches the open window that ends at ``through``. The completed artifact list is written to
+        ``fundamentals_manifest.json``; ``data sync`` and its manifest are not touched.
+        """
+        if through >= date.today() + timedelta(days=1):
+            raise DataContractError("--through cannot be in the future")
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+            raise DataContractError("sync workers must be a positive integer")
+        if window_years <= 0 or start_year > through.year:
+            raise DataContractError("Fundamental windows need a positive length and a start year before --through")
+        codes = self._fundamental_codes(universe)
+        windows = [
+            (first, min(first + window_years - 1, through.year))
+            for first in range(start_year, through.year + 1, window_years)
+        ]
+        tasks = [(endpoint, code) for endpoint in FUNDAMENTAL_ENDPOINT_FIELDS for code in codes]
+        cached_artifacts = 0
+        fetched_artifacts = 0
+        progress_lock = threading.Lock()
+        progress = tqdm(
+            total=len(tasks) * len(windows),
+            desc="Tushare statements",
+            unit="partition",
+            dynamic_ncols=True,
+            leave=True,
+            disable=not show_progress,
+            file=sys.stderr,
+            bar_format=(
+                "{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+            ),
+        )
+
+        def fetch(endpoint: str, code: str, first: int, last: int) -> tuple[FetchArtifact, bool]:
+            query = {
+                "ts_code": code,
+                "start_date": f"{first}0101",
+                "end_date": min(f"{last}1231", _date_text(through)),
+                "fields": ",".join(FUNDAMENTAL_ENDPOINT_FIELDS[endpoint]),
+            }
+            partition = f"ts_code={code.replace('.', '_')}/ann={first}-{last}"
+            return self._fetch_partition(endpoint, query, partition, force=force)
+
+        def record(endpoint: str, code: str, cached: bool, *, extra: int = 0) -> None:
+            nonlocal cached_artifacts, fetched_artifacts
+            with progress_lock:
+                if cached:
+                    cached_artifacts += 1
+                else:
+                    fetched_artifacts += 1
+                progress.total += extra
+                progress.set_description_str(f"Tushare {endpoint} {code}", refresh=False)
+                progress.set_postfix_str(f"cached={cached_artifacts} fetched={fetched_artifacts}", refresh=False)
+                progress.update()
+
+        def fetch_stock(task: tuple[str, str]) -> list[tuple[str, FetchArtifact]]:
+            endpoint, code = task
+            artifacts = []
+            for first, last in windows:
+                artifact, cached = fetch(endpoint, code, first, last)
+                if artifact.rows < STATEMENT_ROW_GUARD:
+                    record(endpoint, code, cached)
+                    artifacts.append((endpoint, artifact))
+                    continue
+                if first == last:
+                    raise DataContractError(
+                        f"Tushare {endpoint} returned {artifact.rows} rows for {code} in {first}; "
+                        "the response may be truncated"
+                    )
+                # The superseded multi-year artifact stays on disk but is not listed in the manifest.
+                record(endpoint, code, cached, extra=last - first + 1)
+                for year in range(first, last + 1):
+                    yearly, yearly_cached = fetch(endpoint, code, year, year)
+                    if yearly.rows >= STATEMENT_ROW_GUARD:
+                        raise DataContractError(
+                            f"Tushare {endpoint} returned {yearly.rows} rows for {code} in {year}; "
+                            "the response may be truncated"
+                        )
+                    record(endpoint, code, yearly_cached)
+                    artifacts.append((endpoint, yearly))
+            return artifacts
+
+        try:
+            if workers == 1:
+                results = [fetch_stock(task) for task in tasks]
+            else:
+                executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-statements")
+                futures = [executor.submit(fetch_stock, task) for task in tasks]
+                try:
+                    results = [future.result() for future in futures]
+                finally:
+                    executor.shutdown(wait=True, cancel_futures=True)
+            listed = [item for result in results for item in result]
+            files = [
+                {
+                    "endpoint": endpoint,
+                    "path": Path(artifact.path).relative_to(self.raw_root).as_posix(),
+                    "sha256": artifact.sha256,
+                    "rows": artifact.rows,
+                }
+                for endpoint, artifact in listed
+            ]
+            manifest = {
+                "status": "complete",
+                "through": through.isoformat(),
+                "universe": universe,
+                "start_year": start_year,
+                "window_years": window_years,
+                "endpoints": {endpoint: list(fields) for endpoint, fields in FUNDAMENTAL_ENDPOINT_FIELDS.items()},
+                "instruments": len(codes),
+                "artifacts": len(files),
+                "cached_artifacts": cached_artifacts,
+                "fetched_artifacts": fetched_artifacts,
+                "rows": sum(item["rows"] for item in files),
+                "files": files,
+                "fingerprint": stable_hash(
+                    [
+                        {"endpoint": endpoint, "query": artifact.query, "sha256": artifact.sha256}
+                        for endpoint, artifact in listed
+                    ]
+                ),
+            }
+            atomic_write_json(self.raw_root / FUNDAMENTALS_MANIFEST, manifest)
+            progress.set_description_str("Tushare statements complete", refresh=False)
+            progress.refresh()
+            return manifest
+        except BaseException:
+            progress.set_description_str("Tushare statements stopped", refresh=False)
+            progress.refresh()
+            raise
+        finally:
+            progress.close()
+
+    def _fundamental_codes(self, universe: str) -> list[str]:
+        """Return every Tushare code the universe can contain, read from the completed daily sync."""
+        import json
+
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise DependencyError("pandas and pyarrow are required for fundamental collection") from exc
+        manifest_path = self.raw_root / "sync_manifest.json"
+        if not manifest_path.exists():
+            raise DataContractError("Run `rquant data sync` before syncing fundamentals")
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            sync_manifest = json.load(handle)
+        if sync_manifest.get("status") != "complete":
+            raise DataContractError("Raw sync is not complete; finish `rquant data sync` first")
+        if universe == "csi300":
+            endpoint, column = "index_weight", "con_code"
+        elif universe == "all":
+            endpoint, column = "stock_basic", "ts_code"
+        else:
+            raise DataContractError(f"Unsupported fundamental universe: {universe!r}")
+        paths = sorted((self.raw_root / endpoint).glob("**/data.parquet"))
+        frames = [pd.read_parquet(path) for path in paths]
+        frames = [frame for frame in frames if column in frame.columns and not frame.empty]
+        if not frames:
+            raise DataContractError(f"No raw {endpoint} rows to derive the fundamental universe from")
+        frame = pd.concat(frames, ignore_index=True)
+        index_code = sync_manifest.get("index_code")
+        if endpoint == "index_weight" and index_code and "index_code" in frame.columns:
+            frame = frame[frame["index_code"] == index_code]
+        codes = sorted(str(code) for code in frame[column].dropna().unique())
+        if not codes:
+            raise DataContractError(f"No stocks found for fundamental universe {universe}")
+        return codes
 
     @staticmethod
     def _fetch_daily_partitions(

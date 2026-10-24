@@ -494,9 +494,11 @@ class PanelFactorEngine:
         dates, instruments, panels, output_mask = _load_canonical_panels(
             pd, bars_path, self.input_fields, self.config.universe, start=start, end=end
         )
-        external, reference_hashes = _load_gtja191_external_inputs(
+        external, reference_hashes = _load_panel_references(
+            self.libraries,
             canonical_root,
             dates,
+            instruments,
             dict(self.config.external_inputs),
             pd,
         )
@@ -918,6 +920,31 @@ def _write_year_partitions(
     if not total_rows:
         raise DataContractError(f"Factor build for {label} produced no rows inside the research universe")
     return total_rows
+
+
+def _load_panel_references(
+    libraries: tuple[Any, ...],
+    canonical_root: Path,
+    dates: Any,
+    instruments: Any,
+    external_inputs: dict[str, str],
+    pd: Any,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Load the reference inputs every selected panel library declares, with the hashes of the files read."""
+    inputs: dict[str, Any] = {}
+    hashes: dict[str, str] = {}
+    if any(library.family == "gtja191" for library in libraries):
+        inputs, hashes = _load_gtja191_external_inputs(canonical_root, dates, external_inputs, pd)
+    elif external_inputs:
+        raise DataContractError(f"Factor libraries {[lib.family for lib in libraries]} accept no external inputs")
+    for library in libraries:
+        loaded, loaded_hashes = library.load_reference_inputs(canonical_root, dates, instruments)
+        overlap = (set(loaded) & set(inputs)) | (set(loaded_hashes) & set(hashes))
+        if overlap:
+            raise FactorContractError(f"Panel reference inputs are declared twice: {sorted(overlap)}")
+        inputs.update(loaded)
+        hashes.update(loaded_hashes)
+    return inputs, hashes
 
 
 def _load_gtja191_external_inputs(
