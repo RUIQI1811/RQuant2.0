@@ -32,7 +32,10 @@ workflow:
 backtest:
   initial_capital: 1000000
   topk: 50
-  n_drop: 5
+  # n_drop == topk with rebalance_days 5: every 5 trading days the book is reset to the latest top 50.
+  # The earlier daily TopkDropout (drop at most 5 per day) is n_drop 5, rebalance_days 1.
+  n_drop: 50
+  rebalance_days: 5
   trade_unit: 100
   commission_rate: 0.0003
   minimum_commission: 5.0

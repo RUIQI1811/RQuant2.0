@@ -116,6 +116,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = commands.add_parser("report", help="Run portfolio backtest and build the report for a walk-forward run")
     report.add_argument("run_id")
+    report.add_argument("--topk", type=int, help="Override backtest.topk")
+    report.add_argument("--n-drop", type=int, help="Override backtest.n_drop")
+    report.add_argument("--rebalance-days", type=int, help="Override backtest.rebalance_days")
     report.set_defaults(handler=_report, run_category="report")
     return parser
 
@@ -583,8 +586,8 @@ def _report(args: argparse.Namespace) -> int:
         backtest = config.get("backtest", {})
         portfolio_config = PortfolioConfig(
             initial_capital=float(backtest.get("initial_capital", 1_000_000)),
-            topk=int(backtest.get("topk", 50)),
-            n_drop=int(backtest.get("n_drop", 5)),
+            topk=args.topk or int(backtest.get("topk", 50)),
+            n_drop=args.n_drop or int(backtest.get("n_drop", 5)),
             benchmark=str(config.get("data", {}).get("benchmark", "SH000300")),
             trade_unit=int(backtest.get("trade_unit", 100)),
             commission_rate=float(backtest.get("commission_rate", 0.0003)),
@@ -593,6 +596,7 @@ def _report(args: argparse.Namespace) -> int:
             stamp_tax_after=float(backtest.get("stamp_tax_from_2023_08_28", 0.0005)),
             impact_cost=float(backtest.get("impact_cost", 0.0)),
             universe=_universe(config),
+            rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
         )
         run.add_input("walk_forward_run_id", args.run_id)
         run.add_input("walk_forward_run_directory", str(run_directory))

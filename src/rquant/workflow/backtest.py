@@ -24,6 +24,17 @@ class PortfolioConfig:
     stamp_tax_after: float = 0.0005
     impact_cost: float = 0.0
     universe: str = "csi300"
+    # Trade only every `rebalance_days` trading days, counted from the first prediction date. With n_drop == topk each
+    # rebalance replaces every holding that fell out of the latest top-K, so the book becomes that top-K.
+    rebalance_days: int = 1
+
+    def __post_init__(self) -> None:
+        if self.topk < 1:
+            raise ValueError(f"topk must be at least 1, got {self.topk}")
+        if not 1 <= self.n_drop <= self.topk:
+            raise ValueError(f"n_drop must be between 1 and topk={self.topk}, got {self.n_drop}")
+        if self.rebalance_days < 1:
+            raise ValueError(f"rebalance_days must be at least 1, got {self.rebalance_days}")
 
 
 class PortfolioBacktestRunner:
@@ -68,6 +79,16 @@ class PortfolioBacktestRunner:
         later = D.calendar(start_time=signal_end, freq="day")
         end_time = next((value for value in later if pd.Timestamp(value) > signal_end), signal_end)
         signal = predictions.set_index(["datetime", "instrument"])["score"].sort_index()
+        rebalance_dates = _rebalance_dates(
+            pd,
+            D.calendar(start_time=start_time, end_time=signal_end, freq="day"),
+            self.config.rebalance_days,
+        )
+        # Qlib strategies place no orders on a step whose previous day has no signal, so dropping the signal on
+        # non-rebalance days leaves the book untouched until the next rebalance.
+        signal = signal[signal.index.get_level_values("datetime").isin(rebalance_dates)]
+        if signal.empty:
+            raise DataContractError("No predictions fall on a rebalance date")
         cost_model = AshareCostModel(
             commission_rate=self.config.commission_rate,
             minimum_commission=self.config.minimum_commission,
@@ -140,7 +161,9 @@ class PortfolioBacktestRunner:
             "start": str(pd.Timestamp(start_time).date()),
             "end": str(pd.Timestamp(end_time).date()),
             "config": asdict(self.config),
+            "signal_days": int(signal.index.get_level_values("datetime").nunique()),
             "constraints": {
+                "rebalance": _rebalance_description(self.config),
                 "deal_price": "next trading day open",
                 "long_only": True,
                 "equal_weight": True,
@@ -172,6 +195,18 @@ class PortfolioBacktestRunner:
         }
         atomic_write_json(self.run_directory / "backtest.json", manifest)
         return manifest
+
+
+def _rebalance_dates(pd: Any, calendar: Any, every: int) -> Any:
+    """Return every `every`-th trading day of `calendar`, starting with its first day."""
+    return pd.DatetimeIndex(pd.to_datetime(list(calendar))[::every])
+
+
+def _rebalance_description(config: PortfolioConfig) -> str:
+    cadence = "daily" if config.rebalance_days == 1 else f"every {config.rebalance_days} trading days"
+    if config.n_drop == config.topk:
+        return f"{cadence}, full rebalance into the latest top {config.topk}"
+    return f"{cadence}, drop at most {config.n_drop} of the top {config.topk}"
 
 
 def _liquidating_strategy_class(base_class: Any) -> type[Any]:
