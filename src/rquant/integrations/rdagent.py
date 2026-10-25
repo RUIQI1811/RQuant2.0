@@ -152,7 +152,8 @@ class RDAgentExporter:
         for frame, path in ((full, full_path), (debug, debug_path)):
             path.parent.mkdir(parents=True)
             frame.to_parquet(path)
-        (self.output_root / "rdagent.env").write_text(env_template(window), encoding="utf-8")
+        # RD-Agent reads this file on Linux; Windows line endings would leave a CR at the end of every value.
+        (self.output_root / "rdagent.env").write_text(env_template(window), encoding="utf-8", newline="\n")
         shutil.copyfile(SETUP_SCRIPT, self.output_root / SETUP_SCRIPT.name)
 
         with qlib_manifest.open("r", encoding="utf-8") as handle:

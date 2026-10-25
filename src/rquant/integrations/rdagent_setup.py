@@ -78,6 +78,13 @@ def convert_data(bundle: Path, workdir: Path, readme: Path) -> dict[str, int]:
     return rows
 
 
+def write_env(source: Path, target: Path) -> None:
+    """Copy the .env template with Unix line endings; a CR left by a Windows export would end up in the API key."""
+    text = source.read_text(encoding="utf-8").replace("\r\n", "\n")
+    target.write_text(text, encoding="utf-8", newline="\n")
+    target.chmod(0o600)
+
+
 def check_qlib(qlib_dir: Path) -> list[str]:
     required = (qlib_dir / "calendars" / "day.txt", qlib_dir / "instruments" / "csi300.txt", qlib_dir / "features")
     problems = [f"missing {path}" for path in required if not path.exists()]
@@ -136,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     if env_path.exists():
         env_note = f"kept existing {env_path}; compare it with {bundle / 'rdagent.env'}"
     else:
-        shutil.copyfile(bundle / "rdagent.env", env_path)
+        write_env(bundle / "rdagent.env", env_path)
         env_note = f"wrote {env_path}; fill in DASHSCOPE_API_KEY"
 
     problems = check_qlib(args.qlib_dir.expanduser())

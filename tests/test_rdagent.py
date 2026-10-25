@@ -14,7 +14,13 @@ from rquant.integrations.rdagent import (
     default_mining_window,
     env_template,
 )
-from rquant.integrations.rdagent_setup import check_qlib, convert_data, patch_template_text, patch_templates
+from rquant.integrations.rdagent_setup import (
+    check_qlib,
+    convert_data,
+    patch_template_text,
+    patch_templates,
+    write_env,
+)
 
 HAS_QLIB = all(importlib.util.find_spec(name) is not None for name in ("pandas", "pyarrow", "qlib"))
 HAS_TABLES = HAS_QLIB and importlib.util.find_spec("tables") is not None
@@ -96,6 +102,17 @@ class TemplatePatchTests(unittest.TestCase):
             self.assertEqual(TEMPLATE_EXCERPT, (root / "conf_baseline.yaml.orig").read_text(encoding="utf-8"))
 
 
+class WriteEnvTests(unittest.TestCase):
+    def test_windows_line_endings_do_not_reach_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "rdagent.env"
+            source.write_bytes(b"CHAT_MODEL=dashscope/qwen-plus\r\nDASHSCOPE_API_KEY=\r\n")
+            target = Path(temporary) / ".env"
+            write_env(source, target)
+            self.assertEqual(b"CHAT_MODEL=dashscope/qwen-plus\nDASHSCOPE_API_KEY=\n", target.read_bytes())
+            self.assertEqual(0o600, target.stat().st_mode & 0o777)
+
+
 @unittest.skipUnless(HAS_QLIB, "pandas, pyarrow and pyqlib are required")
 class ExportTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -161,6 +178,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(2, manifest["full"]["instruments"])
         self.assertEqual("2020-03-13", manifest["full"]["end"])
         self.assertTrue((output / "rdagent_setup.py").exists())
+        self.assertNotIn(b"\r", (output / "rdagent.env").read_bytes())
         env_lines = (output / "rdagent.env").read_text(encoding="utf-8").splitlines()
         self.assertIn("QLIB_FACTOR_TEST_END=2020-03-13", env_lines)
         self.assertEqual(manifest, json.loads((output / "manifest.json").read_text(encoding="utf-8")))
