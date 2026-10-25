@@ -689,6 +689,17 @@ annual_effectiveness.csv
 `pocket` 列记录每日轮值口袋，汇总文件中的 `pocket_count` 与 `required_pockets` 用于核对口袋覆盖。
 多空端结果只用于因子诊断，最终交易结论仍以包含 A 股交易约束的 long-only 组合回测为准。
 
+### 用 RD-Agent 自动挖因子
+
+`rquant rdagent export` 把截至挖掘期末（默认 2021-12-31）的沪深 300 历史成分日线导出给微软 RD-Agent 的 `fin_factor`
+循环，并附带把它的回测改成次日开盘口径的准备脚本。RD-Agent 用自己 test 段的结果挑因子，所以挖掘期之后的年份
+只留给 walk-forward 做样本外检验。RD-Agent 只支持 Linux，需要在 WSL2 里单独安装，并准备 LLM API key；完整步骤见
+[docs/rdagent.md](docs/rdagent.md)。
+
+```bash
+rquant rdagent export --mining-end 2021-12-31
+```
+
 ## 7. 执行滚动训练与样本外预测
 
 训练前必须确认：

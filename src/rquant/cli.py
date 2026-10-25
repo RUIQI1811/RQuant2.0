@@ -29,6 +29,7 @@ from rquant.factors.engine import (
     validate_factor_frame,
 )
 from rquant.factors.evaluation import FactorEvaluationConfig, FactorEvaluator
+from rquant.integrations.rdagent import RDAgentExporter, default_mining_window
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
 from rquant.runs import RunContext
@@ -120,6 +121,23 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--n-drop", type=int, help="Override backtest.n_drop")
     report.add_argument("--rebalance-days", type=int, help="Override backtest.rebalance_days")
     report.set_defaults(handler=_report, run_category="report")
+
+    rdagent = commands.add_parser("rdagent", help="Exchange data with Microsoft RD-Agent factor mining")
+    rdagent_commands = rdagent.add_subparsers(dest="rdagent_command", required=True)
+    rdagent_export = rdagent_commands.add_parser(
+        "export", help="Write daily price/volume data and settings for RD-Agent fin_factor, cut at the mining end"
+    )
+    rdagent_export.add_argument(
+        "--mining-end",
+        type=_date,
+        default=date(2021, 12, 31),
+        help="Last date RD-Agent may see, YYYY-MM-DD (default 2021-12-31); later data is the holdout",
+    )
+    rdagent_export.add_argument("--output", help="Bundle directory (default: <data_root>/rdagent)")
+    rdagent_export.add_argument(
+        "--debug-instruments", type=int, default=100, help="Instruments in RD-Agent's quick debug data (default 100)"
+    )
+    rdagent_export.set_defaults(handler=_rdagent_export, run_category="rdagent-export")
     return parser
 
 
@@ -562,6 +580,21 @@ def _walk_forward(args: argparse.Namespace) -> int:
         )
         run.add_input("through", through.isoformat())
         return runner.run(first_year=first_year, last_year=last_year, through=through)
+
+    return _run(args, action)
+
+
+def _rdagent_export(args: argparse.Namespace) -> int:
+    def action(run: RunContext, config: dict[str, Any], paths: ProjectPaths) -> dict[str, Any]:
+        formal_start = _date_value(config.get("data", {}).get("formal_start", "2010-01-01"))
+        window = default_mining_window(formal_start, args.mining_end)
+        output = Path(args.output).expanduser() if args.output else paths.data / "rdagent"
+        if not output.is_absolute():
+            output = paths.root / output
+        run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
+        exporter = RDAgentExporter(paths.qlib, output, universe=_universe(config))
+        manifest = exporter.export(window, debug_instruments=args.debug_instruments)
+        return {"output": str(output), **manifest}
 
     return _run(args, action)
 
