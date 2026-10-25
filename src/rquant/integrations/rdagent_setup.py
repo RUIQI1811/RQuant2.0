@@ -112,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: run this inside the RD-Agent conda env (pip install rdagent)", file=sys.stderr)
         return 2
     import importlib.metadata
+    import importlib.util
 
     installed = importlib.metadata.version("rdagent")
     if installed != manifest["rdagent_version"]:
@@ -120,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
             f"Run: pip install rdagent=={manifest['rdagent_version']}",
             file=sys.stderr,
         )
+        return 2
+
+    if importlib.util.find_spec("litellm.llms.dashscope.embed") is None:
+        # The default .env embeds through LiteLLM's native DashScope provider, which older LiteLLM lacks.
+        print("error: this LiteLLM has no DashScope embedding provider. Run: pip install -U litellm", file=sys.stderr)
         return 2
 
     experiment_root = Path(qlib_experiment_utils.__file__).parent
@@ -131,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         env_note = f"kept existing {env_path}; compare it with {bundle / 'rdagent.env'}"
     else:
         shutil.copyfile(bundle / "rdagent.env", env_path)
-        env_note = f"wrote {env_path}; fill in DEEPSEEK_API_KEY and LITELLM_PROXY_API_KEY"
+        env_note = f"wrote {env_path}; fill in DASHSCOPE_API_KEY"
 
     problems = check_qlib(args.qlib_dir.expanduser())
     print(f"rdagent {installed}: {experiment_root}")

@@ -56,6 +56,7 @@ RD-Agent 只支持 Linux。以下步骤只需要做一次。
    conda create -y -n rdagent python=3.10
    conda activate rdagent
    pip install rdagent==1.0.0
+   pip install -U litellm
    ```
 
    第一次回测时 RD-Agent 会自动再建一个 `rdagent4qlib` 环境（从 GitHub 安装固定版本的 qlib，并装 torch，约 2–3 GB），
@@ -74,7 +75,7 @@ rquant rdagent export           # 写入 data/rdagent/
 ```text
 factor_source_data/daily_pv.parquet         全量：挖掘窗口内的沪深 300 历史成分
 factor_source_data_debug/daily_pv.parquet   调试：最后两年、前 100 只
-rdagent.env                                 .env 模板（API key 留空）
+rdagent.env                                 .env 模板（千问 / 百炼，API key 留空）
 rdagent_setup.py                            在 WSL 里运行的准备脚本
 manifest.json                               窗口、行数、哈希和 Qlib provider 指纹
 ```
@@ -96,13 +97,14 @@ python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" \
 脚本会把 Parquet 转成 RD-Agent 读取的 `git_ignore_folder/factor_implementation_source_data*/daily_pv.h5`，改好上面的
 模板（原文件备份为 `*.yaml.orig`，重复运行总是从备份重新改），并在工作目录写入 `.env`（已存在则不覆盖）。
 
-编辑 `~/rdagent-work/.env`，填两个 key：
+编辑 `~/rdagent-work/.env`，填 `DASHSCOPE_API_KEY`：在阿里云百炼控制台（中国内地地域）开通服务并创建 API Key。
+同一个 key 同时用于 chat 模型 `qwen-plus` 和 embedding 模型 `text-embedding-v4`，都走 LiteLLM 自带的 DashScope
+接口，需要较新的 LiteLLM（准备脚本会检查，不满足时提示 `pip install -U litellm`）。
 
-- `DEEPSEEK_API_KEY`：DeepSeek 开放平台；
-- `LITELLM_PROXY_API_KEY`：硅基流动（SiliconFlow），用于 `BAAI/bge-m3` embedding。
-
-换用其他模型时按 RD-Agent README 的 LiteLLM 写法修改 `CHAT_MODEL` / `EMBEDDING_MODEL`；推理模型（输出 `<think>`）
-需要再加 `REASONING_THINK_RM=True`。
+- `qwen-plus` 上下文 128k，够用且便宜；想要更强可以改成 `qwen3-max`。不要用 `qwen-max`：它只有 30k 上下文，
+  装不下 RD-Agent 的提示词；也不要用 QwQ 等推理模型（输出 `<think>`，慢且贵，要用就得再加 `REASONING_THINK_RM=True`）；
+- `EMBEDDING_MAX_STR_NUM=10`：百炼的 embedding 每次最多 10 条，RD-Agent 默认一次发 50 条；
+- `.env` 里还留了 DeepSeek（chat）+ 硅基流动（embedding）的注释配置，想换时注释掉千问那几行即可。
 
 ## 5. 运行
 

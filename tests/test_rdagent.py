@@ -63,8 +63,10 @@ class MiningWindowTests(unittest.TestCase):
         lines = text.splitlines()
         self.assertIn("QLIB_FACTOR_TEST_START=2019-01-01", lines)
         self.assertIn("MODEL_CoSTEER_ENV_TYPE=conda", lines)
-        self.assertIn("DEEPSEEK_API_KEY=", lines)
-        self.assertIn("LITELLM_PROXY_API_KEY=", lines)
+        self.assertIn("CHAT_MODEL=dashscope/qwen-plus", lines)
+        self.assertIn("EMBEDDING_MODEL=dashscope/text-embedding-v4", lines)
+        self.assertIn("DASHSCOPE_API_KEY=", lines)
+        self.assertIn("EMBEDDING_MAX_STR_NUM=10", lines)
 
 
 class TemplatePatchTests(unittest.TestCase):
