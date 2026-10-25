@@ -69,6 +69,9 @@ def synthetic_inputs(days: int = 2200, stocks: int = 40, seed: int = 5) -> dict[
         for year in range(first, last + 1):
             paid = (dates >= f"{year}-06-15") & (dates < f"{year + 1}-06-15")
             dps.iloc[paid, column] = 0.2 + 0.05 * (year - 2012)
+            # Tushare double-counts the new payment for a few days after its ex-date.
+            spike = (dates >= f"{year}-06-15") & (dates < f"{year}-06-22")
+            dps.iloc[spike, column] = 2.0 * (0.2 + 0.05 * (year - 2012))
     raw_close = panels["close"] / np.linspace(1.0, 1.3, days)[:, None]
 
     rows = []
@@ -92,7 +95,7 @@ def synthetic_inputs(days: int = 2200, stocks: int = 40, seed: int = 5) -> dict[
             row["total_hldr_eqy_exc_min_int"] = 0.45 * row["total_assets"]
             row["revenue"] = float(rng.uniform(0.3, 0.5) * scale * quarter)
             row["n_income_attr_p"] = float(rng.uniform(-0.01, 0.06) * scale * quarter)
-            if end.year < 2018:
+            if end.year < 2018 or column == 5:
                 row["rd_exp"] = np.nan
             rows.append(row)
     fundamentals = pd.DataFrame(rows)
@@ -100,6 +103,7 @@ def synthetic_inputs(days: int = 2200, stocks: int = 40, seed: int = 5) -> dict[
 
     list_date = pd.Series(dates[0] - pd.to_timedelta(rng.integers(100, 4000, stocks), unit="D"), index=instruments)
     list_date.iloc[3] = dates[min(400, days - 1)]
+    list_date.iloc[5] = dates[min(1800, days - 1)]
     return {
         **panels,
         "amount": panels["close"] * panels["volume"],
@@ -227,12 +231,13 @@ class OAPCalculationTests(unittest.TestCase):
 
         # Payers have no year of history before mid-2013, so a 2012 initiation is unknown; stock 4 starts in 2015.
         self.assertTrue(np.isnan(self.outputs["DivInit"].iloc[row("2012-06-15") + 5, 2]))
-        self.assertEqual(1.0, self.outputs["DivInit"].iloc[row("2015-06-15") + 5, 4])
-        self.assertEqual(0.0, self.outputs["DivInit"].iloc[row("2015-06-15") + 5, 2])
-        self.assertEqual(0.0, self.outputs["DivInit"].iloc[row("2016-06-15") + 5, 4])
+        self.assertEqual(1.0, self.outputs["DivInit"].iloc[row("2015-06-15") + 20, 4])
+        self.assertEqual(0.0, self.outputs["DivInit"].iloc[row("2015-06-15") + 20, 2])
+        self.assertEqual(0.0, self.outputs["DivInit"].iloc[row("2016-06-15") + 20, 4])
         self.assertEqual(1.0, self.outputs["DivOmit"].iloc[row("2017-06-15") + 5, 0])
         self.assertEqual(0.0, self.outputs["DivOmit"].iloc[row("2017-06-15") + 5, 2])
-        paid = row("2015-06-15")
+        # The trailing amount ignores the ex-date double count and moves once, 15 rows after the payment.
+        paid = row("2015-06-15") + 14
         self.assertEqual(1.0, self.outputs["DivSeason"].iloc[paid + 240, 2])
         self.assertEqual(0.0, self.outputs["DivSeason"].iloc[paid + 100, 2])
         self.assertTrue(np.isnan(self.outputs["DivSeason"].iloc[paid + 240, 1]))
@@ -246,6 +251,10 @@ class OAPCalculationTests(unittest.TestCase):
         self.assertTrue(set(np.unique(values[np.isfinite(values)])) <= {0.0, 1.0})
         self.assertEqual(1.0, self.outputs["IndIPO"].iloc[600, 3])
         self.assertEqual(0.0, self.outputs["IndIPO"].iloc[2000, 3])
+        # A blank R&D line means no R&D only once R&D is its own line (2018); stock 5 lists in late 2018 without R&D.
+        self.assertTrue(np.isnan(self.outputs["RDIPO"].iloc[600, 3]))
+        self.assertEqual(1.0, self.outputs["RDIPO"].iloc[2100, 5])
+        self.assertEqual(0.0, self.outputs["RDIPO"].iloc[2100, 4])
 
 
 class OAPHelperTests(unittest.TestCase):

@@ -20,7 +20,8 @@ Daily adaptation
   items the latest quarter end, quarterly items the latest single quarter, and "one year ago" is four quarters ago.
   Compustat items map to Tushare lines as listed in ``ITEMS``.
 * Market value is daily total market value; dividends are the trailing-twelve-month dividend yield of daily_basic
-  times the total market value, and a payment is due when that trailing amount changed 11 to 12 months ago. Share
+  times the total market value (the smallest of the last 15 days, because Tushare double-counts a payment for a few
+  days around its ex-date), and a payment is due when that trailing amount changed 11 to 12 months ago. Share
   counts that must be split-adjusted (ShareIss1Y, ShareIss5Y, PS) are total shares times the unadjusted over the
   adjusted close.
 * Cross-sectional steps (quintile flags, industry means and medians, cross-sectional regressions, Herfindahl indices)
@@ -67,6 +68,9 @@ QUARTER = 63
 YEAR = 252
 OAP_DAILY_BASIC = {"close": 1.0, "turnover_rate": 0.01, "total_share": 10_000.0, "dv_ttm": 0.01}
 MARKET_FACTORS = ("mkt", "smb", "hml")
+DIVIDEND_SPIKE_DAYS = 15
+# Tushare reports R&D expense as its own income-statement line from 2018; afterwards a blank line means none.
+RD_LINE_YEAR = 2018
 TREND_WINDOWS = (3, 5, 10, 20, 50, 100, 200, 400, 600, 800, 1000)
 
 # Compustat item: Tushare statement lines summed into it. Flow items are read as trailing-twelve-month sums, single
@@ -820,11 +824,16 @@ class OAPSignals:
 
     @property
     def dividends(self) -> np.ndarray:
-        """Trailing-twelve-month cash dividends in yuan, zero for a quoted non-payer, carried over gaps."""
+        """Trailing-twelve-month cash dividends in yuan, zero for a quoted non-payer, carried over gaps.
+
+        Tushare counts a payment twice for a few days around its ex-date (up to about two weeks), so the amount is the
+        smallest of the last ``DIVIDEND_SPIKE_DAYS`` rows; a real change shows up that many rows later.
+        """
         def build() -> np.ndarray:
             quoted = np.isfinite(self.raw_close)
             dividend_yield = finite_or(self._array("basic_dv_ttm"), 0.0)
-            return self._ffill(np.where(quoted, dividend_yield * self.cap_filled, np.nan))
+            amount = self._ffill(np.where(quoted, dividend_yield * self.cap_filled, np.nan))
+            return trailing(amount, DIVIDEND_SPIKE_DAYS, 1, "min")
         return self._memo("dividends", build)
 
     @property
@@ -1760,8 +1769,13 @@ class OAPSignals:
         return flag((age >= 6) & (age <= 36), np.isfinite(age))
 
     def _s_RDIPO(self) -> np.ndarray:
-        research = self.p(self.x("xrd"))
-        return self._s_IndIPO() * flag(research == 0, np.isfinite(research))
+        grid = self.grid
+        research, sales = self.x("xrd"), self.x("sale")
+        # A trailing year that lies wholly after R&D became its own line, with a blank line, has no R&D.
+        separate = (np.arange(grid.quarters) + grid.first_quarter) >= RD_LINE_YEAR * 4 + 3
+        known = np.isfinite(sales) & separate[None, :]
+        no_research = self.p(flag(finite_or(research, 0.0) == 0, known))
+        return self._s_IndIPO() * no_research
 
     def _dividend_changes(self) -> np.ndarray:
         """Days the trailing dividend amount changes by more than 5%: a payment enters or a year-old one drops out."""
