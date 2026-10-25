@@ -69,6 +69,7 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - `src/rquant/factors/libraries/`：因子库接口、注册表及本地公式定义；
 - `src/rquant/factors/extensions/`：KunQuant 0.1.11 缺失能力的最小扩展，不是上游运行时副本；
 - `src/rquant/factors/panel_operators.py`：GTJA191 使用的公共 Pandas 面板算子；
+- `src/rquant/integrations/`：与外部研究工具交换数据的桥接（如 RD-Agent 导出与其模板改写脚本），不在 `rquant` 环境中安装这些工具；
 - `tests/`：快速、确定性的自动化测试；
 - `config/default.yaml`：默认研究和执行参数；
 - `data/raw/`：不可变的 Tushare 分区、分区级清单及总同步清单；
