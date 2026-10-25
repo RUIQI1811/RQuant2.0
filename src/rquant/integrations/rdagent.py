@@ -79,6 +79,8 @@ def env_template(window: MiningWindow) -> str:
         "",
         "# Run Qlib backtests in a local conda env (rdagent4qlib) instead of Docker.",
         "MODEL_CoSTEER_ENV_TYPE=conda",
+        "# rdagent4qlib installs MLflow 3.x, which refuses qlib's ./mlruns file store without this.",
+        "MLFLOW_ALLOW_FILE_STORE=true",
         "",
         "# Mining split. Everything after QLIB_FACTOR_TEST_END is held out for RQuant walk-forward.",
         *(f"{key}={value}" for key, value in window.env().items()),

@@ -69,6 +69,7 @@ class MiningWindowTests(unittest.TestCase):
         lines = text.splitlines()
         self.assertIn("QLIB_FACTOR_TEST_START=2019-01-01", lines)
         self.assertIn("MODEL_CoSTEER_ENV_TYPE=conda", lines)
+        self.assertIn("MLFLOW_ALLOW_FILE_STORE=true", lines)
         self.assertIn("CHAT_MODEL=dashscope/qwen-plus", lines)
         self.assertIn("EMBEDDING_MODEL=dashscope/text-embedding-v4", lines)
         self.assertIn("DASHSCOPE_API_KEY=", lines)
