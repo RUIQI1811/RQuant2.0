@@ -95,7 +95,7 @@ python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" \
 ```
 
 脚本会把 Parquet 转成 RD-Agent 读取的 `git_ignore_folder/factor_implementation_source_data*/daily_pv.h5`，改好上面的
-模板（原文件备份为 `*.yaml.orig`，重复运行总是从备份重新改），并在工作目录写入 `.env`（已存在则不覆盖）。
+模板（原文件备份为 `*.yaml.orig`，重复运行总是从备份重新改）、给 RD-Agent 的 embedding 接口打分批补丁，并在工作目录写入 `.env`（已存在则不覆盖）。
 
 编辑 `~/rdagent-work/.env`，填 `DASHSCOPE_API_KEY`：在阿里云百炼控制台（中国内地地域）开通服务并创建 API Key。
 同一个 key 同时用于 chat 模型 `qwen-plus` 和 embedding 模型 `text-embedding-v4`，都走 LiteLLM 自带的 DashScope
@@ -103,7 +103,9 @@ python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" \
 
 - `qwen-plus` 上下文 128k，够用且便宜；想要更强可以改成 `qwen3-max`。不要用 `qwen-max`：它只有 30k 上下文，
   装不下 RD-Agent 的提示词；也不要用 QwQ 等推理模型（输出 `<think>`，慢且贵，要用就得再加 `REASONING_THINK_RM=True`）；
-- `EMBEDDING_MAX_STR_NUM=10`：百炼的 embedding 每次最多 10 条，RD-Agent 默认一次发 50 条；
+- `EMBEDDING_MAX_STR_NUM=10`：百炼的 embedding 每次最多 10 条。RD-Agent 1.0.0 的 LiteLLM 接口其实不读这个设置，
+  会把所有文本一次发出，知识库超过 10 条后（约第 5 轮）报 `batch size is invalid`；准备脚本会给它的
+  `rdagent/oai/backend/litellm.py` 打补丁按这个值分批（原文件备份为 `litellm.py.orig`）；
 - `.env` 里还留了 DeepSeek（chat）+ 硅基流动（embedding）的注释配置，想换时注释掉千问那几行即可。
 
 ## 5. 运行

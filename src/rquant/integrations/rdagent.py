@@ -67,7 +67,7 @@ def env_template(window: MiningWindow) -> str:
         "CHAT_MODEL=dashscope/qwen-plus",
         "EMBEDDING_MODEL=dashscope/text-embedding-v4",
         "DASHSCOPE_API_KEY=",
-        "# DashScope embeds at most 10 texts per request; RD-Agent batches 50 by default.",
+        "# DashScope embeds at most 10 texts per request; rdagent_setup.py patches RD-Agent to batch by this.",
         "EMBEDDING_MAX_STR_NUM=10",
         "",
         "# Alternative: DeepSeek chat with SiliconFlow embedding (comment out the Qwen lines above).",

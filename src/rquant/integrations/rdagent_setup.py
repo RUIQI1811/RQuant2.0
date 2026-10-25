@@ -67,6 +67,40 @@ def patch_templates(template_root: Path, threads: int) -> list[str]:
     return patched
 
 
+# RD-Agent 1.0.0's LiteLLM backend sends every text in one embedding request and ignores embedding_max_str_num
+# (only its deprecated OpenAI backend batches). DashScope rejects more than 10 texts per request, which crashes the
+# loop once its knowledge base outgrows 10 entries, around the fifth loop.
+EMBEDDING_ORIGINAL = """        response = embedding(
+            model=model_name,
+            input=input_content_list,
+        )
+        response_list = [data["embedding"] for data in response.data]
+        return response_list
+"""
+EMBEDDING_BATCHED = """        # RQuant patch: batch by embedding_max_str_num, as RD-Agent's deprecated backend does.
+        response_list = []
+        step = LITELLM_SETTINGS.embedding_max_str_num
+        for start in range(0, len(input_content_list), step):
+            response = embedding(
+                model=model_name,
+                input=input_content_list[start : start + step],
+            )
+            response_list.extend(data["embedding"] for data in response.data)
+        return response_list
+"""
+
+
+def patch_embedding_batches(backend: Path) -> None:
+    """Make the LiteLLM backend batch embedding requests. Idempotent; fails if the backend no longer matches."""
+    backup = backend.with_name(backend.name + ".orig")
+    if not backup.exists():
+        shutil.copyfile(backend, backup)
+    text = backup.read_text(encoding="utf-8")
+    if EMBEDDING_ORIGINAL not in text:
+        raise ValueError(f"RD-Agent LiteLLM backend no longer matches the embedding patch: {backend}")
+    backend.write_text(text.replace(EMBEDDING_ORIGINAL, EMBEDDING_BATCHED), encoding="utf-8")
+
+
 def convert_data(bundle: Path, workdir: Path, readme: Path) -> dict[str, int]:
     import pandas as pd
 
@@ -179,6 +213,9 @@ def main(argv: list[str] | None = None) -> int:
 
     experiment_root = Path(qlib_experiment_utils.__file__).parent
     patched = patch_templates(experiment_root / "factor_template", args.threads)
+    litellm_backend = experiment_root.parents[2] / "oai" / "backend" / "litellm.py"
+    patch_embedding_batches(litellm_backend)
+    patched.append(str(litellm_backend))
     rows = convert_data(bundle, workdir, experiment_root / "factor_data_template" / "README.md")
 
     env_path = workdir / ".env"

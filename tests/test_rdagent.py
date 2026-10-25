@@ -15,8 +15,10 @@ from rquant.integrations.rdagent import (
     env_template,
 )
 from rquant.integrations.rdagent_setup import (
+    EMBEDDING_ORIGINAL,
     check_qlib,
     convert_data,
+    patch_embedding_batches,
     patch_template_text,
     patch_templates,
     write_env,
@@ -101,6 +103,27 @@ class TemplatePatchTests(unittest.TestCase):
             text = (root / "conf_baseline.yaml").read_text(encoding="utf-8")
             self.assertIn("num_threads: 8", text)
             self.assertEqual(TEMPLATE_EXCERPT, (root / "conf_baseline.yaml.orig").read_text(encoding="utf-8"))
+
+
+class EmbeddingPatchTests(unittest.TestCase):
+    def test_embedding_requests_are_batched_and_patch_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            backend = Path(temporary) / "litellm.py"
+            original = "def _create_embedding_inner_function(self, input_content_list):\n" + EMBEDDING_ORIGINAL
+            backend.write_text(original, encoding="utf-8")
+            patch_embedding_batches(backend)
+            patch_embedding_batches(backend)
+            text = backend.read_text(encoding="utf-8")
+            self.assertEqual(1, text.count("for start in range(0, len(input_content_list), step):"))
+            self.assertIn("input=input_content_list[start : start + step],", text)
+            self.assertEqual(original, (Path(temporary) / "litellm.py.orig").read_text(encoding="utf-8"))
+
+    def test_unrecognized_backend_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            backend = Path(temporary) / "litellm.py"
+            backend.write_text("def something_else():\n    pass\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                patch_embedding_batches(backend)
 
 
 class WriteEnvTests(unittest.TestCase):
