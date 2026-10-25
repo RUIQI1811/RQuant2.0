@@ -108,9 +108,19 @@ python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" \
 
 ## 5. 运行
 
+先确认 key 和模型能用（发一次 JSON 模式的 chat 和一次 embedding，走的是 RD-Agent 自己的 LLM 接口）：
+
+```bash
+python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" --workdir ~/rdagent-work --check-llm
+```
+
+不要用 `rdagent health_check` 检查：RD-Agent 1.0.0 的这个命令只认 OpenAI 和 DeepSeek 的 key，遇到千问配置会报
+`UnboundLocalError: local variable 'embedding_model' referenced before assignment`，并不代表配置有错。
+
+两行都显示 OK 后开始挖：
+
 ```bash
 cd ~/rdagent-work
-rdagent health_check --no-check-docker
 rdagent fin_factor --loop-n 20
 ```
 

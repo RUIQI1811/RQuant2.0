@@ -8,6 +8,9 @@ It (1) converts the exported Parquet into the ``daily_pv.h5`` folders RD-Agent r
 (2) patches RD-Agent's Qlib factor templates to RQuant's trading conventions, (3) writes ``.env`` from the bundle's
 template when none exists, and (4) checks the Qlib provider RD-Agent backtests against. It only needs the
 standard library, pandas and PyTables, all of which RD-Agent installs.
+
+After filling in the API key, check it with ``python rdagent_setup.py --workdir ~/rdagent-work --check-llm``;
+``rdagent health_check`` only understands OpenAI and DeepSeek keys and crashes on the default Qwen settings.
 """
 
 from __future__ import annotations
@@ -93,9 +96,41 @@ def check_qlib(qlib_dir: Path) -> list[str]:
     return problems
 
 
+def check_llm(workdir: Path) -> int:
+    """Send one JSON-mode chat and one embedding request through RD-Agent's own LLM backend, as its loop does."""
+    import os
+
+    env_path = workdir / ".env"
+    if not env_path.exists():
+        print(f"error: {env_path} does not exist; run the setup first", file=sys.stderr)
+        return 2
+    os.chdir(workdir)
+    from dotenv import load_dotenv
+
+    load_dotenv(env_path, override=True)
+    # RD-Agent retries a failed call ten times by default; one is enough to tell a bad key from a good one.
+    os.environ.setdefault("MAX_RETRY", "1")
+    from rdagent.oai.llm_utils import APIBackend
+
+    backend = APIBackend()
+    try:
+        reply = backend.build_messages_and_create_chat_completion(
+            user_prompt='Reply with the JSON object {"ok": true}.',
+            system_prompt="You reply with JSON only.",
+            json_mode=True,
+        )
+        vector = backend.create_embedding("hello")
+    except Exception as exc:  # noqa: BLE001 - any provider failure means the settings do not work
+        print(f"error: LLM check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(f"chat OK ({os.environ.get('CHAT_MODEL')}): {reply.strip()[:80]}")
+    print(f"embedding OK ({os.environ.get('EMBEDDING_MODEL')}): {len(vector)} dimensions")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--bundle", required=True, type=Path, help="Directory written by `rquant rdagent export`")
+    parser.add_argument("--bundle", type=Path, help="Directory written by `rquant rdagent export`")
     parser.add_argument("--workdir", required=True, type=Path, help="Directory you will run `rdagent` from")
     parser.add_argument(
         "--qlib-dir",
@@ -104,10 +139,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Copy of RQuant's data/qlib; RD-Agent's templates hard-code this location",
     )
     parser.add_argument("--threads", type=int, default=4, help="LightGBM threads per backtest (default 4)")
+    parser.add_argument(
+        "--check-llm", action="store_true", help="Only test the chat and embedding models configured in <workdir>/.env"
+    )
     args = parser.parse_args(argv)
 
-    bundle = args.bundle.expanduser().resolve()
     workdir = args.workdir.expanduser().resolve()
+    if args.check_llm:
+        return check_llm(workdir)
+    if args.bundle is None:
+        parser.error("--bundle is required unless --check-llm is given")
+    bundle = args.bundle.expanduser().resolve()
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("status") != "complete":
         print(f"error: export bundle is incomplete: {bundle}", file=sys.stderr)
@@ -156,7 +198,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Qlib provider at {args.qlib_dir} is not ready: " + "; ".join(problems), file=sys.stderr)
         return 1
     print(f"Qlib provider OK: {args.qlib_dir}")
-    print(f"Next: cd {workdir} && rdagent health_check --no-check-docker && rdagent fin_factor --loop-n 20")
+    print(f"Next: fill in the API key in {env_path}, then check it with")
+    print(f"  python {Path(__file__).resolve()} --workdir {workdir} --check-llm")
+    print(f"and start mining with: cd {workdir} && rdagent fin_factor --loop-n 20")
     return 0
 
 
