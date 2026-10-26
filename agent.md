@@ -173,7 +173,7 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - `oap` 列名为 `oap_001` 至 `oap_142`，来源名为 Open Source Asset Pricing 信号简称；它是按 Chen-Zimmermann `SignalDoc`
   公开定义独立重写的日频版本（未使用其代码或数据）。`OAP_NAMES` 与 `OAP_SKIPPED` 必须合起来恰好覆盖 212 个 Predictor，
   跳过的信号要写明原因。月度信号在以当日结尾的不重叠 21 日块上计算；财报口径与 `china_chars` 相同；截面运算只用当日
-  沪深 300 成分股。`tests/test_oap.py` 用截断数据重算回归验证无前视；
+  研究股票池成员（引擎传入）。`tests/test_oap.py` 用截断数据重算回归验证无前视；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖 `data/canonical/reference/index_daily.parquet`
