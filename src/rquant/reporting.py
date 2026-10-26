@@ -10,6 +10,7 @@ from rquant.io import atomic_write_json
 UNIVERSE_LABELS = {
     "csi300": "CSI300",
     "main": "Shanghai/Shenzhen main-board (no ST, no first 60 trading days)",
+    "sh_main": "Shanghai main-board (no ST, no first 60 trading days)",
     "all": "all A-share",
 }
 

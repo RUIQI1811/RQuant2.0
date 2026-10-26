@@ -138,7 +138,7 @@ rquant doctor --skip-permission-check
 | `data.formal_start`              | `2010-01-01` | 正式研究起点                 |
 | `data.warmup_trading_days`       |        `300` | 正式研究前预热交易日数       |
 | `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
-| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）、`main`（沪深主板，见下文）或 `all` |
+| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）、`main`（沪深主板，见下文）、`sh_main`（沪市主板）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `data.fundamentals_start_year`   |       `2004` | `data sync-fundamentals` 抓取财报的最早公告年份 |
@@ -277,13 +277,14 @@ python -m json.tool data/qlib/manifest.json
 | -------- | ---------------- |
 | `csi300` | 当日可知的沪深 300 成分股 |
 | `main`   | 沪市 60 开头、深市 00 开头的主板 A 股（含原中小板 002/003），剔除创业板 30、科创板 68、北交所和 B 股；当日名称为 ST、\*ST 或“退”（退市整理）的股票，以及上市后前 60 个交易日的次新股，当日也不在池内 |
+| `sh_main` | `main` 中只保留沪市 60 开头的股票，ST 与次新股剔除规则相同 |
 | `all`    | 全部 A 股 |
 
 ST 状态按 Tushare `namechange` 的历史名称逐日判断（生效日即 `start_date`），上市天数按交易日历从 `list_date` 起数。
 规则定义在 `src/rquant/universe.py`。股票池逐日决定因子库发布哪些行，因此只影响训练样本与可买入的股票；
 时间序列指标仍使用每只股票进池前的历史。
 
-除 `csi300` 外，每个股票池的因子库写在各自目录（`main` 为 `data/factors-main/`），与沪深 300 的
+除 `csi300` 外，每个股票池的因子库写在各自目录（`main` 为 `data/factors-main/`，`sh_main` 为 `data/factors-sh_main/`），与沪深 300 的
 `data/factors/` 并存。临时切换股票池用全局参数 `--universe`，它覆盖 `data.universe`：
 
 ```bash
@@ -293,7 +294,7 @@ rquant report RUN_ID   # 自动按该滚动训练的股票池回测
 ```
 
 `walk-forward` 会检查因子库的股票池与当前股票池一致；`report` 从滚动训练清单读取股票池，与配置无关。
-`main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
+`main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
 `rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
 
 财报需要单独同步（按股票、按公告日窗口请求单股接口，不需要 `*_vip` 批量接口权限）：

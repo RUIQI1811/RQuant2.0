@@ -199,6 +199,8 @@ class DataPipelineTests(unittest.TestCase):
         main = (self.qlib / "instruments" / "main.txt").read_text(encoding="utf-8")
         # SZ000001 turns ST on 2020-01-06 and SZ000002 is a new listing, so only one member day remains.
         self.assertEqual("SZ000001\t2020-01-02\t2020-01-02\n", main)
+        # Both fixture stocks are in Shenzhen.
+        self.assertEqual("", (self.qlib / "instruments" / "sh_main.txt").read_text(encoding="utf-8"))
 
     def test_canonical_without_name_history_leaves_st_unknown(self) -> None:
         from rquant.universe import universe_mask

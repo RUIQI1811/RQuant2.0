@@ -20,7 +20,7 @@ from rquant.data.canonical import ts_code_to_qlib
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS, RAW_DAILY_ENDPOINTS
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, sha256_file, stable_hash
-from rquant.universe import MAIN_BOARD_PREFIXES
+from rquant.universe import BOARD_PREFIXES
 
 # Tushare caps some statement responses at 100 rows without saying so; a window that reaches the cap is refetched
 # year by year instead of being trusted.
@@ -549,7 +549,7 @@ class TushareCollector:
             raise DataContractError("Raw sync is not complete; finish `rquant data sync` first")
         if universe == "csi300":
             endpoint, column = "index_weight", "con_code"
-        elif universe in ("main", "all"):
+        elif universe in (*BOARD_PREFIXES, "all"):
             endpoint, column = "stock_basic", "ts_code"
         else:
             raise DataContractError(f"Unsupported fundamental universe: {universe!r}")
@@ -563,9 +563,9 @@ class TushareCollector:
         if endpoint == "index_weight" and index_code and "index_code" in frame.columns:
             frame = frame[frame["index_code"] == index_code]
         codes = sorted(str(code) for code in frame[column].dropna().unique())
-        if universe == "main":
-            # ST and listing-age filters change over time, so every main-board stock may enter the universe.
-            codes = [code for code in codes if ts_code_to_qlib(code).startswith(MAIN_BOARD_PREFIXES)]
+        if universe in BOARD_PREFIXES:
+            # ST and listing-age filters change over time, so every stock on the boards may enter the universe.
+            codes = [code for code in codes if ts_code_to_qlib(code).startswith(BOARD_PREFIXES[universe])]
         if not codes:
             raise DataContractError(f"No stocks found for fundamental universe {universe}")
         return codes

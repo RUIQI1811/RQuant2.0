@@ -46,7 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--universe",
         choices=SUPPORTED_UNIVERSES,
-        help="Override data.universe: csi300, main (SH/SZ main board without ST and new listings) or all",
+        help=(
+            "Override data.universe: csi300, main (SH/SZ main board without ST and new listings), sh_main "
+            "(Shanghai main board only, same screens) or all"
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
 

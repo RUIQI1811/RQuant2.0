@@ -47,6 +47,10 @@ class UniverseTests(unittest.TestCase):
             members,
         )
 
+    def test_sh_main_keeps_only_the_shanghai_main_board(self) -> None:
+        members = self.frame.loc[universe_mask(self.frame, "sh_main"), "instrument"].tolist()
+        self.assertEqual(["SH600000", "SH601318", "SH603000", "SH605000"], members)
+
     def test_csi300_and_all(self) -> None:
         self.assertEqual(
             ["SH600000", "SZ000001", "SZ300750"],

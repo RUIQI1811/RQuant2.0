@@ -5,6 +5,7 @@
   Market (68xxxx) and the Beijing exchange need extra trading permissions, and B shares are not A shares, so all of
   them are left out. On each day a main-board stock is also left out while it carries an ST, *ST or delisting name,
   and during its first ``MAIN_NEW_LISTING_EXCLUDED_DAYS`` trading days.
+* ``sh_main``: the Shanghai half of ``main`` (60xxxx only), with the same ST and new-listing screens.
 * ``all``: every canonical bar.
 """
 
@@ -14,18 +15,16 @@ from typing import Any
 
 from rquant.errors import DataContractError
 
-SUPPORTED_UNIVERSES = ("csi300", "main", "all")
+SUPPORTED_UNIVERSES = ("csi300", "main", "sh_main", "all")
 
-# Shanghai 60xxxx and Shenzhen 00xxxx, including the former SME board (002/003, merged into the main board in 2021).
-MAIN_BOARD_PREFIXES = ("SH60", "SZ00")
+# Board-screened universes and their Qlib code prefixes: Shanghai 60xxxx and Shenzhen 00xxxx, including the former SME
+# board (002/003, merged into the main board in 2021).
+BOARD_PREFIXES = {"main": ("SH60", "SZ00"), "sh_main": ("SH60",)}
 MAIN_NEW_LISTING_EXCLUDED_DAYS = 60
 
 # Canonical bar columns each universe's membership is derived from, besides ``instrument``.
-UNIVERSE_COLUMNS = {
-    "csi300": ("in_csi300",),
-    "main": ("is_st", "listed_days"),
-    "all": (),
-}
+SCREEN_COLUMNS = ("is_st", "listed_days")
+UNIVERSE_COLUMNS = {"csi300": ("in_csi300",), "all": (), **dict.fromkeys(BOARD_PREFIXES, SCREEN_COLUMNS)}
 
 
 def validate_universe(universe: str) -> str:
@@ -34,9 +33,9 @@ def validate_universe(universe: str) -> str:
     return universe
 
 
-def is_main_board(instruments: Any) -> Any:
-    """Return a boolean Series marking Qlib instrument codes listed on the Shanghai or Shenzhen main board."""
-    return instruments.astype(str).str.upper().str.startswith(MAIN_BOARD_PREFIXES)
+def on_board(instruments: Any, universe: str) -> Any:
+    """Return a boolean Series marking Qlib instrument codes on the boards of a board-screened ``universe``."""
+    return instruments.astype(str).str.upper().str.startswith(BOARD_PREFIXES[universe])
 
 
 def universe_mask(frame: Any, universe: str) -> Any:
@@ -46,11 +45,11 @@ def universe_mask(frame: Any, universe: str) -> Any:
         return frame["instrument"].notna()
     if universe == "csi300":
         return frame["in_csi300"].fillna(False).astype(bool)
-    board = is_main_board(frame["instrument"])
+    board = on_board(frame["instrument"], universe)
     unknown_st = board & frame["is_st"].isna()
     if unknown_st.any():
         raise DataContractError(
-            "The main universe needs point-in-time ST history, which the canonical bars lack; "
+            f"The {universe} universe needs point-in-time ST history, which the canonical bars lack; "
             "run `rquant data sync` and `rquant data build-qlib` again to fetch Tushare namechange"
         )
     seasoned = frame["listed_days"].gt(MAIN_NEW_LISTING_EXCLUDED_DAYS)
