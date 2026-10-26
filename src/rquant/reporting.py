@@ -123,7 +123,7 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
                 )
             )
         markdown.append("")
-    markdown.extend(["## Limitations", "", *(f"- {item}" for item in LIMITATIONS), ""])
+    markdown.extend(["## Limitations", "", *(f"- {item}" for item in summary["limitations"]), ""])
     (run_dir / "report.md").write_text("\n".join(markdown), encoding="utf-8")
     return summary
 
