@@ -287,8 +287,8 @@ ST 状态按 Tushare `namechange` 的历史名称逐日判断（生效日即 `st
 `data/factors/` 并存。临时切换股票池用全局参数 `--universe`，它覆盖 `data.universe`：
 
 ```bash
-rquant --universe main factors build --factor-set Alpha158
-rquant --universe main walk-forward --model lgb --horizon 1d --factor-set Alpha158 --through 2026-10-23
+rquant --universe main factors build --factor-set qlib_alpha158
+rquant --universe main walk-forward --model lgb --horizon 1d --factor-set qlib_alpha158 --through 2026-10-23
 rquant report RUN_ID   # 自动按该滚动训练的股票池回测
 ```
 
