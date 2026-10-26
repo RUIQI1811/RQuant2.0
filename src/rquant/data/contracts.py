@@ -84,6 +84,9 @@ FUNDAMENTAL_ENDPOINT_FIELDS = {
         "cap_rese",
         "surplus_rese",
         "undistr_porfit",
+        # jkp153 (Jensen-Kelly-Pedersen characteristics) items.
+        "taxes_payable",
+        "defer_tax_liab",
     ),
     "cashflow": (
         *STATEMENT_KEY_FIELDS,
@@ -98,6 +101,11 @@ FUNDAMENTAL_ENDPOINT_FIELDS = {
         "n_cashflow_inv_act",
         "n_cash_flows_fnc_act",
         "c_cash_equ_end_period",
+        # jkp153 (Jensen-Kelly-Pedersen characteristics) items.
+        "c_recp_cap_contrib",
+        "c_recp_borrow",
+        "proc_issue_bonds",
+        "c_prepay_amt_borr",
     ),
 }
 FUNDAMENTAL_ENDPOINTS = tuple(FUNDAMENTAL_ENDPOINT_FIELDS)
