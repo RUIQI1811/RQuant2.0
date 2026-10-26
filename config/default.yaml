@@ -7,6 +7,8 @@ data:
   formal_start: 2010-01-01
   warmup_trading_days: 300
   through: null
+  # csi300 (point-in-time CSI300 members), main (Shanghai/Shenzhen main board without ChiNext, STAR, Beijing, ST names
+  # or the first 60 trading days after listing) or all. `rquant --universe main ...` overrides it for one command.
   universe: csi300
   benchmark: SH000300
   tushare_index_code: 399300.SZ

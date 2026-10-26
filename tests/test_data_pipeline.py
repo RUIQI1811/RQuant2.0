@@ -162,6 +162,57 @@ class DataPipelineTests(unittest.TestCase):
         self.assertTrue(first.in_csi300)
         self.assertTrue(np.isfinite(first.sector))
 
+    def _write_name_history(self) -> None:
+        pd = self.pd
+        manifest = json.loads((self.raw / "sync_manifest.json").read_text(encoding="utf-8"))
+        atomic_write_json(self.raw / "sync_manifest.json", {**manifest, "namechange_snapshot": "2020-01-06"})
+        path = self.raw / "namechange" / "snapshot=20200106" / "page=0000" / "data.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                ["000001.SZ", "深发展A", "19910403", "20200105", "19910403"],
+                ["000001.SZ", "ST发展", "20200106", None, "20200103"],
+                ["000002.SZ", "万科A", "20200103", None, "20200102"],
+            ],
+            columns=["ts_code", "name", "start_date", "end_date", "ann_date"],
+        ).to_parquet(path, index=False)
+        stock_basic_path = self.raw / "stock_basic" / "fixture" / "data.parquet"
+        stock_basic = pd.read_parquet(stock_basic_path)
+        stock_basic.loc[stock_basic["ts_code"].eq("000002.SZ"), "list_date"] = "20200103"
+        stock_basic.to_parquet(stock_basic_path, index=False)
+
+    def test_point_in_time_st_flags_and_listing_age(self) -> None:
+        self._write_name_history()
+        manifest = CanonicalBuilder(self.raw, self.canonical).build()
+        self.assertTrue(manifest["st_history"])
+        bars = self.pd.read_parquet(self.canonical / "bars").set_index(["instrument", "datetime"]).sort_index()
+        day = self.pd.Timestamp
+        self.assertFalse(bars.loc[("SZ000001", day("2020-01-02")), "is_st"])
+        self.assertTrue(bars.loc[("SZ000001", day("2020-01-06")), "is_st"])
+        self.assertFalse(bars.loc[("SZ000002", day("2020-01-06")), "is_st"])
+        self.assertEqual(1, bars.loc[("SZ000002", day("2020-01-03")), "listed_days"])
+        self.assertEqual(2, bars.loc[("SZ000002", day("2020-01-06")), "listed_days"])
+        # Listed in 1991, before the synced calendar: aged with weekdays before 2020-01-02.
+        self.assertGreater(bars.loc[("SZ000001", day("2020-01-02")), "listed_days"], 7000)
+
+        QlibProviderBuilder(self.canonical, self.qlib).build()
+        main = (self.qlib / "instruments" / "main.txt").read_text(encoding="utf-8")
+        # SZ000001 turns ST on 2020-01-06 and SZ000002 is a new listing, so only one member day remains.
+        self.assertEqual("SZ000001\t2020-01-02\t2020-01-02\n", main)
+
+    def test_canonical_without_name_history_leaves_st_unknown(self) -> None:
+        from rquant.universe import universe_mask
+
+        manifest = CanonicalBuilder(self.raw, self.canonical).build()
+        self.assertFalse(manifest["st_history"])
+        bars = self.pd.read_parquet(self.canonical / "bars")
+        self.assertTrue(bars["is_st"].isna().all())
+        self.assertTrue(universe_mask(bars, "csi300").any())
+        with self.assertRaisesRegex(DataContractError, "namechange"):
+            universe_mask(bars, "main")
+        QlibProviderBuilder(self.canonical, self.qlib).build()
+        self.assertFalse((self.qlib / "instruments" / "main.txt").exists())
+
     def test_invalid_ohlc_outside_csi300_is_excluded_and_audited(self) -> None:
         daily_path = self.raw / "daily" / "fixture" / "data.parquet"
         daily = self.pd.read_parquet(daily_path)
@@ -454,6 +505,8 @@ class CollectorResumeTests(unittest.TestCase):
             snapshot = Path(temporary, "index_member_all", "snapshot=20200103")
             self.assertTrue((snapshot / "status=N" / "page=0000" / "data.parquet").exists())
             self.assertTrue((snapshot / "status=Y" / "page=0000" / "data.parquet").exists())
+            self.assertTrue(Path(temporary, "namechange", "snapshot=20200103", "page=0000", "data.parquet").exists())
+            self.assertEqual("2020-01-03", first["namechange_snapshot"])
 
             second_stderr = io.StringIO()
             with redirect_stderr(second_stderr):

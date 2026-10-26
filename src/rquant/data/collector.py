@@ -16,9 +16,11 @@ from typing import Any
 
 from tqdm import tqdm
 
+from rquant.data.canonical import ts_code_to_qlib
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS, RAW_DAILY_ENDPOINTS
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, sha256_file, stable_hash
+from rquant.universe import MAIN_BOARD_PREFIXES
 
 # Tushare caps some statement responses at 100 rows without saying so; a window that reaches the cap is refetched
 # year by year instead of being trusted.
@@ -317,9 +319,9 @@ class TushareCollector:
             ]
             open_dates = completed_open_dates[-(warmup_trading_days + _formal_day_count(formal_start, through)) :]
             month_starts = _month_starts(fetch_start, through)
-            # One historical and one current industry-membership page are known up front. The total grows only
-            # when either query requires another page.
-            progress.total = 4 + len(open_dates) * len(RAW_DAILY_ENDPOINTS) + 1 + len(month_starts) + 2
+            # One historical and one current industry-membership page and one name-history page are known up front.
+            # The total grows only when a query requires another page.
+            progress.total = 4 + len(open_dates) * len(RAW_DAILY_ENDPOINTS) + 1 + len(month_starts) + 3
             progress.refresh()
 
             daily_requests = [
@@ -351,6 +353,7 @@ class TushareCollector:
                 )
 
             artifacts.extend(self._fetch_industry_history(fetch=fetch, progress=progress, snapshot_date=through))
+            artifacts.extend(self._fetch_name_history(fetch=fetch, progress=progress, snapshot_date=through))
             manifest = {
                 "status": "complete",
                 "formal_start": formal_start.isoformat(),
@@ -359,6 +362,7 @@ class TushareCollector:
                 "warmup_trading_days": warmup_trading_days,
                 "index_code": index_code,
                 "industry_snapshot": through.isoformat(),
+                "namechange_snapshot": through.isoformat(),
                 "max_requests_per_minute": self.rate_limiter.max_requests_per_minute,
                 "artifacts": len(artifacts),
                 "cached_artifacts": cached_artifacts,
@@ -539,7 +543,7 @@ class TushareCollector:
             raise DataContractError("Raw sync is not complete; finish `rquant data sync` first")
         if universe == "csi300":
             endpoint, column = "index_weight", "con_code"
-        elif universe == "all":
+        elif universe in ("main", "all"):
             endpoint, column = "stock_basic", "ts_code"
         else:
             raise DataContractError(f"Unsupported fundamental universe: {universe!r}")
@@ -553,6 +557,9 @@ class TushareCollector:
         if endpoint == "index_weight" and index_code and "index_code" in frame.columns:
             frame = frame[frame["index_code"] == index_code]
         codes = sorted(str(code) for code in frame[column].dropna().unique())
+        if universe == "main":
+            # ST and listing-age filters change over time, so every main-board stock may enter the universe.
+            codes = [code for code in codes if ts_code_to_qlib(code).startswith(MAIN_BOARD_PREFIXES)]
         if not codes:
             raise DataContractError(f"No stocks found for fundamental universe {universe}")
         return codes
@@ -604,6 +611,24 @@ class TushareCollector:
                     "refusing a silently truncated result"
                 )
         return artifacts
+
+    @staticmethod
+    def _fetch_name_history(*, fetch: Any, progress: Any, snapshot_date: date) -> list[FetchArtifact]:
+        """Fetch every A share's name history, which marks the point-in-time ST and delisting periods."""
+        artifacts: list[FetchArtifact] = []
+        limit = 1000
+        for offset in range(0, 500_000, limit):
+            artifact = fetch(
+                "namechange",
+                {"fields": "ts_code,name,start_date,end_date,ann_date,change_reason", "offset": offset, "limit": limit},
+                f"snapshot={snapshot_date:%Y%m%d}/page={offset // limit:04d}",
+            )
+            artifacts.append(artifact)
+            if artifact.rows < limit:
+                return artifacts
+            progress.total += 1
+            progress.refresh()
+        raise DataContractError("namechange pagination exceeded 500,000 rows; refusing a silently truncated result")
 
     @staticmethod
     def _open_dates(calendar_path: Path) -> list[date]:

@@ -21,6 +21,7 @@ from rquant.factors.libraries.base import CANONICAL_INPUT_FIELDS
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
 from rquant.io import atomic_replace_directory as _atomic_replace_directory
 from rquant.io import atomic_write_json, sha256_file, stable_hash
+from rquant.universe import UNIVERSE_COLUMNS, universe_mask, validate_universe
 
 INPUT_FIELDS = CANONICAL_INPUT_FIELDS
 FACTOR_ENGINE_VERSION = 3
@@ -503,6 +504,8 @@ class PanelFactorEngine:
             pd,
         )
         panels.update(external)
+        # Cross-sectional panel operators use the research universe's members of each day.
+        panels["universe"] = pd.DataFrame(output_mask, index=dates, columns=instruments)
 
         output_root = Path(output_root)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -817,9 +820,6 @@ def _read_selected_columns(
     return pd.concat(parts, axis=1)
 
 
-SUPPORTED_UNIVERSES = ("csi300", "all")
-
-
 def _load_canonical_panels(
     pd: Any,
     bars_path: Path,
@@ -835,12 +835,9 @@ def _load_canonical_panels(
     every canonical bar of every instrument that is ever in the universe. Membership only decides which computed rows
     are published.
     """
-    if universe not in SUPPORTED_UNIVERSES:
-        raise DataContractError(f"Unsupported factor universe {universe!r}; expected one of {SUPPORTED_UNIVERSES}")
-    columns = ["datetime", "instrument", *input_fields]
-    if universe == "csi300":
-        columns.append("in_csi300")
-    bars = pd.read_parquet(bars_path, columns=columns)
+    validate_universe(universe)
+    columns = ["datetime", "instrument", *input_fields, *UNIVERSE_COLUMNS[universe]]
+    bars = pd.read_parquet(bars_path, columns=list(dict.fromkeys(columns)))
     bars["datetime"] = pd.to_datetime(bars["datetime"])
     if start:
         bars = bars[bars["datetime"] >= pd.Timestamp(start)]
@@ -848,10 +845,7 @@ def _load_canonical_panels(
         bars = bars[bars["datetime"] <= pd.Timestamp(end)]
     if bars.empty:
         raise DataContractError("No canonical rows in requested factor range")
-    if universe == "csi300":
-        bars = bars.assign(in_universe=bars["in_csi300"].fillna(False).astype(bool))
-    else:
-        bars = bars.assign(in_universe=True)
+    bars = bars.assign(in_universe=universe_mask(bars, universe).to_numpy())
     members = bars.loc[bars["in_universe"], "instrument"].unique()
     if not len(members):
         raise DataContractError(f"No canonical rows for universe {universe}")

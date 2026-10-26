@@ -25,6 +25,7 @@ class ProjectPaths:
         *,
         data_root: str | Path = "data",
         runs_root: str | Path = "runs",
+        universe: str = "csi300",
     ) -> ProjectPaths:
         root_path = Path(root).expanduser().resolve()
         data_path = _under_root(root_path, data_root)
@@ -35,7 +36,8 @@ class ProjectPaths:
             raw=data_path / "raw",
             canonical=data_path / "canonical",
             qlib=data_path / "qlib",
-            factors=data_path / "factors",
+            # Factor stores hold only universe rows, so each universe other than the original CSI300 gets its own root.
+            factors=data_path / ("factors" if universe == "csi300" else f"factors-{universe}"),
             cache=data_path / "cache",
             runs=runs_path,
         )
@@ -79,4 +81,5 @@ def resolve_paths(config: dict[str, Any], root: str | Path) -> ProjectPaths:
         root,
         data_root=project.get("data_root", "data"),
         runs_root=project.get("runs_root", "runs"),
+        universe=str(config.get("data", {}).get("universe", "csi300")),
     )
