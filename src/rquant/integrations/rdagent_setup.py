@@ -98,7 +98,9 @@ def patch_embedding_batches(backend: Path) -> None:
     text = backup.read_text(encoding="utf-8")
     if EMBEDDING_ORIGINAL not in text:
         raise ValueError(f"RD-Agent LiteLLM backend no longer matches the embedding patch: {backend}")
-    backend.write_text(text.replace(EMBEDDING_ORIGINAL, EMBEDDING_BATCHED), encoding="utf-8")
+    patched = text.replace(EMBEDDING_ORIGINAL, EMBEDDING_BATCHED)
+    if backend.read_text(encoding="utf-8") != patched:
+        backend.write_text(patched, encoding="utf-8")
 
 
 def convert_data(bundle: Path, workdir: Path, readme: Path) -> dict[str, int]:
@@ -216,7 +218,11 @@ def main(argv: list[str] | None = None) -> int:
     litellm_backend = experiment_root.parents[2] / "oai" / "backend" / "litellm.py"
     patch_embedding_batches(litellm_backend)
     patched.append(str(litellm_backend))
-    rows = convert_data(bundle, workdir, experiment_root / "factor_data_template" / "README.md")
+    # The bundle's README describes RQuant's columns; bundles exported before it existed fall back to RD-Agent's.
+    readme = bundle / "README.md"
+    if not readme.exists():
+        readme = experiment_root / "factor_data_template" / "README.md"
+    rows = convert_data(bundle, workdir, readme)
 
     env_path = workdir / ".env"
     if env_path.exists():

@@ -16,8 +16,12 @@ RD-Agent 只用固定的 train/valid/test 三段，并且**用 test 段的 IC �
 - 2022 年以后只留给 RQuant 的 walk-forward；拿挖到的因子报告结果时，只有 2022 年以后的年份算样本外。
 
 导出的股票是挖掘窗口内任意时点的沪深 300 成分（历史时点可知），每只股票保留它在导出范围内的全部行情，
-这样滚动窗口有预热数据；字段和 RD-Agent 自带的 `daily_pv.h5` 一致：`$open $close $high $low $volume $factor`，
-价格为后复权（`$close / $factor` 是原始价格）。
+这样滚动窗口有预热数据。字段是 `$open $close $high $low $volume $amount $vwap`：价格为后复权，每只股票首日
+收盘价归一为 1；`$amount` 是成交额（元，不复权），`$volume * $vwap = $amount`。
+
+RD-Agent 自带的数据还有复权因子 `$factor`，它的数据说明把它写成 "factor value of the stock"。第一次 16 轮试跑中，
+LLM 有一半轮次把它当成基本面数据来构造因子，挖出来的东西只是在测除权事件，所以导出时去掉了它，并用 bundle 里的
+`README.md` 替换 RD-Agent 的数据说明（它会原样进入写因子的提示词）。
 
 `rdagent_setup.py` 会改 RD-Agent 1.0.0 的三个 Qlib 因子模板：
 
@@ -75,6 +79,7 @@ rquant rdagent export           # 写入 data/rdagent/
 ```text
 factor_source_data/daily_pv.parquet         全量：挖掘窗口内的沪深 300 历史成分
 factor_source_data_debug/daily_pv.parquet   调试：最后两年、前 100 只
+README.md                                   给 LLM 的数据说明（替换 RD-Agent 自带的）
 rdagent.env                                 .env 模板（千问 / 百炼，API key 留空）
 rdagent_setup.py                            在 WSL 里运行的准备脚本
 manifest.json                               窗口、行数、哈希和 Qlib provider 指纹

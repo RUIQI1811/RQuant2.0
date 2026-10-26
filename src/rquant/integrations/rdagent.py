@@ -13,8 +13,44 @@ from rquant.qlib_ext.runtime import qlib_init_kwargs
 
 # RD-Agent ships its Qlib factor templates inside the package, so the setup script patches one exact release.
 RDAGENT_VERSION = "1.0.0"
-# The columns of RD-Agent's own daily_pv.h5 (factor_data_template/generate.py): adjusted prices and the adjustment.
-PV_FIELDS = ("$open", "$close", "$high", "$low", "$volume", "$factor")
+# RD-Agent's own daily_pv.h5 also carries $factor, which its README calls "factor value of the stock". In a 16-loop
+# run the LLM treated that adjustment factor as fundamental data in half the loops, so it is left out; turnover and
+# VWAP give the model more to work with than a dividend-adjustment series.
+PV_FIELDS = ("$open", "$close", "$high", "$low", "$volume", "$amount", "$vwap")
+# Replaces RD-Agent's factor_data_template/README.md, which the factor prompts quote as the data description.
+DATA_README = """\
+# How to read files.
+For example, if you want to read `filename.h5`
+```Python
+import pandas as pd
+df = pd.read_hdf("filename.h5", key="data")
+```
+NOTE: **key is always "data" for all hdf5 files **.
+
+# Here is a short description about the data
+
+| Filename       | Description                                                      |
+| -------------- | -----------------------------------------------------------------|
+| "daily_pv.h5"  | Adjusted daily price and volume data of China A-share stocks.    |
+
+# For different data, We have some basic knowledge for them
+
+## Daily price and volume data
+The index is a MultiIndex of (datetime, instrument). The rows cover every stock that was a CSI 300 member at any time
+in the period, including the days before it joined and after it left the index.
+
+Prices are backward-adjusted for dividends and splits, so returns computed from them are total returns. Each stock's
+adjusted close starts at 1.0 on its first day, so price levels are not comparable across stocks or meaningful on their
+own; use ratios, returns and ranks instead. There is no fundamental, financial-statement or index-membership data.
+
+$open: adjusted open price of the stock on that day.
+$close: adjusted close price of the stock on that day.
+$high: adjusted high price of the stock on that day.
+$low: adjusted low price of the stock on that day.
+$volume: traded shares on that day, scaled inversely to the price adjustment so that $volume * $vwap equals $amount.
+$amount: traded value on that day in CNY (not adjusted). Use it for liquidity and size of trading.
+$vwap: adjusted volume-weighted average price of the stock on that day.
+"""
 SETUP_SCRIPT = Path(__file__).with_name("rdagent_setup.py")
 
 
@@ -156,6 +192,7 @@ class RDAgentExporter:
             frame.to_parquet(path)
         # RD-Agent reads this file on Linux; Windows line endings would leave a CR at the end of every value.
         (self.output_root / "rdagent.env").write_text(env_template(window), encoding="utf-8", newline="\n")
+        (self.output_root / "README.md").write_text(DATA_README, encoding="utf-8", newline="\n")
         shutil.copyfile(SETUP_SCRIPT, self.output_root / SETUP_SCRIPT.name)
 
         with qlib_manifest.open("r", encoding="utf-8") as handle:

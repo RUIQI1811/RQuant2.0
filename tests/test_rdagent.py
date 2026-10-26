@@ -165,7 +165,7 @@ class ExportTests(unittest.TestCase):
         for offset, name in enumerate(members):
             directory = self.qlib / "features" / name.lower()
             directory.mkdir(parents=True)
-            for field in ("open", "close", "high", "low", "volume", "factor"):
+            for field in ("open", "close", "high", "low", "volume", "amount", "vwap", "factor"):
                 values = np.arange(len(calendar), dtype=np.float32) + offset * 100
                 np.concatenate((np.asarray([0], dtype=np.float32), values)).tofile(directory / f"{field}.day.bin")
         (self.qlib / "manifest.json").write_text(json.dumps({"fingerprint": "qlib-v1"}), encoding="utf-8")
@@ -202,6 +202,10 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(2, manifest["full"]["instruments"])
         self.assertEqual("2020-03-13", manifest["full"]["end"])
         self.assertTrue((output / "rdagent_setup.py").exists())
+        self.assertNotIn("$factor", list(frame.columns))
+        readme = (output / "README.md").read_text(encoding="utf-8")
+        for field in PV_FIELDS:
+            self.assertIn(f"{field}:", readme)
         self.assertNotIn(b"\r", (output / "rdagent.env").read_bytes())
         env_lines = (output / "rdagent.env").read_text(encoding="utf-8").splitlines()
         self.assertIn("QLIB_FACTOR_TEST_END=2020-03-13", env_lines)
@@ -225,16 +229,14 @@ class ExportTests(unittest.TestCase):
     def test_setup_converts_bundle_to_rdagent_hdf5(self) -> None:
         output = self.root / "bundle"
         RDAgentExporter(self.qlib, output).export(self.window, debug_instruments=1)
-        readme = self.root / "README.md"
-        readme.write_text("data description", encoding="utf-8")
         workdir = self.root / "work"
 
-        rows = convert_data(output, workdir, readme)
+        rows = convert_data(output, workdir, output / "README.md")
 
         target = workdir / "git_ignore_folder" / "factor_implementation_source_data"
         restored = self.pd.read_hdf(target / "daily_pv.h5", key="data")
         self.assertEqual(rows["git_ignore_folder/factor_implementation_source_data"], len(restored))
-        self.assertEqual("data description", (target / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("$amount:", (target / "README.md").read_text(encoding="utf-8"))
         self.assertTrue(
             (workdir / "git_ignore_folder" / "factor_implementation_source_data_debug" / "daily_pv.h5").exists()
         )
