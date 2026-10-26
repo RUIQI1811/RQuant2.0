@@ -139,7 +139,7 @@ class FactorRunnerPatchTests(unittest.TestCase):
             patch_factor_runner(runner, source)
             patch_factor_runner(runner, source)
             text = runner.read_text(encoding="utf-8")
-            self.assertEqual(1, text.count("screen_new_factors(new_factors, SOTA_factor)"))
+            self.assertEqual(1, text.count("screen_new_factors(new_factors, SOTA_factor, codes=codes)"))
             self.assertNotIn(".dropna()", text)
             self.assertEqual(source.read_text(encoding="utf-8"), (Path(temporary) / "rquant_novelty.py").read_text())
 
@@ -184,6 +184,30 @@ class NoveltyScreenTests(unittest.TestCase):
         self.assertTrue(rejected[0].startswith("near_copy: rank correlation -0.9"))
         self.assertIn("50%", rejected[1])
 
+    def test_rejects_market_wide_values_identities_and_look_ahead(self) -> None:
+        import numpy as np
+
+        from rquant.integrations.rdagent_novelty import screen_new_factors
+
+        days = self.index.get_level_values("datetime")
+        rng = np.random.default_rng(1)
+        market = self.pd.Series(rng.normal(size=days.nunique()), index=days.unique())
+        new = self.pd.DataFrame(
+            {
+                "market_skew": market.reindex(days).to_numpy(),
+                "amount_ratio": 1.0 + rng.normal(scale=1e-7, size=len(self.index)),
+                "future_ic": rng.normal(size=len(self.index)),
+                "fresh": rng.normal(size=len(self.index)),
+            },
+            index=self.index,
+        )
+        codes = {"future_ic": "ret = df['$close'].shift(-5) / df['$close'] - 1\n", "fresh": "x.shift(1)\n"}
+        kept, rejected = screen_new_factors(new, None, self.reference, codes=codes)
+        self.assertEqual(["fresh"], list(kept.columns))
+        self.assertTrue(rejected[0].startswith("market_skew: on a typical day only 2% of stocks"))
+        self.assertTrue(rejected[1].startswith("amount_ratio: its values are practically identical"))
+        self.assertIn("reads future rows ('shift(-')", rejected[2])
+
     def test_compares_with_accepted_factors_without_reference(self) -> None:
         from rquant.integrations.rdagent_novelty import screen_new_factors
 
@@ -198,6 +222,22 @@ class NoveltyScreenTests(unittest.TestCase):
         left = self.pd.DataFrame({"a": self.base}, index=self.index)
         right = self.pd.DataFrame({"b": self.base**3 * 10 + 5}, index=self.index)
         self.assertAlmostEqual(1.0, float(rank_correlation(left, right).loc["a", "b"]), places=6)
+
+
+class CacheRetirementTests(unittest.TestCase):
+    def test_cache_moves_aside_only_when_settings_change(self) -> None:
+        from rquant.integrations.rdagent_setup import retire_stale_cache
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workdir = Path(temporary)
+            (workdir / "pickle_cache").mkdir()
+            self.assertIsNotNone(retire_stale_cache(workdir, {"label": "10d"}))
+            (workdir / "pickle_cache").mkdir()
+            self.assertIsNone(retire_stale_cache(workdir, {"label": "10d"}))
+            self.assertTrue((workdir / "pickle_cache").exists())
+            moved = retire_stale_cache(workdir, {"label": "5d"})
+            self.assertTrue(moved.name.startswith("pickle_cache.stale-"))
+            self.assertFalse((workdir / "pickle_cache").exists())
 
 
 class WriteEnvTests(unittest.TestCase):

@@ -61,6 +61,12 @@ volatility, moving-average, candlestick-shape, VWAP-ratio and volume-ratio varia
 for different economic mechanisms instead. Directions documented for China A-shares include splitting returns into
 overnight ($open over the previous $close) and intraday ($close over $open) parts, which behave very differently,
 and conditioning momentum or reversal on how dispersed returns are across stocks.
+
+Factors are also rejected when their code reads future rows (`shift(-n)`, `center=True`) or when they barely differ
+across stocks on a day: a market-wide value repeated for every stock (a cross-sectional skewness, a market regime
+weight), or a ratio that is 1 by construction such as $amount / ($volume * $vwap). Compute every rolling statistic
+over time within each instrument, for example `df.groupby(level="instrument")[col].rolling(20)`, never across
+instruments after a transpose.
 """
 SETUP_SCRIPT = Path(__file__).with_name("rdagent_setup.py")
 NOVELTY_MODULE = Path(__file__).with_name("rdagent_novelty.py")

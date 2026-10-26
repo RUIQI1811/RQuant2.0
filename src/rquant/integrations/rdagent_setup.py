@@ -123,7 +123,12 @@ DEDUPLICATION_ORIGINAL = """            if SOTA_factor is not None and not SOTA_
 DEDUPLICATION_SCREENED = """            # RQuant patch: screen against RQuant's factor libraries and the accepted factors, keep missing values.
             from rdagent.scenarios.qlib.developer.rquant_novelty import screen_new_factors
 
-            new_factors, rejected = screen_new_factors(new_factors, SOTA_factor)
+            codes = {
+                task.factor_name: workspace.file_dict.get("factor.py", "")
+                for task, workspace in zip(exp.sub_tasks, exp.sub_workspace_list)
+                if workspace is not None
+            }
+            new_factors, rejected = screen_new_factors(new_factors, SOTA_factor, codes=codes)
             if rejected:
                 logger.info("RQuant novelty screen rejected: " + "; ".join(rejected))
             if new_factors.empty:
@@ -160,6 +165,28 @@ def _patch_source(path: Path, original: str, replacement: str) -> None:
     patched = text.replace(original, replacement)
     if path.read_text(encoding="utf-8") != patched:
         path.write_text(patched, encoding="utf-8")
+
+
+# RD-Agent caches backtest results under <workdir>/pickle_cache keyed only by the factor tasks, not by the templates,
+# so after a label change the Alpha158 baseline (which has no tasks) silently came back from the old label's cache.
+CACHE_FOLDER = "pickle_cache"
+SETUP_RECORD = ".rquant_setup.json"
+
+
+def retire_stale_cache(workdir: Path, settings: dict[str, object]) -> Path | None:
+    """Move RD-Agent's result cache aside when the backtest settings changed since the last setup."""
+    record = workdir / SETUP_RECORD
+    previous = json.loads(record.read_text(encoding="utf-8")) if record.exists() else None
+    cache = workdir / CACHE_FOLDER
+    moved = None
+    if previous != settings and cache.exists():
+        from datetime import datetime, timezone
+
+        # timezone.utc, not datetime.UTC: RD-Agent's env runs Python 3.10.
+        moved = cache.with_name(f"{CACHE_FOLDER}.stale-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}")  # noqa: UP017
+        cache.rename(moved)
+    record.write_text(json.dumps(settings, indent=2, sort_keys=True), encoding="utf-8")
+    return moved
 
 
 def convert_data(bundle: Path, workdir: Path, readme: Path) -> dict[str, int]:
@@ -286,6 +313,18 @@ def main(argv: list[str] | None = None) -> int:
     factor_runner = experiment_root.parent / "developer" / "factor_runner.py"
     patch_factor_runner(factor_runner, bundle / "rdagent_novelty.py")
     patched.append(str(factor_runner))
+    import hashlib
+
+    settings = {
+        "label": label_expression(args.label_days),
+        "threads": args.threads,
+        "templates": [list(pair) for pair in TEMPLATE_REPLACEMENTS],
+        "novelty": hashlib.sha256((bundle / "rdagent_novelty.py").read_bytes()).hexdigest(),
+        "bundle": manifest.get("fingerprint"),
+    }
+    retired = retire_stale_cache(workdir, settings)
+    if retired is not None:
+        print(f"backtest settings changed: moved RD-Agent's result cache to {retired} (delete it when done)")
     reference = bundle / "reference_factors.parquet"
     if reference.exists():
         target = workdir / "git_ignore_folder" / "rquant_reference_factors.parquet"
