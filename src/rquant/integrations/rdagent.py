@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from rquant.errors import DataContractError, DependencyError
+from rquant.factors.catalog import get_catalog
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.qlib_ext.runtime import qlib_init_kwargs
 
@@ -292,7 +293,12 @@ class RDAgentExporter:
             frame = pd.concat(parts, ignore_index=True)
             frame["datetime"] = pd.to_datetime(frame["datetime"])
             frame = frame.set_index(["datetime", "instrument"]).sort_index().astype("float32")
-            frames.append(frame.add_prefix(f"{name}."))
+            # A handful of extreme values overflow float32; ranks only need finite values.
+            frame = frame.replace([float("inf"), float("-inf")], float("nan"))
+            # Name columns by the library's own factor names (STD5, alpha012) so rejections read well to the LLM.
+            source_names = {spec.canonical_name: spec.source_name for spec in get_catalog().select(name)}
+            frame.columns = [f"{name}.{source_names.get(column, column)}" for column in frame.columns]
+            frames.append(frame)
             sets[name] = {"fingerprint": manifest.get("fingerprint"), "factors": int(frame.shape[1])}
         return pd.concat(frames, axis=1).sort_index(), sets
 
