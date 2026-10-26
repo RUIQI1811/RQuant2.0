@@ -37,11 +37,12 @@ rquant factors build --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
-rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars 与 jq240 需要
+rquant data sync-fundamentals --through 2026-08-04   # 仅 china_chars、jq240 与 oap 需要
 rquant data build-reference
 rquant factors build --factor-set china_chars
 rquant factors build --factor-set size_value_china    # 只需 build-reference，不需要财报
 rquant factors build --factor-set jq240
+rquant factors build --factor-set oap
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -117,7 +118,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 1297 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240）；
+- 1439 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -321,6 +322,8 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
+- `oap`：`oap_001` 至 `oap_142`，共 142 列，Open Source Asset Pricing（Chen-Zimmermann）212 个预测信号中能用 Tushare
+  构造的部分，见下文“Open Source Asset Pricing 因子集 oap”。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -353,6 +356,7 @@ src/rquant/factors/
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
     ├── jq240.py                         # 233 个按聚宽因子库定义重写的日频因子
+    ├── oap.py                           # 142 个按 Open Source Asset Pricing 定义重写的日频信号
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -641,6 +645,43 @@ rquant data build-reference
 rquant factors build --factor-set jq240
 rquant factors validate --factor-set jq240
 rquant walk-forward --model lgb --horizon 1d --factor-set jq240
+```
+
+### Open Source Asset Pricing 因子集 oap
+
+`oap` 按 Open Source Asset Pricing（Chen and Zimmermann, “Open Source Cross-Sectional Asset Pricing”，openassetpricing.com）
+`SignalDoc` 中 212 个 Predictor 信号的公开定义独立重写，不使用其代码或数据，只用 Tushare，定义锁定在
+`src/rquant/factors/libraries/oap.py`，来源名就是 OAP 简称（如 `Mom12m`、`AssetGrowth`、`IdioVol3F`）。114 个 Placebo
+信号不在其中。142 个已实现：价格 36、交易 11、会计 84（估值、盈利、投资与应计、R&D）、其他 4、事件 7（含
+AnnouncementReturn）。
+
+- 月度定义改为日频：一个月 21 个交易日，一年 252 个；需要月收益序列的信号（Beta、Coskewness、std_turn、VolumeTrend、
+  ResidualMomentum、BetaTailRisk、VarCF 等）在以当日结尾、互不重叠的 21 日块上计算，因此每天更新；
+- 财报沿用 `china_chars` 的季度网格（首次披露值、公告日后且更早报告期均已公告才可用）：Compustat 年度流量改为最近四个
+  单季之和，资产负债项取最近报告期，“一年前”为四个季度前；Compustat 科目与 Tushare 字段的对应见 `ITEMS`；
+- 市值为日度总市值；股利为 daily_basic 的 `dv_ttm` 乘总市值，过去 12 个月股利总额变化超过 5% 的日子视为一次派息变动，
+  DivSeason/DivYieldST 以 11–12 个月前是否有变动判断下月是否派息；需要剔除送转的股数（ShareIss1Y/5Y、PS）用
+  总股本 × 不复权价 / 复权价；
+- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日沪深 300 成分股，行业为申万一级；
+- 美股样本过滤（股价低于 5 美元、交易所、股票代码、SIC 金融业剔除等）不再使用；定义本身的限制保留（FirmAgeMom 只取最年轻
+  五分之一，MomVol 只取换手率最高三分之一）；美国特有常数换成 A 股口径（法定税率 2008 年前 33%、之后 25%；ShareVol
+  用沪深 300 换手率三分位代替美股 5%/10% 阈值）。
+
+未实现的 70 个及原因记录在 `OAP_SKIPPED`：分析师预期与评级 20 个（IBES）、13F 机构持仓 8 个、个股期权 9 个，以及
+专利、广告费、员工数、订单储备、养老金、分部数据、信用评级、融券余额、PIN、股份回购、递延收入（2018–2020 年预收款项
+改为合同负债）、需要 8 年 R&D 的 RDAbility（Tushare 研发费用 2018 年起才单列）、11 年以上的季节性（行情从 2008 年开始）等。
+R&D 类信号（RD、RDcap、SurpriseRD、RDIPO）在 2018 年以前为空。
+
+`oap` 用到的现金流量表字段（吸收投资、取得借款、发行债券、偿还债务收到/支付的现金）和资产负债表字段（应交税费、递延所得税
+负债）与 `jkp153` 相同，新增字段后需重新 `data sync-fundamentals` 与 `data build-reference`，已构建的
+`china_chars`、`jq240` 也要重建。`tests/test_oap.py` 用截断数据重算、直接公式、派息事件与截面成分股回归验证。
+
+```bash
+rquant data sync-fundamentals --through 2026-08-04
+rquant data build-reference
+rquant factors build --factor-set oap
+rquant factors validate --factor-set oap
+rquant walk-forward --model lgb --horizon 1d --factor-set oap
 ```
 
 ### 验证因子

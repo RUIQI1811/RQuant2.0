@@ -58,7 +58,7 @@ class SizeValueChinaCatalogTests(unittest.TestCase):
         self.assertEqual(21, len(names))
         self.assertEqual(("svc_001", "svc_021"), (names[0], names[-1]))
         self.assertEqual(len(set(SIZE_VALUE_CHINA_NAMES)), len(SIZE_VALUE_CHINA_NAMES))
-        self.assertEqual(1297, len(catalog.specs))
+        self.assertEqual(1439, len(catalog.specs))
 
     def test_every_characteristic_has_a_calculator(self) -> None:
         for name in ("size", "ep", "abturn"):
