@@ -287,7 +287,8 @@ class CanonicalBuilder:
         if not snapshot:
             return None
         snapshot_root = self.raw_root / "namechange" / f"snapshot={snapshot.replace('-', '')}"
-        paths = sorted(snapshot_root.glob("**/data.parquet"))
+        # One partition per stock; older paged partitions in the same snapshot are incomplete and ignored.
+        paths = sorted(snapshot_root.glob("ts_code=*/data.parquet"))
         if not paths:
             raise DataContractError(f"Name-change snapshot from sync manifest does not exist: {snapshot_root}")
         frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True, sort=False)

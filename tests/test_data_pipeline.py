@@ -166,7 +166,7 @@ class DataPipelineTests(unittest.TestCase):
         pd = self.pd
         manifest = json.loads((self.raw / "sync_manifest.json").read_text(encoding="utf-8"))
         atomic_write_json(self.raw / "sync_manifest.json", {**manifest, "namechange_snapshot": "2020-01-06"})
-        path = self.raw / "namechange" / "snapshot=20200106" / "page=0000" / "data.parquet"
+        path = self.raw / "namechange" / "snapshot=20200106" / "ts_code=fixture" / "data.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(
             [
@@ -468,6 +468,7 @@ class CollectorResumeTests(unittest.TestCase):
         class Client:
             def __init__(self) -> None:
                 self.industry_queries: list[dict[str, object]] = []
+                self.name_queries: list[object] = []
 
             def __getattr__(self, endpoint: str) -> object:
                 def fetch(**query: object) -> object:
@@ -479,6 +480,16 @@ class CollectorResumeTests(unittest.TestCase):
                     if endpoint == "index_member_all":
                         self.industry_queries.append(query)
                         return pd.DataFrame([["000001.SZ"]], columns=["ts_code"])
+                    if endpoint == "namechange":
+                        self.name_queries.append(query["ts_code"])
+                        # A row without an announcement date must not break the partition's date range.
+                        return pd.DataFrame(
+                            [
+                                [query["ts_code"], "平安银行", "20120801", "20120731"],
+                                [query["ts_code"], "深发展A", "19910403", float("nan")],
+                            ],
+                            columns=["ts_code", "name", "start_date", "ann_date"],
+                        )
                     if "trade_date" in query:
                         return pd.DataFrame([["000001.SZ", query["trade_date"]]], columns=["ts_code", "trade_date"])
                     return pd.DataFrame()
@@ -505,7 +516,9 @@ class CollectorResumeTests(unittest.TestCase):
             snapshot = Path(temporary, "index_member_all", "snapshot=20200103")
             self.assertTrue((snapshot / "status=N" / "page=0000" / "data.parquet").exists())
             self.assertTrue((snapshot / "status=Y" / "page=0000" / "data.parquet").exists())
-            self.assertTrue(Path(temporary, "namechange", "snapshot=20200103", "page=0000", "data.parquet").exists())
+            names = Path(temporary, "namechange", "snapshot=20200103", "ts_code=000001.SZ", "data.parquet")
+            self.assertEqual("000001.SZ", pd.read_parquet(names)["ts_code"].iloc[0])
+            self.assertEqual(["000001.SZ"], client.name_queries)
             self.assertEqual("2020-01-03", first["namechange_snapshot"])
 
             second_stderr = io.StringIO()
@@ -520,6 +533,7 @@ class CollectorResumeTests(unittest.TestCase):
             self.assertEqual(0, second["fetched_artifacts"])
             self.assertIn(f"cached={second['artifacts']} fetched=0", second_stderr.getvalue())
             self.assertEqual(2, len(client.industry_queries))
+            self.assertEqual(["000001.SZ"], client.name_queries)
 
     def test_concurrent_sync_matches_sequential_fingerprint_and_stops_on_failure(self) -> None:
         import pandas as pd

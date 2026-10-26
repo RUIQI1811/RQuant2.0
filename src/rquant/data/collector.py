@@ -200,8 +200,10 @@ class TushareCollector:
         date_column = next(
             (name for name in ("trade_date", "cal_date", "in_date", "ann_date") if name in frame.columns), None
         )
-        min_date = str(frame[date_column].min()) if date_column and not frame.empty else None
-        max_date = str(frame[date_column].max()) if date_column and not frame.empty else None
+        # Some endpoints (namechange) leave the date empty on a few rows.
+        dates = frame[date_column].dropna().astype(str) if date_column else None
+        min_date = dates.min() if dates is not None and len(dates) else None
+        max_date = dates.max() if dates is not None and len(dates) else None
         artifact = FetchArtifact(
             endpoint=endpoint,
             query=query,
@@ -319,9 +321,9 @@ class TushareCollector:
             ]
             open_dates = completed_open_dates[-(warmup_trading_days + _formal_day_count(formal_start, through)) :]
             month_starts = _month_starts(fetch_start, through)
-            # One historical and one current industry-membership page and one name-history page are known up front.
-            # The total grows only when a query requires another page.
-            progress.total = 4 + len(open_dates) * len(RAW_DAILY_ENDPOINTS) + 1 + len(month_starts) + 3
+            # One historical and one current industry-membership page are known up front. The total grows only
+            # when either query requires another page, and once per stock for the name histories.
+            progress.total = 4 + len(open_dates) * len(RAW_DAILY_ENDPOINTS) + 1 + len(month_starts) + 2
             progress.refresh()
 
             daily_requests = [
@@ -329,7 +331,8 @@ class TushareCollector:
                 for trade_date in open_dates
                 for endpoint in RAW_DAILY_ENDPOINTS
             ]
-            artifacts.extend(self._fetch_daily_partitions(daily_requests, fetch=fetch, workers=workers))
+            daily_artifacts = self._fetch_daily_partitions(daily_requests, fetch=fetch, workers=workers)
+            artifacts.extend(daily_artifacts)
 
             artifacts.append(
                 fetch(
@@ -353,7 +356,10 @@ class TushareCollector:
                 )
 
             artifacts.extend(self._fetch_industry_history(fetch=fetch, progress=progress, snapshot_date=through))
-            artifacts.extend(self._fetch_name_history(fetch=fetch, progress=progress, snapshot_date=through))
+            codes = self._stock_codes([*artifacts[:3], *daily_artifacts])
+            progress.total += len(codes)
+            progress.refresh()
+            artifacts.extend(self._fetch_name_history(codes, fetch=fetch, workers=workers, snapshot_date=through))
             manifest = {
                 "status": "complete",
                 "formal_start": formal_start.isoformat(),
@@ -579,15 +585,7 @@ class TushareCollector:
             # Every open trading day has quotes; an empty answer means "not published yet".
             return fetch(endpoint, {"trade_date": query_date}, f"trade_date={query_date}", require_rows=True)
 
-        if workers == 1:
-            return [fetch_one(request) for request in requests]
-        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-sync")
-        futures = [executor.submit(fetch_one, request) for request in requests]
-        try:
-            return [future.result() for future in futures]
-        finally:
-            # On the first failure, stop queued requests instead of draining the whole history.
-            executor.shutdown(wait=True, cancel_futures=True)
+        return _map_in_order(fetch_one, requests, workers)
 
     def _fetch_industry_history(self, *, fetch: Any, progress: Any, snapshot_date: date) -> list[FetchArtifact]:
         artifacts: list[FetchArtifact] = []
@@ -613,22 +611,41 @@ class TushareCollector:
         return artifacts
 
     @staticmethod
-    def _fetch_name_history(*, fetch: Any, progress: Any, snapshot_date: date) -> list[FetchArtifact]:
-        """Fetch every A share's name history, which marks the point-in-time ST and delisting periods."""
-        artifacts: list[FetchArtifact] = []
-        limit = 1000
-        for offset in range(0, 500_000, limit):
-            artifact = fetch(
+    def _stock_codes(artifacts: list[FetchArtifact]) -> list[str]:
+        """Every Tushare code in the given stock_basic and daily partitions.
+
+        The daily partitions add stocks listed after the cached stock_basic snapshot.
+        """
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise DependencyError("pandas and pyarrow are required for stock code collection") from exc
+        codes: set[str] = set()
+        for artifact in artifacts:
+            if artifact.rows:
+                codes.update(pd.read_parquet(artifact.path, columns=["ts_code"])["ts_code"].dropna().astype(str))
+        if not codes:
+            raise DataContractError("No stock codes to fetch name histories for")
+        return sorted(codes)
+
+    @staticmethod
+    def _fetch_name_history(
+        codes: list[str], *, fetch: Any, workers: int, snapshot_date: date
+    ) -> list[FetchArtifact]:
+        """Fetch each stock's name history, which marks its point-in-time ST and delisting periods.
+
+        The all-stock query pages by offset over an unstable order and silently drops rows, so every stock is asked
+        for on its own.
+        """
+
+        def fetch_one(code: str) -> FetchArtifact:
+            return fetch(
                 "namechange",
-                {"fields": "ts_code,name,start_date,end_date,ann_date,change_reason", "offset": offset, "limit": limit},
-                f"snapshot={snapshot_date:%Y%m%d}/page={offset // limit:04d}",
+                {"ts_code": code, "fields": "ts_code,name,start_date,end_date,ann_date,change_reason"},
+                f"snapshot={snapshot_date:%Y%m%d}/ts_code={code}",
             )
-            artifacts.append(artifact)
-            if artifact.rows < limit:
-                return artifacts
-            progress.total += 1
-            progress.refresh()
-        raise DataContractError("namechange pagination exceeded 500,000 rows; refusing a silently truncated result")
+
+        return _map_in_order(fetch_one, codes, workers)
 
     @staticmethod
     def _open_dates(calendar_path: Path) -> list[date]:
@@ -641,6 +658,23 @@ class TushareCollector:
             raise DataContractError("trade_cal response lacks cal_date/is_open")
         values = frame.loc[frame["is_open"].astype(int).eq(1), "cal_date"].astype(str)
         return sorted(datetime.strptime(value, "%Y%m%d").date() for value in values)
+
+
+def _map_in_order(function: Callable[[Any], FetchArtifact], items: list[Any], workers: int) -> list[FetchArtifact]:
+    """Run ``function`` over ``items`` on ``workers`` threads and return results in item order.
+
+    The shared rate limiter still caps total throughput, and the order keeps the sync fingerprint independent of the
+    worker count.
+    """
+    if workers == 1:
+        return [function(item) for item in items]
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-sync")
+    futures = [executor.submit(function, item) for item in items]
+    try:
+        return [future.result() for future in futures]
+    finally:
+        # On the first failure, stop queued requests instead of draining the whole history.
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _date_text(value: date) -> str:
