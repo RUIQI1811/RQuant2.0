@@ -29,7 +29,12 @@ from rquant.factors.engine import (
     validate_factor_frame,
 )
 from rquant.factors.evaluation import FactorEvaluationConfig, FactorEvaluator
-from rquant.integrations.rdagent import RDAgentExporter, default_mining_window
+from rquant.integrations.rdagent import (
+    DEFAULT_REFERENCE_DATES,
+    DEFAULT_REFERENCE_SETS,
+    RDAgentExporter,
+    default_mining_window,
+)
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
 from rquant.runs import RunContext
@@ -136,6 +141,18 @@ def build_parser() -> argparse.ArgumentParser:
     rdagent_export.add_argument("--output", help="Bundle directory (default: <data_root>/rdagent)")
     rdagent_export.add_argument(
         "--debug-instruments", type=int, default=100, help="Instruments in RD-Agent's quick debug data (default 100)"
+    )
+    rdagent_export.add_argument(
+        "--reference-sets",
+        default=",".join(DEFAULT_REFERENCE_SETS),
+        help="Built factor sets RD-Agent's new factors must differ from, comma-separated ('' for none; "
+        f"default {','.join(DEFAULT_REFERENCE_SETS)})",
+    )
+    rdagent_export.add_argument(
+        "--reference-dates",
+        type=int,
+        default=DEFAULT_REFERENCE_DATES,
+        help=f"Trading days sampled for the novelty screen's correlations (default {DEFAULT_REFERENCE_DATES})",
     )
     rdagent_export.set_defaults(handler=_rdagent_export, run_category="rdagent-export")
     return parser
@@ -592,8 +609,18 @@ def _rdagent_export(args: argparse.Namespace) -> int:
         if not output.is_absolute():
             output = paths.root / output
         run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
-        exporter = RDAgentExporter(paths.qlib, output, universe=_universe(config))
-        manifest = exporter.export(window, debug_instruments=args.debug_instruments)
+        reference_sets = tuple(name.strip() for name in args.reference_sets.split(",") if name.strip())
+        unknown = sorted(set(reference_sets) - set(_factor_sets()))
+        if unknown:
+            raise ValueError(f"Unknown factor sets: {', '.join(unknown)}")
+        for name in reference_sets:
+            run.add_input(f"factors_{name}", _fingerprint(paths.factors / name / "manifest.json"))
+        exporter = RDAgentExporter(
+            paths.qlib, output, universe=_universe(config), factor_root=paths.factors, reference_sets=reference_sets
+        )
+        manifest = exporter.export(
+            window, debug_instruments=args.debug_instruments, reference_dates=args.reference_dates
+        )
         return {"output": str(output), **manifest}
 
     return _run(args, action)

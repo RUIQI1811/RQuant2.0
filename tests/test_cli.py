@@ -30,6 +30,7 @@ class CliTests(unittest.TestCase):
             ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "Hquality"],
             ["report", "run-id"],
             ["rdagent", "export", "--mining-end", "2021-12-31"],
+            ["rdagent", "export", "--reference-sets", "qlib_alpha158,talib", "--reference-dates", "100"],
         ]
         for argv in cases:
             with self.subTest(argv=argv):

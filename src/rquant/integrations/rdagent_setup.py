@@ -5,9 +5,10 @@ Run this inside the RD-Agent conda environment on Linux/WSL, not in the rquant e
     python rdagent_setup.py --bundle /mnt/d/.../data/rdagent --workdir ~/rdagent-work
 
 It (1) converts the exported Parquet into the ``daily_pv.h5`` folders RD-Agent reads from its working directory,
-(2) patches RD-Agent's Qlib factor templates to RQuant's trading conventions, (3) writes ``.env`` from the bundle's
-template when none exists, and (4) checks the Qlib provider RD-Agent backtests against. It only needs the
-standard library, pandas and PyTables, all of which RD-Agent installs.
+(2) patches RD-Agent's Qlib factor templates to RQuant's trading conventions, (3) patches RD-Agent to batch embedding
+requests and to screen new factors against RQuant's factor libraries (``rdagent_novelty.py``), (4) writes ``.env``
+from the bundle's template when none exists, and (5) checks the Qlib provider RD-Agent backtests against. It only
+needs the standard library, pandas and PyTables, all of which RD-Agent installs.
 
 After filling in the API key, check it with ``python rdagent_setup.py --workdir ~/rdagent-work --check-llm``;
 ``rdagent health_check`` only understands OpenAI and DeepSeek keys and crashes on the default Qwen settings.
@@ -21,11 +22,14 @@ import shutil
 import sys
 from pathlib import Path
 
-# (RD-Agent 1.0.0 original, RQuant replacement). RQuant buys and sells at the next open, so the label runs from the
-# next open to the open after it; costs are commission 0.03% each side plus 0.1% stamp tax on sells, which applied
-# throughout the default mining period (it halved only on 2023-08-28).
+# RD-Agent 1.0.0's label; RQuant's runs from the next open, when it trades, to the open ``label_days`` later.
+ORIGINAL_LABEL = '["Ref($close, -2)/Ref($close, -1) - 1"]'
+# Factors that predict ten days ahead are found with far less noise than one-day ones (CogAlpha, AlphaForge), and
+# RQuant's own walk-forward still judges them on its one-day setup.
+DEFAULT_LABEL_DAYS = 10
+# (RD-Agent 1.0.0 original, RQuant replacement). Costs are commission 0.03% each side plus 0.1% stamp tax on sells,
+# which applied throughout the default mining period (it halved only on 2023-08-28).
 TEMPLATE_REPLACEMENTS = (
-    ('["Ref($close, -2)/Ref($close, -1) - 1"]', '["Ref($open, -2)/Ref($open, -1) - 1"]'),
     ("deal_price: close", "deal_price: open"),
     ("open_cost: 0.0005", "open_cost: 0.0003"),
     ("close_cost: 0.0015", "close_cost: 0.0013"),
@@ -37,9 +41,15 @@ DATA_FOLDERS = {
 }
 
 
-def patch_template_text(text: str, threads: int) -> str:
-    """Apply RQuant's conventions to one template. Idempotent; fails if a template no longer matches."""
-    for original, replacement in TEMPLATE_REPLACEMENTS:
+def label_expression(days: int) -> str:
+    if days < 1:
+        raise ValueError("label_days must be positive")
+    return f'["Ref($open, -{days + 1})/Ref($open, -1) - 1"]'
+
+
+def patch_template_text(text: str, threads: int, label_days: int = DEFAULT_LABEL_DAYS) -> str:
+    """Apply RQuant's conventions to RD-Agent's pristine template. Fails if the template no longer matches."""
+    for original, replacement in ((ORIGINAL_LABEL, label_expression(label_days)), *TEMPLATE_REPLACEMENTS):
         if original in text:
             text = text.replace(original, replacement)
         elif replacement not in text:
@@ -52,7 +62,7 @@ def patch_template_text(text: str, threads: int) -> str:
     return "".join(lines)
 
 
-def patch_templates(template_root: Path, threads: int) -> list[str]:
+def patch_templates(template_root: Path, threads: int, label_days: int = DEFAULT_LABEL_DAYS) -> list[str]:
     patched = []
     for name in TEMPLATE_FILES:
         path = template_root / name
@@ -62,7 +72,8 @@ def patch_templates(template_root: Path, threads: int) -> list[str]:
         if not backup.exists():
             shutil.copyfile(path, backup)
         # Always patch from the pristine copy so a rerun with another thread count does not compound.
-        path.write_text(patch_template_text(backup.read_text(encoding="utf-8"), threads), encoding="utf-8")
+        text = patch_template_text(backup.read_text(encoding="utf-8"), threads, label_days)
+        path.write_text(text, encoding="utf-8")
         patched.append(str(path))
     return patched
 
@@ -92,15 +103,63 @@ EMBEDDING_BATCHED = """        # RQuant patch: batch by embedding_max_str_num, a
 
 def patch_embedding_batches(backend: Path) -> None:
     """Make the LiteLLM backend batch embedding requests. Idempotent; fails if the backend no longer matches."""
-    backup = backend.with_name(backend.name + ".orig")
+    _patch_source(backend, EMBEDDING_ORIGINAL, EMBEDDING_BATCHED)
+
+
+# RD-Agent 1.0.0 drops a new factor only when its correlation with an accepted one reaches 0.99, never compares with
+# known libraries, and then drops every stock-day on which any factor is missing, so one sparse factor silently
+# removed 82% of the rows in a run. Qlib's loader joins these factors onto Alpha158 and LightGBM handles gaps, so
+# the patch keeps missing values and screens with rquant_novelty.screen_new_factors instead.
+DEDUPLICATION_ORIGINAL = """            if SOTA_factor is not None and not SOTA_factor.empty:
+                new_factors = self.deduplicate_new_factors(SOTA_factor, new_factors)
+                if new_factors.empty:
+                    raise FactorEmptyError(
+                        "The factors generated in this round are highly similar to the previous factors. Please change the direction for creating new factors."
+                    )
+                combined_factors = pd.concat([SOTA_factor, new_factors], axis=1).dropna()
+            else:
+                combined_factors = new_factors
+"""  # noqa: E501
+DEDUPLICATION_SCREENED = """            # RQuant patch: screen against RQuant's factor libraries and the accepted factors, keep missing values.
+            from rdagent.scenarios.qlib.developer.rquant_novelty import screen_new_factors
+
+            new_factors, rejected = screen_new_factors(new_factors, SOTA_factor)
+            if rejected:
+                logger.info("RQuant novelty screen rejected: " + "; ".join(rejected))
+            if new_factors.empty:
+                raise FactorEmptyError(
+                    "Every factor in this round was rejected by the novelty screen: "
+                    + "; ".join(rejected)
+                    + ". Propose factors based on a different economic mechanism, not variants of existing factors."
+                )
+            if SOTA_factor is not None and not SOTA_factor.empty:
+                combined_factors = pd.concat([SOTA_factor, new_factors], axis=1)
+            else:
+                combined_factors = new_factors
+"""  # noqa: E501
+NOVELTY_MODULE_NAME = "rquant_novelty.py"
+
+
+def patch_factor_runner(runner: Path, novelty_source: Path) -> None:
+    """Install the novelty screen next to RD-Agent's factor runner and call it there."""
+    module = runner.with_name(NOVELTY_MODULE_NAME)
+    text = novelty_source.read_text(encoding="utf-8")
+    if not module.exists() or module.read_text(encoding="utf-8") != text:
+        module.write_text(text, encoding="utf-8")
+    _patch_source(runner, DEDUPLICATION_ORIGINAL, DEDUPLICATION_SCREENED)
+
+
+def _patch_source(path: Path, original: str, replacement: str) -> None:
+    """Replace ``original`` in RD-Agent's pristine copy (kept as ``.orig``); writes only when the result changes."""
+    backup = path.with_name(path.name + ".orig")
     if not backup.exists():
-        shutil.copyfile(backend, backup)
+        shutil.copyfile(path, backup)
     text = backup.read_text(encoding="utf-8")
-    if EMBEDDING_ORIGINAL not in text:
-        raise ValueError(f"RD-Agent LiteLLM backend no longer matches the embedding patch: {backend}")
-    patched = text.replace(EMBEDDING_ORIGINAL, EMBEDDING_BATCHED)
-    if backend.read_text(encoding="utf-8") != patched:
-        backend.write_text(patched, encoding="utf-8")
+    if original not in text:
+        raise ValueError(f"RD-Agent source no longer matches the RQuant patch: {path}")
+    patched = text.replace(original, replacement)
+    if path.read_text(encoding="utf-8") != patched:
+        path.write_text(patched, encoding="utf-8")
 
 
 def convert_data(bundle: Path, workdir: Path, readme: Path) -> dict[str, int]:
@@ -176,6 +235,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--threads", type=int, default=4, help="LightGBM threads per backtest (default 4)")
     parser.add_argument(
+        "--label-days",
+        type=int,
+        default=DEFAULT_LABEL_DAYS,
+        help=f"Return horizon RD-Agent's LightGBM learns, open to open (default {DEFAULT_LABEL_DAYS})",
+    )
+    parser.add_argument(
         "--check-llm", action="store_true", help="Only test the chat and embedding models configured in <workdir>/.env"
     )
     args = parser.parse_args(argv)
@@ -214,10 +279,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     experiment_root = Path(qlib_experiment_utils.__file__).parent
-    patched = patch_templates(experiment_root / "factor_template", args.threads)
+    patched = patch_templates(experiment_root / "factor_template", args.threads, args.label_days)
     litellm_backend = experiment_root.parents[2] / "oai" / "backend" / "litellm.py"
     patch_embedding_batches(litellm_backend)
     patched.append(str(litellm_backend))
+    factor_runner = experiment_root.parent / "developer" / "factor_runner.py"
+    patch_factor_runner(factor_runner, bundle / "rdagent_novelty.py")
+    patched.append(str(factor_runner))
+    reference = bundle / "reference_factors.parquet"
+    if reference.exists():
+        target = workdir / "git_ignore_folder" / "rquant_reference_factors.parquet"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(reference, target)
     # The bundle's README describes RQuant's columns; bundles exported before it existed fall back to RD-Agent's.
     readme = bundle / "README.md"
     if not readme.exists():

@@ -27,14 +27,32 @@ LLM 有一半轮次把它当成基本面数据来构造因子，挖出来的东�
 
 | 项目 | RD-Agent 默认 | 改为 |
 | --- | --- | --- |
-| 标签 | `Ref($close,-2)/Ref($close,-1)-1` | `Ref($open,-2)/Ref($open,-1)-1`（下一开盘到再下一开盘） |
+| 标签 | `Ref($close,-2)/Ref($close,-1)-1` | `Ref($open,-11)/Ref($open,-1)-1`（下一开盘起 10 日，`--label-days` 可改） |
 | 成交价 | close | open |
 | 买入成本 | 0.05% | 0.03%（佣金） |
 | 卖出成本 | 0.15% | 0.13%（佣金 + 0.1% 印花税） |
 | LightGBM 线程 | 20 | `--threads`，默认 4 |
 
 模型仍是 RD-Agent 自带的 LightGBM 和 qlib 的 TopkDropout（持股 50、每天最多换 5 只），基线因子是 qlib 自带的
-Alpha158 表达式。它只用来给候选因子排序，不替代 RQuant 的组合回测。
+Alpha158 表达式。它只用来给候选因子排序，不替代 RQuant 的组合回测。标签用 10 日而不是 1 日：1 日收益噪声太大，
+前两次运行里 IC 只有 0.02 左右，好坏因子难以区分；CogAlpha、AlphaForge 等论文都用 10–20 日。挖到的因子最后仍在
+RQuant 的 1 日 walk-forward 里检验。
+
+### 新颖度筛选
+
+RD-Agent 1.0.0 只在新因子和它已采纳的因子日均相关达到 0.99 时才当作重复，从不和 Alpha158 等已知因子库比；
+它还会把任一因子缺失的股票日整行删掉。前两次运行（36 轮）挖到的全是 Alpha158 的变体，其中一个大部分时间为空的
+因子让组合因子表只剩 18% 的行。`rdagent_setup.py` 因此改了它的 `factor_runner.py`（原文件备份为
+`factor_runner.py.orig`），改用 `rdagent_novelty.py` 筛选：
+
+- 新因子和参考因子（默认 `qlib_alpha158`、`wq_alpha101`、`gtja191`、`talib`，由导出时从 RQuant 的因子库抽样）
+  或本次已采纳的因子，日均截面秩相关的绝对值 ≥ 0.7 就拒绝；
+- 在参考样本（各抽样日的沪深 300 成分）上有值的比例不到 70% 也拒绝；
+- 一轮的因子全被拒时，拒绝原因（和哪个已有因子相关多少）作为报错交给 RD-Agent，作为下一轮的反馈；
+- 不再删除有缺失值的行，qlib 的数据加载把这些因子左连接到 Alpha158 上，LightGBM 自己处理缺失。
+
+两个门槛可以在 `.env` 里用 `RQUANT_MAX_CORRELATION`、`RQUANT_MIN_COVERAGE` 覆盖。数据说明 `README.md` 也写明了
+这条规则，并提示了 A 股文献里的方向（隔夜和日内收益分开、按截面离散度切换动量和反转）。
 
 ## 2. 在 Windows 上准备 WSL2
 
@@ -74,12 +92,17 @@ rquant data build-qlib          # 确保 data/qlib 是最新的
 rquant rdagent export           # 写入 data/rdagent/
 ```
 
+参考因子集需要先用 `rquant factors build --factor-set <名字>` 建好；用 `--reference-sets` 换成别的集合，传空字符串
+`--reference-sets ""` 则不做参考比较（仍会和本次已采纳的因子比）。
+
 `data/rdagent/` 包括：
 
 ```text
 factor_source_data/daily_pv.parquet         全量：挖掘窗口内的沪深 300 历史成分
 factor_source_data_debug/daily_pv.parquet   调试：最后两年、前 100 只
 README.md                                   给 LLM 的数据说明（替换 RD-Agent 自带的）
+reference_factors.parquet                   参考因子在约 150 个抽样交易日上的值，供新颖度筛选
+rdagent_novelty.py                          新颖度筛选，准备脚本把它装进 RD-Agent
 rdagent.env                                 .env 模板（千问 / 百炼，API key 留空）
 rdagent_setup.py                            在 WSL 里运行的准备脚本
 manifest.json                               窗口、行数、哈希和 Qlib provider 指纹
@@ -100,7 +123,7 @@ python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" \
 ```
 
 脚本会把 Parquet 转成 RD-Agent 读取的 `git_ignore_folder/factor_implementation_source_data*/daily_pv.h5`，改好上面的
-模板（原文件备份为 `*.yaml.orig`，重复运行总是从备份重新改）、给 RD-Agent 的 embedding 接口打分批补丁，并在工作目录写入 `.env`（已存在则不覆盖）。
+模板（原文件备份为 `*.yaml.orig`，重复运行总是从备份重新改）、给 RD-Agent 的 embedding 接口打分批补丁、装上新颖度筛选，并在工作目录写入 `.env`（已存在则不覆盖）。
 
 编辑 `~/rdagent-work/.env`，填 `DASHSCOPE_API_KEY`：在阿里云百炼控制台（中国内地地域）开通服务并创建 API Key。
 同一个 key 同时用于 chat 模型 `qwen-plus` 和 embedding 模型 `text-embedding-v4`，都走 LiteLLM 自带的 DashScope

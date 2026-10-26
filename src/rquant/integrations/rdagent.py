@@ -51,7 +51,28 @@ $volume: traded shares on that day, scaled inversely to the price adjustment so 
 $amount: traded value on that day in CNY (not adjusted). Use it for liquidity and size of trading.
 $vwap: adjusted volume-weighted average price of the stock on that day.
 """
+NOVELTY_README = """
+# Novelty requirement
+Every new factor is compared with {count} existing factors ({libraries}). A factor whose daily cross-sectional rank
+correlation with any of them, or with a factor already accepted in this run, reaches 0.7 in absolute value is
+rejected, and so is a factor that has a value on fewer than 70% of stock-days. Simple momentum, reversal,
+volatility, moving-average, candlestick-shape, VWAP-ratio and volume-ratio variants are almost always rejected; look
+for different economic mechanisms instead. Directions documented for China A-shares include splitting returns into
+overnight ($open over the previous $close) and intraday ($close over $open) parts, which behave very differently,
+and conditioning momentum or reversal on how dispersed returns are across stocks.
+"""
 SETUP_SCRIPT = Path(__file__).with_name("rdagent_setup.py")
+NOVELTY_MODULE = Path(__file__).with_name("rdagent_novelty.py")
+# The price/volume libraries RD-Agent can rediscover from daily_pv.h5; its new factors are screened against them.
+DEFAULT_REFERENCE_SETS = ("qlib_alpha158", "wq_alpha101", "gtja191", "talib")
+REFERENCE_SET_NAMES = {
+    "qlib_alpha158": "Qlib Alpha158",
+    "wq_alpha101": "WorldQuant Alpha101",
+    "gtja191": "GTJA Alpha191",
+    "talib": "TA-Lib indicators",
+}
+# Correlations between factors are stable enough that ~150 days spread over the mining period measure them well.
+DEFAULT_REFERENCE_DATES = 150
 
 
 @dataclass(frozen=True)
@@ -128,14 +149,30 @@ def env_template(window: MiningWindow) -> str:
 class RDAgentExporter:
     """Write the inputs RD-Agent's fin_factor loop needs, cut off at the end of the mining period."""
 
-    def __init__(self, qlib_root: str | Path, output_root: str | Path, universe: str = "csi300") -> None:
+    def __init__(
+        self,
+        qlib_root: str | Path,
+        output_root: str | Path,
+        universe: str = "csi300",
+        *,
+        factor_root: str | Path | None = None,
+        reference_sets: tuple[str, ...] = (),
+    ) -> None:
         self.qlib_root = Path(qlib_root)
         self.output_root = Path(output_root)
         self.universe = universe
+        self.factor_root = Path(factor_root) if factor_root is not None else None
+        self.reference_sets = reference_sets
+        if reference_sets and self.factor_root is None:
+            raise ValueError("reference_sets need a factor_root")
 
-    def export(self, window: MiningWindow, *, debug_instruments: int = 100) -> dict[str, Any]:
+    def export(
+        self, window: MiningWindow, *, debug_instruments: int = 100, reference_dates: int = DEFAULT_REFERENCE_DATES
+    ) -> dict[str, Any]:
         if debug_instruments < 1:
             raise ValueError("debug_instruments must be positive")
+        if reference_dates < 1:
+            raise ValueError("reference_dates must be positive")
         qlib_manifest = self.qlib_root / "manifest.json"
         if not qlib_manifest.exists():
             raise DataContractError(f"Qlib manifest does not exist: {qlib_manifest}")
@@ -182,6 +219,10 @@ class RDAgentExporter:
             & full.index.get_level_values("instrument").isin(debug_members)
         ]
 
+        mining_days = [day for day in calendar if window.train_start <= day.date() <= window.test_end]
+        sample_days = mining_days[:: max(1, len(mining_days) // reference_dates)]
+        reference, reference_manifest = self._reference(sample_days)
+
         if self.output_root.exists():
             shutil.rmtree(self.output_root)
         self.output_root.mkdir(parents=True)
@@ -192,8 +233,17 @@ class RDAgentExporter:
             frame.to_parquet(path)
         # RD-Agent reads this file on Linux; Windows line endings would leave a CR at the end of every value.
         (self.output_root / "rdagent.env").write_text(env_template(window), encoding="utf-8", newline="\n")
-        (self.output_root / "README.md").write_text(DATA_README, encoding="utf-8", newline="\n")
+        readme = DATA_README
+        reference_summary = None
+        if reference is not None:
+            reference_path = self.output_root / "reference_factors.parquet"
+            reference.to_parquet(reference_path)
+            libraries = ", ".join(REFERENCE_SET_NAMES.get(name, name) for name in self.reference_sets)
+            readme += NOVELTY_README.format(count=reference.shape[1], libraries=libraries)
+            reference_summary = {**_summary(reference, reference_path), "sets": reference_manifest}
+        (self.output_root / "README.md").write_text(readme, encoding="utf-8", newline="\n")
         shutil.copyfile(SETUP_SCRIPT, self.output_root / SETUP_SCRIPT.name)
+        shutil.copyfile(NOVELTY_MODULE, self.output_root / NOVELTY_MODULE.name)
 
         with qlib_manifest.open("r", encoding="utf-8") as handle:
             qlib_fingerprint = json.load(handle).get("fingerprint")
@@ -206,10 +256,45 @@ class RDAgentExporter:
             "fields": list(PV_FIELDS),
             "full": _summary(full, full_path),
             "debug": _summary(debug, debug_path),
+            "reference": reference_summary,
         }
         manifest["fingerprint"] = stable_hash(manifest)
         atomic_write_json(self.output_root / "manifest.json", manifest)
         return manifest
+
+    def _reference(self, days: list[Any]) -> tuple[Any, dict[str, Any]]:
+        """Values of RQuant's built factor sets on the sampled days, with columns named ``<set>.<factor>``."""
+        if not self.reference_sets:
+            return None, {}
+        import pandas as pd
+
+        assert self.factor_root is not None
+        wanted = pd.DatetimeIndex(days)
+        frames, sets = [], {}
+        for name in self.reference_sets:
+            root = self.factor_root / name
+            manifest_path = root / "manifest.json"
+            if not manifest_path.exists():
+                raise DataContractError(f"Factor set {name} is not built ({manifest_path}); run `rquant factors build`")
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            if manifest.get("status") != "complete":
+                raise DataContractError(f"Factor set {name} is incomplete: {manifest_path}")
+            parts = []
+            for year in sorted(set(wanted.year)):
+                partition = root / f"year={year}" / "factors.parquet"
+                if not partition.exists():
+                    continue
+                frame = pd.read_parquet(partition)
+                parts.append(frame[pd.to_datetime(frame["datetime"]).isin(wanted)])
+            if not parts:
+                raise DataContractError(f"Factor set {name} has no rows in the mining period")
+            frame = pd.concat(parts, ignore_index=True)
+            frame["datetime"] = pd.to_datetime(frame["datetime"])
+            frame = frame.set_index(["datetime", "instrument"]).sort_index().astype("float32")
+            frames.append(frame.add_prefix(f"{name}."))
+            sets[name] = {"fingerprint": manifest.get("fingerprint"), "factors": int(frame.shape[1])}
+        return pd.concat(frames, axis=1).sort_index(), sets
 
     @staticmethod
     def _features(D: Any, instruments: list[str], start: Any, end: date) -> Any:
