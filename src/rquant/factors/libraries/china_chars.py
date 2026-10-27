@@ -284,8 +284,8 @@ STATEMENT_OUTPUTS = (
     "q_rs",
     "q_tes",
 )
-# Characteristics published straight from one statement-graph result.
-FROM_STATEMENTS = {
+# Characteristics published unchanged from one statement-graph result.
+STATEMENT_FACTORS = {
     name: result
     for result in STATEMENT_OUTPUTS
     if (name := result[2:]) in {spec[0] for spec in CHINA_CHARS}
@@ -535,9 +535,13 @@ class ChinaCharsLibrary(FactorLibrary):
 
     family = "china_chars"
     required_inputs = ("close", "amount", "cap", "sector")
-    reference_inputs = (*DAILY_REFERENCE, *STATEMENT_OUTPUTS)
+    reference_inputs = (
+        *DAILY_REFERENCE,
+        *(name for name in STATEMENT_OUTPUTS if name not in STATEMENT_FACTORS.values()),
+    )
     statement_fields = STATEMENT_FIELDS
     statement_outputs = STATEMENT_OUTPUTS
+    statement_factors = STATEMENT_FACTORS
     strict_float = True
     cpp_prelude = CPP_PRELUDE
 
@@ -643,7 +647,11 @@ class ChinaCharsLibrary(FactorLibrary):
     def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         outputs = _daily_graph(inputs)
         trading = k.notna(inputs["close"])
-        return {name: k.mask(k.replace_inf(outputs[name]), trading) for name in CHINA_CHARS_NAMES}
+        return {
+            name: k.mask(k.replace_inf(outputs[name]), trading)
+            for name in CHINA_CHARS_NAMES
+            if name not in STATEMENT_FACTORS
+        }
 
 
 # ---------------------------------------------------------------------------------------------------- statements
@@ -869,7 +877,7 @@ def _oscore(value: Callable[[str], Any], ttm: Callable[[str], Any], lag: Callabl
 
 # ---------------------------------------------------------------------------------------------------- daily graph
 def _daily_graph(inputs: Mapping[str, Any]) -> dict[str, Any]:
-    """Every characteristic before the trading-day mask, from prices and the published statement results."""
+    """Every characteristic outside ``STATEMENT_FACTORS``, before the trading-day mask."""
     close, amount, cap = inputs["close"], inputs["amount"], inputs["cap"]
     turnover, float_value = inputs["basic_turnover_rate"], inputs["basic_circ_mv"]
     market = [inputs[name] for name in MARKET_FACTORS]
@@ -1107,9 +1115,7 @@ def _daily_graph(inputs: Mapping[str, Any]) -> dict[str, Any]:
             if (count >= 3) out[t] = total / count;
         }}""",
     )
-    # Profitability, value, investment and other statement-based characteristics
-    for name, result in FROM_STATEMENTS.items():
-        out[name] = inputs[result]
+    # Statement-based characteristics that involve the market value (the others are ``STATEMENT_FACTORS``)
     for name, result in OVER_MARKET_VALUE.items():
         out[name] = to_price(inputs[result])
     ebitda = inputs["q_ebitda_ttm"]

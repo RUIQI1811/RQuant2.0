@@ -98,9 +98,12 @@ class FactorLibrary(ABC):
     # in the reference input ``fundamentals``, reading ``statement_fields`` and ``fiscal_quarter`` (0 for Q1). The
     # engine publishes each result named in ``statement_outputs`` as a daily input of ``build``: ``q_`` results from
     # the latest quarter known on the day, ``y_`` results from the latest known fiscal year
-    # (``rquant.factors.statements``). Statement outputs are listed in ``reference_inputs`` too.
+    # (``rquant.factors.statements``). Results the daily graph reads are listed in ``reference_inputs`` too; a factor
+    # published unchanged from a result is mapped to it in ``statement_factors`` (source name to result) instead and
+    # left out of ``build``, so the engine writes it without holding the result as a daily input.
     statement_fields: tuple[str, ...] = ()
     statement_outputs: tuple[str, ...] = ()
+    statement_factors: Mapping[str, str] = {}
 
     @property
     @abstractmethod
@@ -114,6 +117,10 @@ class FactorLibrary(ABC):
     def build_statements(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         """Build ``statement_outputs`` to KunQuant expressions over fiscal quarters x instruments."""
         raise NotImplementedError(f"{self.family} has no statement graph")
+
+    def prepare_statements(self, fundamentals: Any) -> Any:
+        """The first-reported statements the statement graph reads (``fundamentals`` unchanged by default)."""
+        return fundamentals
 
     def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
         """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""

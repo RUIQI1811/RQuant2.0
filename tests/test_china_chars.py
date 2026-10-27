@@ -195,8 +195,9 @@ class ChinaCharsCalculationTests(unittest.TestCase):
         """KunQuant outputs by source name, as panels shaped like the inputs."""
         close = inputs["close"]
         aligned = ChinaCharsLibrary().align_reference_inputs(inputs, close.index, close.columns)
-        aligned.update(cls.engine.statement_inputs(aligned, close.index, close.columns, cls.statements))
-        output = cls.engine.run(kunquant_arrays(cls.engine, aligned), module=cls.module)
+        statements = cls.engine.run_statements(aligned, close.index, close.columns, cls.statements)
+        aligned.update({name: statements.daily(name) for name in cls.engine.input_fields if name in statements})
+        output = cls.engine.run(kunquant_arrays(cls.engine, aligned), module=cls.module, statements=statements)
         return {
             spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
             for spec in ChinaCharsLibrary().specs

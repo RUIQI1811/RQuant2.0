@@ -130,6 +130,25 @@ class QuarterGrid:
         return Panel(self.gather(values.T, annual=annual), index=self.dates, columns=self.instruments)
 
 
+class StatementResults:
+    """Statement-graph results (quarters x instruments) by output name, with the grid that dates each of them."""
+
+    def __init__(self) -> None:
+        self._results: dict[str, tuple[QuarterGrid, np.ndarray]] = {}
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._results
+
+    def add(self, name: str, grid: QuarterGrid, values: np.ndarray) -> None:
+        self._results[name] = (grid, values)
+
+    def daily(self, name: str) -> np.ndarray:
+        """The result on every trading day: ``q_`` results from the latest known quarter, ``y_`` from the latest
+        fiscal year."""
+        grid, values = self._results[name]
+        return grid.gather(values, annual=name.startswith("y_"))
+
+
 def lag(values: np.ndarray, periods: int) -> np.ndarray:
     """Shift quarter columns right so column q holds quarter q - periods."""
     result = np.full(values.shape, np.nan)

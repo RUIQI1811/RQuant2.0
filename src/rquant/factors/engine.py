@@ -12,7 +12,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rquant.errors import DataContractError, DependencyError, FactorContractError
 from rquant.factors.catalog import FactorSet, catalog_from_registry, get_catalog
@@ -22,6 +22,9 @@ from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library
 from rquant.io import atomic_replace_directory as _atomic_replace_directory
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.universe import UNIVERSE_COLUMNS, universe_mask, validate_universe
+
+if TYPE_CHECKING:
+    from rquant.factors.statements import StatementResults
 
 INPUT_FIELDS = CANONICAL_INPUT_FIELDS
 FACTOR_ENGINE_VERSION = 3
@@ -140,6 +143,14 @@ class KunQuantFactorEngine:
                 f"Factor set {self.config.factor_set} mixes libraries on calendar days and on their own quotes"
             )
         self.quote_fields: tuple[str, ...] = next(iter(quote_fields), ())
+        # Factors published unchanged from a statement-graph result skip the daily graph: ``run`` writes them straight
+        # into their output buffers.
+        self.statement_factors = {
+            spec.canonical_name: library.statement_factors[spec.source_name]
+            for library in self.libraries
+            for spec in library.specs
+            if spec.source_name in library.statement_factors
+        }
 
     @property
     def strict_float(self) -> bool:
@@ -197,7 +208,11 @@ class KunQuantFactorEngine:
             outputs: dict[str, Any] = {}
             for library in self.libraries:
                 source_outputs = dict(library.build(inputs))
-                source_to_canonical = {spec.source_name: spec.canonical_name for spec in library.specs}
+                source_to_canonical = {
+                    spec.source_name: spec.canonical_name
+                    for spec in library.specs
+                    if spec.source_name not in library.statement_factors
+                }
                 if set(source_outputs) != set(source_to_canonical):
                     missing_names = sorted(set(source_to_canonical) - set(source_outputs))
                     extra_names = sorted(set(source_outputs) - set(source_to_canonical))
@@ -210,7 +225,7 @@ class KunQuantFactorEngine:
                         raise FactorContractError(f"Duplicate canonical factor output: {canonical_name}")
                     outputs[canonical_name] = source_outputs[source_name]
 
-            expected = self.catalog.canonical_names(self.config.factor_set)
+            expected = self.graph_outputs
             if tuple(outputs) != expected:
                 raise FactorContractError("Factor-library output order differs from the locked catalog")
             for canonical_name, expression in outputs.items():
@@ -232,6 +247,12 @@ class KunQuantFactorEngine:
         )
 
     @property
+    def graph_outputs(self) -> tuple[str, ...]:
+        """Catalog outputs the daily graph computes, in catalog order."""
+        names = self.catalog.canonical_names(self.config.factor_set)
+        return tuple(name for name in names if name not in self.statement_factors)
+
+    @property
     def statement_libraries(self) -> tuple[Any, ...]:
         return tuple(library for library in self.libraries if library.statement_outputs)
 
@@ -247,8 +268,9 @@ class KunQuantFactorEngine:
         for library in self.statement_libraries:
             if any(not name.startswith(("q_", "y_")) for name in library.statement_outputs):
                 raise FactorContractError(f"Statement outputs of {library.family} must start with q_ or y_")
-            if not set(library.statement_outputs) <= set(library.reference_inputs):
-                raise FactorContractError(f"Statement outputs of {library.family} must be reference inputs")
+            published = set(library.reference_inputs) | set(library.statement_factors.values())
+            if not set(library.statement_outputs) <= published:
+                raise FactorContractError(f"Statement outputs of {library.family} are neither inputs nor factors")
             builder = Builder()
             with builder:
                 inputs = {name: Input(name) for name in (*library.statement_fields, "fiscal_quarter")}
@@ -318,29 +340,30 @@ class KunQuantFactorEngine:
         library = load_kunquant_library(compiled)
         return {name.removeprefix("statements_"): library.getModule(name) for name, _, _ in functions}
 
-    def statement_inputs(
+    def run_statements(
         self, inputs: dict[str, Any], dates: Any, instruments: Any, modules: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Run the statement graphs over ``inputs["fundamentals"]`` and publish each result as a dates x instruments
-        array: ``q_`` results from the latest quarter known on the day, ``y_`` results from the latest fiscal year."""
+    ) -> StatementResults:
+        """Run every library's statement graph over its first-reported statements in ``inputs["fundamentals"]``."""
+        from rquant.factors.statements import QuarterGrid, StatementResults
+
+        results = StatementResults()
         if not self.statement_libraries:
-            return {}
+            return results
         try:
             import numpy as np
             import pandas as pd
             from KunQuant.runner import KunRunner as kr
         except ImportError as exc:
             raise DependencyError("NumPy, pandas and KunQuant are required for factor computation") from exc
-        from rquant.factors.statements import QuarterGrid
 
         if "fundamentals" not in inputs:
             raise DataContractError("Statement graphs need the reference input `fundamentals`")
         modules = self.compile_statements() if modules is None else modules
         dtype = np.float64 if self.config.dtype == "double" else np.float32
-        grid = QuarterGrid(inputs["fundamentals"], pd.DatetimeIndex(dates), pd.Index(instruments))
         executor = kr.createMultiThreadExecutor(self.config.workers)
-        published: dict[str, Any] = {}
+        dates, instruments = pd.DatetimeIndex(dates), pd.Index(instruments)
         for library in self.statement_libraries:
+            grid = QuarterGrid(library.prepare_statements(inputs["fundamentals"]), dates, instruments)
             module = modules[library.family]
             pad = (-len(instruments)) % int(module.blocking_len)
             arrays = {
@@ -349,15 +372,15 @@ class KunQuantFactorEngine:
             }
             output = kr.runGraph(executor, module, arrays, 0, grid.quarters)
             for name in library.statement_outputs:
-                values = output[name][:, : len(instruments)]
-                published[name] = grid.gather(values, annual=name.startswith("y_")).astype(dtype, copy=False)
-        return published
+                results.add(name, grid, output[name][:, : len(instruments)])
+        return results
 
     def run(
         self,
         inputs: dict[str, Any],
         module: Any | None = None,
         *,
+        statements: StatementResults | None = None,
         output_buffers: dict[str, Any] | None = None,
         trim_outputs: bool = True,
     ) -> dict[str, Any]:
@@ -370,6 +393,8 @@ class KunQuantFactorEngine:
         absent = sorted(set(self.input_fields) - set(inputs))
         if absent:
             raise DataContractError(f"Missing KunQuant inputs: {absent}")
+        if self.statement_factors and statements is None:
+            raise DataContractError(f"Factor set {self.config.factor_set} needs its statement-graph results")
         numpy_dtype = np.float64 if self.config.dtype == "double" else np.float32
         normalized = {
             name: np.ascontiguousarray(np.asarray(inputs[name], dtype=numpy_dtype)) for name in self.input_fields
@@ -403,13 +428,22 @@ class KunQuantFactorEngine:
         if output_buffers is not None and set(output_buffers) != set(expected):
             raise DataContractError("KunQuant output buffers do not match the locked catalog")
         executor = kr.createMultiThreadExecutor(self.config.workers)
-        run_buffers = {name: values[:run_length] for name, values in (output_buffers or {}).items()}
+        run_buffers = {name: output_buffers[name][:run_length] for name in self.graph_outputs} if output_buffers else {}
         output = kr.runGraph(executor, module, normalized, 0, run_length, run_buffers)
         if packing is not None:
             output = {
                 name: packing.unpack(values, output_buffers[name] if output_buffers else None, time_count)
                 for name, values in output.items()
             }
+        if self.statement_factors:
+            # Published on the days with a close, like every other factor; infinite values are missing.
+            trading = np.isfinite(np.asarray(inputs["close"], dtype=float))
+            for name, result in self.statement_factors.items():
+                values = statements.daily(result)
+                target = output_buffers[name] if output_buffers else np.empty((time_count, stock_count + pad_stocks))
+                target[:, :stock_count] = np.where(trading & np.isfinite(values), values, np.nan)
+                target[:, stock_count:] = np.nan
+                output[name] = target
         if pad_stocks and trim_outputs:
             output = {name: np.ascontiguousarray(values[:, :stock_count]) for name, values in output.items()}
         if tuple(output) != expected:
@@ -448,7 +482,8 @@ class KunQuantFactorEngine:
         external, reference_hashes = _load_panel_references(
             self.libraries, Path(canonical_root), dates, instruments, dict(self.config.external_inputs), pd
         )
-        external.update(self.statement_inputs(external, dates, instruments))
+        statements = self.run_statements(external, dates, instruments)
+        external.update({name: statements.daily(name) for name in self.reference_fields if name in statements})
         # Cross-sectional operators use the research universe's members of each day.
         external["universe"] = pd.DataFrame(output_mask, index=dates, columns=instruments)
         missing_references = sorted(set(self.reference_fields) - set(external))
@@ -502,6 +537,7 @@ class KunQuantFactorEngine:
                 result = self.run(
                     matrices,
                     module=module,
+                    statements=statements,
                     output_buffers=output_buffers,
                     trim_outputs=False,
                 )
