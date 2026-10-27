@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算 Alpha158、Alpha101、Alpha360 与 GTJA191 因子；其余面板因子集使用 Pandas 面板后端。
+- KunQuant 编译并计算全部九个公式因子集；Hquality 和 recent 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -361,15 +361,22 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 
 ### 因子库代码结构
 
-所有可研究的因子公式由 RQuant 自己维护。Alpha158/Alpha101/Alpha360/GTJA191 使用 KunQuant 后端，china_chars、
-size_value_china、talib、jq240 与 oap 使用 Pandas 宽表后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约：
+所有可研究的因子公式由 RQuant 自己维护。Alpha158、Alpha101、Alpha360、GTJA191、china_chars、
+size_value_china、talib、jq240 与 oap 全部使用 KunQuant 后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约。
+原 Pandas 实现保留在 `tests/panel_reference/` 中作为独立数值对照。Python 负责读取、排列数据和按公告日发布财报结果；
+财报公式在季度图中计算，日频公式在交易日图中计算，缺失的窗口、递推、回归和行业截面能力由 C++ 扩展算子提供：
 
 ```text
 src/rquant/factors/
 ├── extensions/
 │   ├── kunquant.py                      # KunQuant 缺失能力的最小扩展与适配
-│   └── kunquant_panel.py                # 与 Pandas 面板语义一致的 KunQuant 算子（窗口、递归、逐股 C++ 状态）
-├── panel_operators.py                   # 公共 Pandas 面板算子
+│   ├── kunquant_panel.py                # 与 Pandas 面板语义一致的窗口、递归和逐股 C++ 算子
+│   ├── kunquant_jq240.py                # jq240 的停牌窗口与截面运算
+│   ├── kunquant_oap.py                  # oap 的季度、月度和行业截面运算
+│   ├── kunquant_oap_regression.py       # oap 奇异回归窗口的伪逆回退
+│   └── ta_lib/ta_lib.hpp                # 编译到 KunQuant 图中的 TA-Lib C 函数
+├── panel_operators.py                   # 独立数值参考及研究流程使用的 Pandas 算子
+├── statements.py                        # 首次披露财报季度网格与公告日对齐
 ├── catalog.py                           # 动态目录、稳定命名和实现指纹
 ├── engine.py                            # 后端选择、执行和标准分区写入
 ├── selection.py                         # 按年度稳定性、覆盖率与相关性筛选因子
@@ -397,10 +404,13 @@ Alpha360 的迁入公式基于 Qlib 0.9.7 的 MIT 源码。两项来源与许可
 `THIRD_PARTY_NOTICES.md`。
 
 因子公式优先直接组合 KunQuant 公共算子。只有 KunQuant 0.1.11 无法表达的能力才放入
-`extensions/kunquant.py`；当前仅包含 Alpha101 行业中性化所需的横截面扩展和轻量符号适配，不复制
+`extensions/`；扩展覆盖行业截面、窗口、递推和逐股 C++ 计算，不复制
 `OpBase`、优化 pass、代码生成器或运行时。
 
 ### 添加自己的因子库
+
+迁移会改变各因子集的实现指纹，旧因子库需要按正式构建命令重建，再重建依赖它们的 Hquality 和 recent。
+截断数据的数值对照测试使用临时目录，不替换已有因子库；完整历史数据上的性能和结果须另行验证。
 
 在 `src/rquant/factors/libraries/` 中新建独立模块。小型因子库可直接使用 `CustomFactorLibrary`：
 
@@ -468,7 +478,7 @@ rquant factors validate --factor-set gtja191
 `Alpha159` 的 `HGIH` 按 `HIGH` 修正并保留其原始加权式；`Alpha181` 的分母 `SUM` 缺少窗口参数，
 实现采用与分子一致的 20 日窗口，并在源码 `GTJA191_FORMULA_NOTES` 中固定这些解释。
 
-GTJA191 由 KunQuant 编译执行（sh_main 规模从 Pandas 单线程 2 小时以上降到分钟级，首次编译约 40 秒）。原 Pandas
+GTJA191 由 KunQuant 编译执行，首次构建需要本机 C++ 编译器，编译耗时取决于平台与图规模。原 Pandas
 实现保留在 `tests/panel_reference/gtja191.py`，测试逐格比对全部 190 条公式。为保证跨编译器、跨 CPU 结果一致：
 截面 `rank` 和时序 `ts_rank` 先把输入保留 40 位有效二进制位并把绝对值小于 1e-12 的值置 0，使理论上相等的值
 严格并列；该库编译时关闭 FMA 合并（GCC/Clang 的 `-ffp-contract=off`，MSVC 默认不合并）。
@@ -631,8 +641,8 @@ rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
 
 ### TA-Lib 因子集 talib
 
-`talib` 逐只股票调用 TA-Lib C 库（`TA-Lib==0.8.2` Python 包，自带 Windows/macOS/Linux 预编译 wheel，无需另装 C 库），
-定义锁定在 `src/rquant/factors/libraries/talib_indicators.py`：
+`talib` 将仓库内的 TA-Lib 0.8.1 C 函数编译到 KunQuant 图中，逐只股票计算；
+`TA-Lib==0.8.2` Python 包用于独立对照测试。定义锁定在 `src/rquant/factors/libraries/talib_indicators.py`：
 
 - 只用 OHLCV，不需要参考数据；每只股票先去掉停牌和上市前的空行，再按自身连续交易日计算，所以 EMA、Wilder 平滑、
   希尔伯特变换等递归指标不会被停牌缺口重置；每只股票最初 `lookback` 个交易日（TA-Lib 无值，K 线形态会给占位 0）为空；
@@ -646,7 +656,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
   也未纳入；
 - 61 个 K 线形态输出为 TA-Lib 原值：形态完成当天看涨 +100 / 看跌 -100（少数形态为 ±200），否则为 0。
 
-因子清单的实现指纹包含 TA-Lib Python 包与 C 库版本，升级 TA-Lib 会使旧的 `data/factors/talib` 失效。
+因子清单的实现指纹包含公式模块和仓库内的 TA-Lib C 源码，修改这些实现会使旧的 `data/factors/talib` 失效。
 
 ```bash
 rquant factors build --factor-set talib
