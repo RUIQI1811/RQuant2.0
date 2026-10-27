@@ -155,7 +155,8 @@ class KunQuantFactorEngine:
         preludes = list(dict.fromkeys(library.cpp_prelude for library in self.libraries if library.cpp_prelude))
         if not preludes:
             return cfake.CppCompilerConfig(other_flags=flags)
-        prelude = "#include <algorithm>\n#include <limits>\n#include <vector>\n" + "\n".join(preludes) + "\n"
+        prelude = "#include <algorithm>\n#include <cmath>\n#include <cstddef>\n#include <limits>\n#include <vector>\n"
+        prelude += "\n".join(preludes) + "\n"
 
         def compile_with_prelude(sources: list[tuple[str, str]], compile_one: Any) -> Any:
             return cfake.multi_thread_compile([(name, prelude + source) for name, source in sources], compile_one)
