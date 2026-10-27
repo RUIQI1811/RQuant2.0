@@ -139,7 +139,7 @@ rquant doctor --skip-permission-check
 | `data.formal_start`              | `2010-01-01` | 正式研究起点                 |
 | `data.warmup_trading_days`       |        `300` | 正式研究前预热交易日数       |
 | `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
-| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）或 `all` |
+| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）、`main`（沪深主板，见下文）、`sh_main`（沪市主板）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `data.fundamentals_start_year`   |       `2004` | `data sync-fundamentals` 抓取财报的最早公告年份 |
@@ -175,6 +175,8 @@ rquant data sync --through 2026-08-04
 
 - 为 2010 年正式研究期自动准备 300 个交易日的预热历史；
 - 获取全 A 股日线及所需参考数据，同时保留历史时点沪深 300 成分信息；
+- 按 `through` 日期逐只留存全部股票的历史名称（`namechange`，用于逐日判断 ST）。全市场一次性分页查询的排序不稳定、会漏行，
+  所以每只股票单独请求，约 6000 次，按默认限流约 30 分钟；
 - 按 `through` 日期留存申万行业快照，分页获取历史已失效记录（`is_new=N`）和当前有效记录（`is_new=Y`）；标准数据只使用最新完整快照，以保持行业时点覆盖并避免当前记录被永久缓存；
 - 每个分区都带有内容哈希和清单；
 - 已完成且哈希有效的分区会作为缓存复用；
@@ -234,6 +236,7 @@ rquant data build-qlib
 - 原始价格、复权价格、成交量与复权因子；
 - 停牌缺口、开盘涨跌停限制；
 - 历史时点沪深 300 成分；
+- 历史时点 ST 状态（`is_st`，没有 `namechange` 历史时为空）与上市交易日数（`listed_days`）；
 - 历史时点行业分类和市值。
 
 如果 Tushare 返回的 OHLC 违反 `low <= open/close <= high`，属于当日历史沪深 300
@@ -269,6 +272,32 @@ python -m json.tool data/qlib/manifest.json
   `ann_date` 为三张表都已公告的日期；
 - `manifest.json`：上述文件的哈希、所依据的原始同步指纹和财报同步指纹。
 
+### 研究股票池
+
+| 股票池   | 每个交易日的成员 |
+| -------- | ---------------- |
+| `csi300` | 当日可知的沪深 300 成分股 |
+| `main`   | 沪市 60 开头、深市 00 开头的主板 A 股（含原中小板 002/003），剔除创业板 30、科创板 68、北交所和 B 股；当日名称为 ST、\*ST 或“退”（退市整理）的股票，以及上市后前 60 个交易日的次新股，当日也不在池内 |
+| `sh_main` | `main` 中只保留沪市 60 开头的股票，ST 与次新股剔除规则相同 |
+| `all`    | 全部 A 股 |
+
+ST 状态按 Tushare `namechange` 的历史名称逐日判断（生效日即 `start_date`），上市天数按交易日历从 `list_date` 起数。
+规则定义在 `src/rquant/universe.py`。股票池逐日决定因子库发布哪些行，因此只影响训练样本与可买入的股票；
+时间序列指标仍使用每只股票进池前的历史。
+
+除 `csi300` 外，每个股票池的因子库写在各自目录（`main` 为 `data/factors-main/`，`sh_main` 为 `data/factors-sh_main/`），与沪深 300 的
+`data/factors/` 并存。临时切换股票池用全局参数 `--universe`，它覆盖 `data.universe`：
+
+```bash
+rquant --universe main factors build --factor-set qlib_alpha158
+rquant --universe main walk-forward --model lgb --horizon 1d --factor-set qlib_alpha158 --through 2026-10-23
+rquant report RUN_ID   # 自动按该滚动训练的股票池回测
+```
+
+`walk-forward` 会检查因子库的股票池与当前股票池一致；`report` 从滚动训练清单读取股票池，与配置无关。
+`main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
+`rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
+
 财报需要单独同步（按股票、按公告日窗口请求单股接口，不需要 `*_vip` 批量接口权限）：
 
 ```bash
@@ -276,7 +305,7 @@ rquant data sync-fundamentals --through 2026-08-04
 rquant data build-reference
 ```
 
-`sync-fundamentals` 只抓取股票池可能包含的股票（`csi300` 为全部历史成分，`all` 为全部 A 股），结果清单写在
+`sync-fundamentals` 只抓取股票池可能包含的股票（`csi300` 为全部历史成分，`main` 为全部主板股票，`all` 为全部 A 股），结果清单写在
 `data/raw/fundamentals_manifest.json`，不改动 `data sync` 的清单。已结束的公告日窗口不会再变，再次同步只重抓
 截至 `--through` 的最后一个窗口。某个窗口返回达到 100 行时，Tushare 可能截断了结果，会自动按年拆分重抓。
 `build-reference` 只重建参考数据，要求原始同步与标准数据一致；原始数据变化后应改跑 `build-qlib`。
@@ -631,7 +660,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set talib
   均线、EMA、布林带、MACD 按聚宽口径除以收盘价，ATR 与多空力道也除以收盘价，`price_no_fq` 是 daily_basic 的不复权收盘价；
   成交量是标准数据的复权成交量，成交额为元，换手率为 daily_basic 的流通股换手率（%）；
 - 风格因子按聚宽文档的 Barra CNE5 描述子计算（beta 半衰期 63、RSTR 504 日滞后 21 日、DASTD/CMRA/HSIGMA 等），
-  截面标准化、排序和正交化只用当日的沪深 300 成分股，市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
+  截面标准化、排序和正交化只用当日的研究股票池成员（默认沪深 300），市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
 - 未实现：`non_recurring_gain_loss` 与 `adjusted_profit_to_total_profit`（需要 `fina_indicator` 的扣非净利润），
   以及风格因子中依赖分析师预期的 EPIBS、EGRLF、EGRSF（其权重按比例分给其余描述子）。
 
@@ -662,7 +691,7 @@ AnnouncementReturn）。
 - 市值为日度总市值；股利为 daily_basic 的 `dv_ttm` 乘总市值，过去 12 个月股利总额变化超过 5% 的日子视为一次派息变动，
   DivSeason/DivYieldST 以 11–12 个月前是否有变动判断下月是否派息；需要剔除送转的股数（ShareIss1Y/5Y、PS）用
   总股本 × 不复权价 / 复权价；
-- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日沪深 300 成分股，行业为申万一级；
+- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日研究股票池成员（默认沪深 300），行业为申万一级；
 - 美股样本过滤（股价低于 5 美元、交易所、股票代码、SIC 金融业剔除等）不再使用；定义本身的限制保留（FirmAgeMom 只取最年轻
   五分之一，MomVol 只取换手率最高三分之一）；美国特有常数换成 A 股口径（法定税率 2008 年前 33%、之后 25%；ShareVol
   用沪深 300 换手率三分位代替美股 5%/10% 阈值）。
@@ -958,7 +987,7 @@ python -m ruff check src tests
 - 原始历史：2010 年前保留足够覆盖 300 个交易日预热的数据；
 - 正式研究期：从 2010 年开始；
 - 数据范围：保留全部 A 股日线；
-- 研究股票池：历史时点可知的沪深 300；
+- 研究股票池：历史时点可知的沪深 300（可切换为沪深主板 `main` 或全部 A 股 `all`）；
 - 标签：下一开盘到再下一开盘的 1 日收益，或下一开盘到第六个开盘的 5 日收益；
 - 滚动评估：前三个完整自然年训练，下一年样本外测试；
 - 组合：long-only TopkDropout，持股 50，每 5 个交易日全量调整到最新前 50 名；

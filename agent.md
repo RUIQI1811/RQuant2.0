@@ -20,7 +20,7 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 实现、测试和文档必须保持以下研究口径：
 
 - 正式研究从 2010 年开始，并保留至少 300 个交易日的预热数据；
-- 股票池是历史时点可知的沪深 300 成分，不得使用当前成分回填历史；
+- 股票池按历史时点判断（默认沪深 300 成分，可选沪深主板 `main`：逐日剔除 ST 与上市不足 60 个交易日的次新股），不得使用当前成分或当前名称回填历史；
 - 1 日标签为下一开盘到再下一开盘的收益；5 日标签为下一开盘到第六个开盘的收益；
 - 滚动训练使用此前三个完整自然年，测试下一年；
 - 组合是 A 股约束下的 long-only TopkDropout（默认持股 50、每 5 个交易日全量调仓），而不是可交易的多空组合；
@@ -166,14 +166,14 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   变化的值。`TALIB_INDICATORS` 中的 lookback 必须与已安装 TA-Lib 一致；实现指纹包含 TA-Lib 包与 C 库版本。
   `tests/test_talib_indicators.py` 用截断数据重算、价格缩放不变性和停牌缺口回归验证；
 - `jq240` 列名为 `jq_001` 至 `jq_233`，来源名为聚宽因子名；它是按聚宽因子库公开定义独立重写的日频版本（未使用聚宽代码或数据），
-  读取参考数据中的 daily_basic、全 A 市场收益、首次披露财报与标准数据的 `in_csi300`。价量指标只在每只股票自身的交易日上计算，
-  截面标准化、排序与正交化只用当日沪深 300 成分股；财报口径与 `china_chars` 相同。它需要 `FUNDAMENTAL_ENDPOINT_FIELDS`
+  读取参考数据中的 daily_basic、全 A 市场收益、首次披露财报，以及引擎传入的当日研究股票池成员。价量指标只在每只股票自身的交易日上计算，
+  截面标准化、排序与正交化只用当日研究股票池成员；财报口径与 `china_chars` 相同。它需要 `FUNDAMENTAL_ENDPOINT_FIELDS`
   中标注为 jq240 的字段，增删这些字段会使财报分区与 `fundamentals.parquet` 失效，须重新 `data sync-fundamentals` 与
   `data build-reference`，并重建 `china_chars`。`tests/test_jq240.py` 用截断数据重算、停牌窗口和直接公式回归验证；
 - `oap` 列名为 `oap_001` 至 `oap_142`，来源名为 Open Source Asset Pricing 信号简称；它是按 Chen-Zimmermann `SignalDoc`
   公开定义独立重写的日频版本（未使用其代码或数据）。`OAP_NAMES` 与 `OAP_SKIPPED` 必须合起来恰好覆盖 212 个 Predictor，
   跳过的信号要写明原因。月度信号在以当日结尾的不重叠 21 日块上计算；财报口径与 `china_chars` 相同；截面运算只用当日
-  沪深 300 成分股。`tests/test_oap.py` 用截断数据重算回归验证无前视；
+  研究股票池成员（引擎传入）。`tests/test_oap.py` 用截断数据重算回归验证无前视；
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖 `data/canonical/reference/index_daily.parquet`

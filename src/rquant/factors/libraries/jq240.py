@@ -574,21 +574,6 @@ class JQ240Library(PanelFactorLibrary):
         inputs["mkt"] = factors["mkt"].reindex(dates)
         inputs["fundamentals"] = fundamentals[fundamentals["instrument"].isin(set(instruments))]
 
-        # Cross-sectional operations use the point-in-time index members of each day.
-        bar_files = sorted((canonical_root / "bars").glob("year=*/*.parquet"))
-        bar_files = [path for path in bar_files if int(path.parent.name.split("=")[1]) in years]
-        if not bar_files:
-            raise DataContractError(f"Canonical bars do not exist under {canonical_root / 'bars'}")
-        members = pd.concat(
-            [
-                pd.read_parquet(path, columns=["datetime", "instrument", "in_csi300"], filters=wanted)
-                for path in bar_files
-            ],
-            ignore_index=True,
-        )
-        members["datetime"] = pd.to_datetime(members["datetime"])
-        membership = members.pivot(index="datetime", columns="instrument", values="in_csi300")
-        inputs["universe"] = membership.reindex(index=dates, columns=instruments).eq(True)
         hashes = {
             "jq240_reference": manifest["fingerprint"],
             "jq240_daily_basic": stable_hash({name: files[name] for name in daily_files}),

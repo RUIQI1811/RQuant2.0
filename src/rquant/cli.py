@@ -22,7 +22,6 @@ from rquant.data.reference import ReferenceBuilder
 from rquant.errors import DataContractError, DependencyError, RQuantError
 from rquant.factors.catalog import CATALOG_VERSION, FactorSet, get_catalog
 from rquant.factors.engine import (
-    SUPPORTED_UNIVERSES,
     FactorBuildConfig,
     cpp_compiler_probe,
     create_factor_engine,
@@ -33,6 +32,7 @@ from rquant.integrations.rdagent import RDAgentExporter, default_mining_window
 from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
 from rquant.runs import RunContext
+from rquant.universe import SUPPORTED_UNIVERSES
 from rquant.workflow.backtest import PortfolioBacktestRunner, PortfolioConfig
 from rquant.workflow.runner import RollingWorkflowRunner
 
@@ -43,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rquant", description="RQuant A-share daily research framework")
     parser.add_argument("--root", default=".", help="Project root (default: current directory)")
     parser.add_argument("--config", default="config/default.yaml", help="Configuration path relative to project root")
+    parser.add_argument(
+        "--universe",
+        choices=SUPPORTED_UNIVERSES,
+        help=(
+            "Override data.universe: csi300, main (SH/SZ main board without ST and new listings), sh_main "
+            "(Shanghai main board only, same screens) or all"
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     doctor = commands.add_parser("doctor", help="Validate interpreter, dependencies, token and local datasets")
@@ -187,6 +195,8 @@ def _config(args: argparse.Namespace) -> tuple[dict[str, Any], ProjectPaths]:
     if not config_path.is_absolute():
         config_path = root / config_path
     config = load_config(config_path)
+    if getattr(args, "universe", None):
+        config.setdefault("data", {})["universe"] = args.universe
     paths = resolve_paths(config, root)
     paths.create_runtime_dirs()
     return config, paths
@@ -296,6 +306,7 @@ def _probe_tushare_permissions(token: str) -> tuple[bool, dict[str, Any]]:
         "index_daily": {"ts_code": "399300.SZ", "start_date": recent, "end_date": end},
         "index_weight": {"index_code": "399300.SZ", "start_date": recent, "end_date": end},
         "index_member_all": {"is_new": "N", "limit": 1},
+        "namechange": {"ts_code": "000001.SZ", "limit": 1},
     }
     client = ts.pro_api(token)
     failures: dict[str, str] = {}
@@ -565,6 +576,7 @@ def _walk_forward(args: argparse.Namespace) -> int:
         last_year = args.last_year or through.year
         run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
         run.add_input("factor_manifest", _fingerprint(paths.factors / args.factor_set / "manifest.json"))
+        _require_factor_universe(paths.factors / args.factor_set / "manifest.json", _universe(config))
         runner = RollingWorkflowRunner(
             qlib_root=paths.qlib,
             factor_root=paths.factors,
@@ -628,7 +640,7 @@ def _report(args: argparse.Namespace) -> int:
             stamp_tax_before=float(backtest.get("stamp_tax_before_2023_08_28", 0.001)),
             stamp_tax_after=float(backtest.get("stamp_tax_from_2023_08_28", 0.0005)),
             impact_cost=float(backtest.get("impact_cost", 0.0)),
-            universe=_universe(config),
+            universe=_walk_forward_universe(run_directory, config),
             rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
         )
         run.add_input("walk_forward_run_id", args.run_id)
@@ -687,6 +699,27 @@ def _through(args: argparse.Namespace, config: dict[str, Any]) -> date:
     if configured is None:
         raise ValueError("--through is required unless data.through is set in the configuration")
     return _date_value(configured)
+
+
+def _require_factor_universe(manifest_path: Path, universe: str) -> None:
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        built = json.load(handle).get("universe", "csi300")
+    if built != universe:
+        raise DataContractError(
+            f"Factor store {manifest_path.parent} was built for universe {built!r}, not {universe!r}; "
+            "rebuild it with `rquant factors build` for this universe"
+        )
+
+
+def _walk_forward_universe(run_directory: Path, config: dict[str, Any]) -> str:
+    """The universe a walk-forward run trained on, so its report backtests the same universe."""
+    manifest_path = run_directory / "walk_forward.json"
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            universe = json.load(handle).get("universe")
+        if universe:
+            return str(universe)
+    return _universe(config)
 
 
 def _universe(config: dict[str, Any]) -> str:

@@ -137,6 +137,10 @@ CANONICAL_BAR_COLUMNS = (
     "limit_buy",
     "limit_sell",
     "in_csi300",
+    # Point-in-time ST/*ST/delisting name (Tushare namechange); null when the raw sync has no namechange history.
+    "is_st",
+    # Trading days since listing, counting the listing day as 1.
+    "listed_days",
 )
 
 

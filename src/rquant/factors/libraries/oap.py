@@ -446,21 +446,7 @@ class OAPLibrary(PanelFactorLibrary):
         listed = pd.to_datetime(basic.set_index("instrument")["list_date"], format="%Y%m%d", errors="coerce")
         inputs["list_date"] = listed.reindex(instruments)
 
-        # Cross-sectional operations use the point-in-time index members of each day.
-        bar_files = sorted((canonical_root / "bars").glob("year=*/*.parquet"))
-        bar_files = [path for path in bar_files if int(path.parent.name.split("=")[1]) in years]
-        if not bar_files:
-            raise DataContractError(f"Canonical bars do not exist under {canonical_root / 'bars'}")
-        members = pd.concat(
-            [
-                pd.read_parquet(path, columns=["datetime", "instrument", "in_csi300"], filters=wanted)
-                for path in bar_files
-            ],
-            ignore_index=True,
-        )
-        members["datetime"] = pd.to_datetime(members["datetime"])
-        membership = members.pivot(index="datetime", columns="instrument", values="in_csi300")
-        inputs["universe"] = membership.reindex(index=dates, columns=instruments).eq(True)
+        # Cross-sectional operations use the research universe's members of each day, which the engine passes in.
         hashes = {
             "oap_reference": manifest["fingerprint"],
             "oap_daily_basic": stable_hash({name: files[name] for name in daily_files}),

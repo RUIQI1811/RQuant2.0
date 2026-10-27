@@ -11,6 +11,7 @@ from typing import Any
 from rquant.data.canonical import ts_code_to_qlib
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, stable_hash
+from rquant.universe import BOARD_PREFIXES, SCREEN_COLUMNS, universe_intervals
 
 QLIB_FIELDS = (
     "open",
@@ -50,7 +51,8 @@ class QlibProviderBuilder:
         if not bars_paths:
             raise DataContractError("No canonical bar partitions found")
         # Only the provider fields are loaded; the full canonical history does not fit in memory on smaller machines.
-        columns = ["instrument", "datetime", *QLIB_FIELDS]
+        universe_columns = list(SCREEN_COLUMNS) if source_manifest.get("st_history") else []
+        columns = ["instrument", "datetime", *QLIB_FIELDS, *universe_columns]
         bars = pd.concat([pd.read_parquet(path, columns=columns) for path in bars_paths], ignore_index=True)
         bars["datetime"] = pd.to_datetime(bars["datetime"])
         calendar = self._calendar(end_time=bars["datetime"].max())
@@ -64,6 +66,10 @@ class QlibProviderBuilder:
             self._write_calendar(temporary_root, calendar, future_calendar)
             self._write_instruments(temporary_root, "all", self._all_intervals(calendar))
             self._write_instruments(temporary_root, "csi300", self._csi300_intervals(calendar))
+            if universe_columns:
+                screened_bars = bars[["instrument", "datetime", *universe_columns]]
+                for market in BOARD_PREFIXES:
+                    self._write_instruments(temporary_root, market, universe_intervals(screened_bars, market))
             for instrument, frame in bars.groupby("instrument", sort=True):
                 self._write_instrument(temporary_root, instrument, frame, calendar, calendar_lookup)
             benchmark = self._write_benchmark(temporary_root, calendar, calendar_lookup)
@@ -87,6 +93,7 @@ class QlibProviderBuilder:
             "calendar_days": len(calendar),
             "future_calendar_end": future_calendar[-1].date().isoformat(),
             "instruments": int(bars["instrument"].nunique()),
+            "markets": ["all", "csi300", *(BOARD_PREFIXES if universe_columns else [])],
             "benchmark": benchmark,
             "fields": list(QLIB_FIELDS),
             "fingerprint": stable_hash(

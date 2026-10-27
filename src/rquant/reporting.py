@@ -7,8 +7,15 @@ from typing import Any
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json
 
+UNIVERSE_LABELS = {
+    "csi300": "CSI300",
+    "main": "Shanghai/Shenzhen main-board (no ST, no first 60 trading days)",
+    "sh_main": "Shanghai main-board (no ST, no first 60 trading days)",
+    "all": "all A-share",
+}
+
 LIMITATIONS = [
-    "Long-only point-in-time CSI300 portfolio.",
+    "Long-only point-in-time {universe} portfolio.",
     "No order-book queue model.",
     "No market-impact or participation-capacity model.",
     "Daily bars cannot model intraday execution priority at the opening auction.",
@@ -38,6 +45,12 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
         raise DependencyError("pandas and pyarrow are required for reporting") from exc
 
     predictions = pd.read_parquet(predictions_path)
+    workflow = None
+    walk_forward = run_dir / "walk_forward.json"
+    if walk_forward.exists():
+        with walk_forward.open("r", encoding="utf-8") as handle:
+            workflow = json.load(handle)
+    universe = (workflow or {}).get("universe", "csi300")
     summary = {
         "status": "complete",
         "prediction_rows": len(predictions),
@@ -45,12 +58,11 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
         "prediction_end": str(predictions["datetime"].max()),
         "instruments": int(predictions["instrument"].nunique()),
         "score_missing": int(predictions["score"].isna().sum()),
-        "limitations": LIMITATIONS,
+        "universe": universe,
+        "limitations": [item.format(universe=UNIVERSE_LABELS.get(universe, universe)) for item in LIMITATIONS],
     }
-    walk_forward = run_dir / "walk_forward.json"
-    if walk_forward.exists():
-        with walk_forward.open("r", encoding="utf-8") as handle:
-            summary["workflow"] = json.load(handle)
+    if workflow is not None:
+        summary["workflow"] = workflow
     backtest = run_dir / "backtest.json"
     if backtest.exists():
         with backtest.open("r", encoding="utf-8") as handle:
@@ -68,6 +80,7 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
         "",
         f"- Prediction rows: {summary['prediction_rows']}",
         f"- Prediction period: {summary['prediction_start']} to {summary['prediction_end']}",
+        f"- Universe: {universe}",
         f"- Instruments: {summary['instruments']}",
         "",
     ]
@@ -110,7 +123,7 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
                 )
             )
         markdown.append("")
-    markdown.extend(["## Limitations", "", *(f"- {item}" for item in LIMITATIONS), ""])
+    markdown.extend(["## Limitations", "", *(f"- {item}" for item in summary["limitations"]), ""])
     (run_dir / "report.md").write_text("\n".join(markdown), encoding="utf-8")
     return summary
 

@@ -70,6 +70,18 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("| 2020 | 2020-01-02 to 2020-01-03 | +2.46% | +0.98% | +1.48 pp |", markdown)
         self.assertIn("| 2021 | 2021-01-04 to 2021-01-05 | +6.20% | +1.00% | +5.20 pp |", markdown)
 
+    def test_report_names_the_walk_forward_universe(self) -> None:
+        atomic_write_json(self.run_directory / "walk_forward.json", {"status": "complete", "universe": "sh_main"})
+
+        report = build_report(self.run_directory)
+
+        self.assertEqual("sh_main", report["universe"])
+        markdown = (self.run_directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("- Universe: sh_main", markdown)
+        label = "- Long-only point-in-time Shanghai main-board (no ST, no first 60 trading days) portfolio."
+        self.assertIn(label, markdown)
+        self.assertNotIn("{universe}", markdown)
+
     def test_report_rejects_incomplete_portfolio_columns(self) -> None:
         pd = self.pd
         pd.DataFrame(
