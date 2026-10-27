@@ -94,6 +94,13 @@ class FactorLibrary(ABC):
     quote_fields: tuple[str, ...] = ()
     # C++ source (helper functions the graph's kernels call) placed before every generated KunQuant source file.
     cpp_prelude = ""
+    # A statement graph (``build_statements``) runs over fiscal quarters x instruments of the first-reported statements
+    # in the reference input ``fundamentals``, reading ``statement_fields`` and ``fiscal_quarter`` (0 for Q1). The
+    # engine publishes each result named in ``statement_outputs`` as a daily input of ``build``: ``q_`` results from
+    # the latest quarter known on the day, ``y_`` results from the latest known fiscal year
+    # (``rquant.factors.statements``). Statement outputs are listed in ``reference_inputs`` too.
+    statement_fields: tuple[str, ...] = ()
+    statement_outputs: tuple[str, ...] = ()
 
     @property
     @abstractmethod
@@ -103,6 +110,10 @@ class FactorLibrary(ABC):
     def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         """Build source-name to KunQuant expression mappings."""
         raise NotImplementedError(f"{self.family} does not implement the KunQuant backend")
+
+    def build_statements(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Build ``statement_outputs`` to KunQuant expressions over fiscal quarters x instruments."""
+        raise NotImplementedError(f"{self.family} has no statement graph")
 
     def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
         """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""

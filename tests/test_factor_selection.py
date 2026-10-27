@@ -151,7 +151,7 @@ class FactorSelectionRegistryTests(unittest.TestCase):
         self.assertEqual(96, len(selection.canonical_names))
         sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
         self.assertEqual(set(selection.source_factor_sets), sources)
-        self.assertEqual({"kunquant", "panel"}, {library.backend for library in registry.select("recent")})
+        self.assertEqual({"kunquant"}, {library.backend for library in registry.select("recent")})
 
 
 class SelectionFactorEngineTests(unittest.TestCase):

@@ -432,6 +432,32 @@ def sumif(value: Node, window: int, condition: Node, *, valid_rows: Node | None 
     return ts_sum(selected, window)
 
 
+def nan_mean(*values: Node) -> Node:
+    """Mean of the present values among ``values``; missing when none is present."""
+    terms = [f"if (!std::isnan(x{index})) {{ total += x{index}; ++count; }}" for index in range(len(values))]
+    body = " ".join(terms)
+    return cpp_state(list(values), f"{{T}} total = 0; int count = 0; {body} y = count > 0 ? total / count : NAN;")
+
+
+def rolling_nan_std(value: Node, window: int, minimum: int) -> Node:
+    """Sample standard deviation of the present values among the newest ``window`` rows.
+
+    Missing with fewer than ``max(minimum, 2)`` present values, like pandas ``rolling(window, min_periods)``.
+    """
+    return cpp_state(
+        [value],
+        f"s.ring[s.next] = x0; s.next = (s.next + 1) % {window}; "
+        f"{{T}} total = 0; int count = 0; "
+        f"for (int i = 0; i < {window}; ++i) if (!std::isnan(s.ring[i])) {{ total += s.ring[i]; ++count; }} "
+        f"const {{T}} mean = total / count; {{T}} squares = 0; "
+        f"for (int i = 0; i < {window}; ++i) if (!std::isnan(s.ring[i])) "
+        "squares += (s.ring[i] - mean) * (s.ring[i] - mean); "
+        f"y = count >= {max(minimum, 2)} ? std::sqrt(squares / (count - 1)) : NAN;",
+        members=f"{{T}} ring[{window}]; int next;",
+        init=f"for (int i = 0; i < {window}; ++i) s.ring[i] = NAN; s.next = 0;",
+    )
+
+
 def recursive(value: Node, update: Any, *, initial: float | str = "nan") -> Node:
     """Carry a per-stock state through time: ``state = update(value, previous_state)`` each row.
 

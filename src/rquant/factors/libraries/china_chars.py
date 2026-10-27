@@ -18,11 +18,19 @@ Daily adaptation
 Upstream characteristics that cannot be built from Tushare data at this account level are not in the catalog:
 employee counts (hn, lfe), advertising expense (adm, gad), CH-4 factor loadings (mkt_beta, vmg_beta, smb_beta,
 pmo_beta), q-factor idiosyncratic moments (idvq, idsq) and the unfinished tail-risk measure (tail).
+
+KunQuant computes every formula in two graphs. The statement graph (``build_statements``) runs over fiscal quarters
+x instruments; the engine publishes each of its results on the trading days its quarter is the latest known one
+(``rquant.factors.statements``). The daily graph (``build``) combines those results with prices and market data; its
+rolling statistics and regressions are C++ kernels (``CPP_PRELUDE``) over each stock's whole series. The pandas
+reference in ``tests/panel_reference`` is the original implementation.
 """
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Mapping
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +38,12 @@ import numpy as np
 import pandas as pd
 
 from rquant.errors import DataContractError
-from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.panel_operators import replace_inf, safe_div
+from rquant.factors import statements
+from rquant.factors.extensions import kunquant_panel as k
+from rquant.factors.extensions.kunquant import kunquant_symbols
+from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 from rquant.io import sha256_file, stable_hash
 
-Panel = pd.DataFrame
 MONTH = 21
 QUARTER = 63
 HALF_YEAR = 120
@@ -162,20 +171,8 @@ CHINA_CHARS: tuple[tuple[str, str, int], ...] = (
 CHINA_CHARS_NAMES = tuple(name for name, _, _ in CHINA_CHARS)
 CHINA_CHARS_DAILY_BASIC = {"turnover_rate": 0.01, "circ_mv": 10_000.0, "close": 1.0}
 MARKET_FACTORS = ("mkt", "smb", "hml")
-# Balance-sheet items that Tushare leaves empty when the company reports none.
-ZERO_IF_MISSING = (
-    "trad_asset",
-    "lt_eqt_invest",
-    "goodwill",
-    "intan_assets",
-    "st_borr",
-    "non_cur_liab_due_1y",
-    "lt_borr",
-    "bond_payable",
-    "minority_int",
-    "oth_eqt_tools_p_shr",
-)
-YTD_FLOWS = (
+# Statement columns the statement graph reads.
+STATEMENT_FIELDS = (
     "revenue",
     "oper_cost",
     "sell_exp",
@@ -189,21 +186,360 @@ YTD_FLOWS = (
     "n_income_attr_p",
     "n_cashflow_act",
     "c_pay_acq_const_fiolta",
-    "n_incr_cash_cash_equ",
     "depr_fa_coga_dpba",
     "amort_intang_assets",
     "lt_amort_deferred_exp",
+    "total_share",
+    "money_cap",
+    "trad_asset",
+    "accounts_receiv",
+    "inventories",
+    "total_cur_assets",
+    "lt_eqt_invest",
+    "fix_assets",
+    "intan_assets",
+    "goodwill",
+    "total_assets",
+    "st_borr",
+    "non_cur_liab_due_1y",
+    "total_cur_liab",
+    "lt_borr",
+    "bond_payable",
+    "total_liab",
+    "minority_int",
+    "oth_eqt_tools_p_shr",
+    "total_hldr_eqy_exc_min_int",
+    "total_hldr_eqy_inc_min_int",
 )
-# Finance, depreciation and amortisation lines are blank rather than zero for many firms.
-ZERO_IF_MISSING_FLOWS = ("sell_exp", "admin_exp", "fin_exp", "depr_fa_coga_dpba", "amort_intang_assets",
-                         "lt_amort_deferred_exp")
+# Statement-graph results. ``q_`` results reach the daily graph from the latest known quarter, ``y_`` results from
+# the latest known fiscal year.
+STATEMENT_OUTPUTS = (
+    "q_roe",
+    "q_droe",
+    "q_roa",
+    "q_droa",
+    "q_rna",
+    "q_pm",
+    "q_ato",
+    "q_ct",
+    "y_gpa",
+    "q_gpla",
+    "y_ope",
+    "q_ople",
+    "y_opa",
+    "q_opla",
+    "q_tbi",
+    "q_bl",
+    "y_sg",
+    "q_sgq",
+    "q_fscore",
+    "q_oscore",
+    "q_book",
+    "q_total_liab",
+    "q_total_assets",
+    "q_earnings_ttm",
+    "q_cash_earnings_ttm",
+    "y_sr",
+    "q_enterprise_debt",
+    "q_ebitda_ttm",
+    "q_revenue_ttm",
+    "q_operating_cash_ttm",
+    "y_de",
+    "q_net_debt",
+    "q_ag",
+    "q_dpia",
+    "q_noa",
+    "q_dnoa",
+    "y_ig",
+    "y_cdi",
+    "y_ivg",
+    "y_ivchg",
+    "y_oacc",
+    "y_tacc",
+    "y_dwc",
+    "y_dcoa",
+    "y_dcol",
+    "y_dnco",
+    "y_dnca",
+    "y_dncl",
+    "y_dfin",
+    "y_dbe",
+    "q_rd",
+    "q_rds",
+    "y_ol",
+    "y_dsi",
+    "y_dsa",
+    "y_dgs",
+    "y_dss",
+    "y_etr_rate_change",
+    "y_earnings_change",
+    "q_tan",
+    "q_vcf",
+    "q_cta",
+    "q_esm",
+    "q_ala",
+    "q_asset_liquidity",
+    "q_debt_value",
+    "q_sue",
+    "q_rs",
+    "q_tes",
+)
+# Characteristics published straight from one statement-graph result.
+FROM_STATEMENTS = {
+    name: result
+    for result in STATEMENT_OUTPUTS
+    if (name := result[2:]) in {spec[0] for spec in CHINA_CHARS}
+}
+# Characteristics that divide a statement-graph result by the total market value.
+OVER_MARKET_VALUE = {
+    "bm": "q_book",
+    "dm": "q_total_liab",
+    "am": "q_total_assets",
+    "ep": "q_earnings_ttm",
+    "cfp": "q_cash_earnings_ttm",
+    "sp": "q_revenue_ttm",
+    "ocfp": "q_operating_cash_ttm",
+    "ndp": "q_net_debt",
+    "rdm": "q_rd",
+}
+DAILY_REFERENCE = (
+    *(f"basic_{field}" for field in CHINA_CHARS_DAILY_BASIC),
+    *MARKET_FACTORS,
+    "announced",
+    "calendar_day",
+    "listed_day",
+)
+
+CPP_PRELUDE = r"""
+namespace rq_cnc {
+
+static const double kNaN = std::numeric_limits<double>::quiet_NaN();
+enum Statistic { kSum, kMean, kStd, kSkew, kMax };
+
+// close[t] / close[t - 1] - 1, missing around a missing close.
+static inline std::vector<double> simple_returns(int n, const double *close) {
+    std::vector<double> r(n, kNaN);
+    for (int t = 1; t < n; ++t) r[t] = close[t] / close[t - 1] - 1.0;
+    return r;
+}
+
+// The latest finite value at or before every row.
+static inline std::vector<double> forward_filled(int n, const double *values) {
+    std::vector<double> filled(n, kNaN);
+    double last = kNaN;
+    for (int t = 0; t < n; ++t) {
+        if (std::isfinite(values[t])) last = values[t];
+        filled[t] = last;
+    }
+    return filled;
+}
+
+// pandas ``safe_div``: missing for a denominator within 1e-12 of zero and for an infinite result.
+static inline double safe_div(double numerator, double denominator) {
+    if (!(std::fabs(denominator) >= 1e-12)) return kNaN;
+    const double result = numerator / denominator;
+    return std::isinf(result) ? kNaN : result;
+}
+
+// pandas ``rolling(window, min_periods=minimum)`` statistics of the finite values among the ``window`` rows ending
+// at ``t``: sum, mean, sample standard deviation, bias-corrected skewness or maximum. A window of one repeated value
+// has a standard deviation and skewness of exactly 0.
+static inline double rolling(const double *values, int t, int window, int minimum, Statistic statistic) {
+    int count = 0;
+    double total = 0.0, largest = -std::numeric_limits<double>::infinity(), first = kNaN;
+    bool same = true;
+    for (int i = t - window + 1 < 0 ? 0 : t - window + 1; i <= t; ++i) {
+        const double value = values[i];
+        if (!std::isfinite(value)) continue;
+        if (count == 0) first = value; else same = same && value == first;
+        ++count;
+        total += value;
+        if (value > largest) largest = value;
+    }
+    if (count == 0 || count < minimum) return kNaN;
+    if (statistic == kSum) return total;
+    if (statistic == kMax) return largest;
+    const double mean = total / count;
+    if (statistic == kMean) return mean;
+    if (count < (statistic == kStd ? 2 : 3)) return kNaN;
+    if (same) return 0.0;
+    double squares = 0.0, cubes = 0.0;
+    for (int i = t - window + 1 < 0 ? 0 : t - window + 1; i <= t; ++i) {
+        if (!std::isfinite(values[i])) continue;
+        const double deviation = values[i] - mean;
+        squares += deviation * deviation;
+        cubes += deviation * deviation * deviation;
+    }
+    if (statistic == kStd) return std::sqrt(squares / (count - 1));
+    const double variance = squares / count, spread = std::sqrt(variance);
+    if (variance <= 1e-14) return kNaN;
+    return std::sqrt(count * (count - 1.0)) * (cubes / count) / ((count - 2.0) * spread * spread * spread);
+}
+
+// Solve the k x k system ``a x = b`` by Gaussian elimination with partial pivoting; false when singular.
+static inline bool solve(int k, std::vector<double> a, std::vector<double> b, double *x) {
+    for (int c = 0; c < k; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < k; ++r) if (std::fabs(a[r * k + c]) > std::fabs(a[pivot * k + c])) pivot = r;
+        if (a[pivot * k + c] == 0.0) return false;
+        if (pivot != c) {
+            for (int j = 0; j < k; ++j) std::swap(a[c * k + j], a[pivot * k + j]);
+            std::swap(b[c], b[pivot]);
+        }
+        for (int r = c + 1; r < k; ++r) {
+            const double factor = a[r * k + c] / a[c * k + c];
+            for (int j = c; j < k; ++j) a[r * k + j] -= factor * a[c * k + j];
+            b[r] -= factor * b[c];
+        }
+    }
+    for (int r = k - 1; r >= 0; --r) {
+        double value = b[r];
+        for (int j = r + 1; j < k; ++j) value -= a[r * k + j] * x[j];
+        x[r] = value / a[r * k + r];
+    }
+    return true;
+}
+
+enum Fit { kBeta, kSlopes, kResidualStd, kResidualSkew, kCoskew, kResidualMomentum };
+
+// Rolling OLS of ``y`` on a constant and the ``x`` columns over trailing ``window`` rows, dropping rows where ``y`` or
+// a regressor is missing, published on the window's last row. ``x[0]`` is the market for co-skewness. The residual
+// momentum is the mean over standard deviation of the full-window residuals in window positions [first, last).
+// Window sums come from prefix sums of cross-products up to third order.
+static inline void rolling_regression(int n, const double *y, const std::vector<const double *> &x, int window,
+                                      int minimum, Fit fit, int first, int last, double *out) {
+    const int k = static_cast<int>(x.size()) + 1;
+    if (n < window) return;
+    std::vector<double> design(static_cast<size_t>(n) * k, 0.0), weight(n, 0.0), value(n, 0.0);
+    for (int t = 0; t < n; ++t) {
+        bool ok = true;
+        for (int j = 1; j < k; ++j) ok = ok && std::isfinite(x[j - 1][t]);
+        if (!ok) continue;
+        design[static_cast<size_t>(t) * k] = 1.0;
+        for (int j = 1; j < k; ++j) design[static_cast<size_t>(t) * k + j] = x[j - 1][t];
+        if (std::isfinite(y[t])) { weight[t] = 1.0; value[t] = y[t]; }
+    }
+    const size_t k2 = static_cast<size_t>(k) * k, k3 = k2 * k;
+    std::vector<double> pn(n + 1, 0.0), py(n + 1, 0.0), pyy(n + 1, 0.0), pyyy(n + 1, 0.0);
+    std::vector<double> px((n + 1) * static_cast<size_t>(k), 0.0), pxy(px.size(), 0.0), pxyy(px.size(), 0.0);
+    std::vector<double> pxx((n + 1) * k2, 0.0), pxxy(pxx.size(), 0.0), pxxx((n + 1) * k3, 0.0);
+    for (int t = 0; t < n; ++t) {
+        const double w = weight[t], v = value[t];
+        const double *d = &design[static_cast<size_t>(t) * k];
+        pn[t + 1] = pn[t] + w;
+        py[t + 1] = py[t] + v;
+        pyy[t + 1] = pyy[t] + v * v;
+        pyyy[t + 1] = pyyy[t] + std::pow(v, 3.0);
+        for (int a = 0; a < k; ++a) {
+            const size_t ia = static_cast<size_t>(t) * k + a;
+            px[ia + k] = px[ia] + d[a] * w;
+            pxy[ia + k] = pxy[ia] + d[a] * v;
+            pxyy[ia + k] = pxyy[ia] + d[a] * (v * v);
+            for (int b = 0; b < k; ++b) {
+                const size_t iab = t * k2 + a * k + b;
+                const double outer = d[a] * d[b];
+                pxx[iab + k2] = pxx[iab] + outer * w;
+                pxxy[iab + k2] = pxxy[iab] + outer * v;
+                for (int c = 0; c < k; ++c) {
+                    const size_t iabc = t * k3 + (a * k + b) * k + c;
+                    pxxx[iabc + k3] = pxxx[iabc] + outer * d[c] * w;
+                }
+            }
+        }
+    }
+    std::vector<double> gram(k2), sxy(k), beta(k);
+    // Range sums over rows [lo, hi) of the prefix arrays with ``size`` values per row.
+    auto range = [](const std::vector<double> &prefix, size_t size, int lo, int hi, size_t at) {
+        return prefix[hi * size + at] - prefix[lo * size + at];
+    };
+    auto linear = [&](const std::vector<double> &prefix, int lo, int hi) {
+        double total = 0.0;
+        for (int a = 0; a < k; ++a) total += beta[a] * range(prefix, k, lo, hi, a);
+        return total;
+    };
+    auto quadratic = [&](const std::vector<double> &prefix, int lo, int hi) {
+        double total = 0.0;
+        for (int a = 0; a < k; ++a) {
+            double row = 0.0;
+            for (int b = 0; b < k; ++b) row += range(prefix, k2, lo, hi, a * k + b) * beta[b];
+            total += beta[a] * row;
+        }
+        return total;
+    };
+    for (int t = window - 1; t < n; ++t) {
+        const int lo = t + 1 - window, hi = t + 1;
+        const double count = pn[hi] - pn[lo];
+        if (!(count >= minimum)) continue;
+        for (int a = 0; a < k; ++a) {
+            sxy[a] = range(pxy, k, lo, hi, a);
+            for (int b = 0; b < k; ++b) gram[a * k + b] = range(pxx, k2, lo, hi, a * k + b);
+        }
+        if (!solve(k, gram, sxy, beta.data())) continue;
+        double result = kNaN;
+        if (fit == kBeta) {
+            result = beta[1];
+        } else if (fit == kSlopes) {
+            result = 0.0;
+            for (int a = 1; a < k; ++a) result += beta[a];
+        } else if (fit == kResidualMomentum) {
+            const int start = lo + first, stop = lo + last;
+            const double part_n = pn[stop] - pn[start];
+            const double part_e = py[stop] - py[start] - linear(px, start, stop);
+            const double part_ee = pyy[stop] - pyy[start] - 2.0 * linear(pxy, start, stop)
+                + quadratic(pxx, start, stop);
+            const double mean = part_e / part_n;
+            const double spread = std::sqrt((part_ee - part_n * (mean * mean)) / (part_n - 1));
+            if (part_n >= (last - first) / 2 && spread > 0) result = mean / spread;
+        } else {
+            const double syy = pyy[hi] - pyy[lo];
+            const double squared = syy - 2.0 * linear(pxy, lo, hi) + quadratic(pxx, lo, hi);
+            // Prefix-sum rounding can leave a tiny negative or zero residual sum of squares for an exact fit.
+            if (squared > 1e-14 * (syy > 1e-300 ? syy : 1e-300)) {
+                const double variance = squared / count;
+                if (fit == kResidualStd) {
+                    result = count > k ? std::sqrt(squared / (count - k)) : kNaN;
+                } else if (fit == kResidualSkew) {
+                    double cubic = 0.0;
+                    for (int a = 0; a < k; ++a)
+                        for (int b = 0; b < k; ++b)
+                            for (int c = 0; c < k; ++c)
+                                cubic += beta[a] * beta[b] * beta[c] * range(pxxx, k3, lo, hi, (a * k + b) * k + c);
+                    const double cubed = pyyy[hi] - pyyy[lo] - 3.0 * linear(pxyy, lo, hi)
+                        + 3.0 * quadratic(pxxy, lo, hi) - cubic;
+                    result = (cubed / count) / std::pow(variance, 1.5);
+                } else {
+                    // Residual moments against the market: sum(e m), sum(e m^2) and the centered market moments.
+                    double e_m = range(pxy, k, lo, hi, 1), e_mm = range(pxxy, k2, lo, hi, k + 1);
+                    for (int a = 0; a < k; ++a) {
+                        e_m -= beta[a] * range(pxx, k2, lo, hi, a * k + 1);
+                        e_mm -= beta[a] * range(pxxx, k3, lo, hi, (a * k + 1) * k + 1);
+                    }
+                    const double sum_e = py[hi] - py[lo] - linear(px, lo, hi);
+                    const double market_mean = range(px, k, lo, hi, 1) / count;
+                    const double centered = range(pxx, k2, lo, hi, k + 1) - count * (market_mean * market_mean);
+                    const double co_moment = e_mm - 2.0 * market_mean * e_m + market_mean * market_mean * sum_e;
+                    result = (co_moment / count) / (std::sqrt(variance) * centered / count);
+                }
+            }
+        }
+        out[t] = result;
+    }
+}
+
+}  // namespace rq_cnc
+"""
 
 
-class ChinaCharsLibrary(PanelFactorLibrary):
-    """China A-share equity characteristics, re-dated to daily point-in-time panels."""
+class ChinaCharsLibrary(FactorLibrary):
+    """China A-share equity characteristics, re-dated to daily point-in-time panels and computed in KunQuant."""
 
     family = "china_chars"
     required_inputs = ("close", "amount", "cap", "sector")
+    reference_inputs = (*DAILY_REFERENCE, *STATEMENT_OUTPUTS)
+    statement_fields = STATEMENT_FIELDS
+    statement_outputs = STATEMENT_OUTPUTS
+    strict_float = True
+    cpp_prelude = CPP_PRELUDE
 
     @property
     def specs(self) -> tuple[FactorSpec, ...]:
@@ -215,10 +551,17 @@ class ChinaCharsLibrary(PanelFactorLibrary):
                 ordinal=ordinal,
                 formula=description,
                 max_lookback=lookback,
-                implementation=f"rquant.factors.libraries.china_chars.ChinaChars.{name}",
-                catalog_version=2,
+                implementation=f"rquant.factors.libraries.china_chars.{name}",
+                catalog_version=3,
             )
             for ordinal, (name, description, lookback) in enumerate(CHINA_CHARS, 1)
+        )
+
+    @property
+    def implementation_fingerprint(self) -> str:
+        """Also pin the statement alignment, which lives in another module."""
+        return stable_hash(
+            {"module": super().implementation_fingerprint, "statements": inspect.getsource(statements)}
         )
 
     def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
@@ -269,960 +612,568 @@ class ChinaCharsLibrary(PanelFactorLibrary):
             "china_chars_fundamentals": files["fundamentals.parquet"],
             "china_chars_stock_basic": stock_basic_hash,
         }
-        return inputs, hashes
+        return self.align_reference_inputs(inputs, dates, instruments), hashes
 
-    def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
-        calculator = ChinaChars(inputs)
-        return {name: calculator.calculate(name) for name in CHINA_CHARS_NAMES}
+    def align_reference_inputs(self, inputs: Mapping[str, Any], dates: Any, instruments: Any) -> dict[str, Any]:
+        """Add the calendar inputs of the daily graph: announcement events and the day numbers of dates and listings.
 
-    def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
-        calculator = ChinaChars(inputs)
-        for spec in self.specs:
-            output_buffers[spec.canonical_name][...] = calculator.calculate(spec.source_name).to_numpy(dtype=float)
-            calculator.release(spec.source_name)
+        ``announced`` is 1 on the trading day after each statement announcement (the first day its earnings
+        reaction is complete), ``calendar_day`` numbers the dates and ``listed_day`` each instrument's listing date.
+        """
+        dates, instruments = pd.DatetimeIndex(dates), pd.Index(instruments)
+        aligned = dict(inputs)
+        frame = inputs["fundamentals"]
+        published = np.searchsorted(dates.to_numpy(), pd.to_datetime(frame["ann_date"]).to_numpy()) + 1
+        columns = instruments.get_indexer(frame["instrument"])
+        keep = (columns >= 0) & (published < len(dates))
+        announced = np.full((len(dates), len(instruments)), np.nan)
+        announced[published[keep], columns[keep]] = 1.0
+        aligned["announced"] = announced
+        epoch = np.datetime64("1970-01-01", "D")
+        aligned["calendar_day"] = pd.Series((dates.to_numpy().astype("datetime64[D]") - epoch).astype(float),
+                                            index=dates)
+        listed = pd.to_datetime(pd.Series(inputs["list_date"]).reindex(instruments)).to_numpy().astype("datetime64[D]")
+        listed_day = np.where(np.isnat(listed), np.nan, (listed - epoch).astype(float))
+        aligned["listed_day"] = np.ascontiguousarray(np.broadcast_to(listed_day, (len(dates), len(instruments))))
+        return aligned
 
+    def build_statements(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        return _statement_graph(inputs)
 
-class QuarterGrid:
-    """First-reported fiscal-quarter values per instrument, with the trading day each quarter becomes usable.
-
-    Arrays are ``instruments x quarters``. A quarter's usable row is the first trading date on or after its
-    announcement, raised to the latest usable row of every earlier reported quarter, so a characteristic anchored on a
-    quarter can read any lagged quarter without looking ahead.
-    """
-
-    def __init__(self, fundamentals: Any, dates: pd.DatetimeIndex, instruments: pd.Index) -> None:
-        frame = fundamentals[fundamentals["instrument"].isin(set(instruments))].copy()
-        self.dates = dates
-        self.instruments = instruments
-        end = pd.to_datetime(frame["end_date"])
-        quarter_number = (end.dt.year * 4 + (end.dt.month - 1) // 3).to_numpy()
-        self.first_quarter = int(quarter_number.min()) if len(quarter_number) else 0
-        last_quarter = int(quarter_number.max()) if len(quarter_number) else 0
-        self.quarters = last_quarter - self.first_quarter + 1
-        rows = instruments.get_indexer(frame["instrument"])
-        columns = quarter_number - self.first_quarter
-        shape = (len(instruments), self.quarters)
-        self.reported = np.zeros(shape, dtype=bool)
-        self.reported[rows, columns] = True
-        usable = np.full(shape, -1, dtype=np.int64)
-        usable[rows, columns] = np.searchsorted(dates.to_numpy(), pd.to_datetime(frame["ann_date"]).to_numpy())
-        self.usable = np.maximum.accumulate(usable, axis=1)
-        self._values: dict[str, np.ndarray] = {}
-        for column in frame.columns:
-            if column in {"instrument", "end_date", "ann_date"}:
-                continue
-            values = np.full(shape, np.nan)
-            values[rows, columns] = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
-            if column in ZERO_IF_MISSING or column in ZERO_IF_MISSING_FLOWS:
-                values = np.where(self.reported & np.isnan(values), 0.0, values)
-            self._values[column] = values
-        self.quarter_index = (np.arange(self.quarters) + self.first_quarter) % 4
-        self.anchor = self._anchor(self.reported)
-        self.annual_anchor = self._anchor(self.reported & (self.quarter_index == 3)[None, :])
-        self._singles: dict[str, np.ndarray] = {}
-
-    def _anchor(self, eligible: np.ndarray) -> np.ndarray:
-        """Return the latest eligible quarter column usable on each trading date, or -1."""
-        anchor = np.full((len(self.dates), len(self.instruments)), -1, dtype=np.int64)
-        rows, columns = np.nonzero(eligible & (self.usable < len(self.dates)) & (self.usable >= 0))
-        np.maximum.at(anchor, (self.usable[rows, columns], rows), columns)
-        return np.maximum.accumulate(anchor, axis=0)
-
-    def value(self, name: str) -> np.ndarray:
-        try:
-            return self._values[name]
-        except KeyError as exc:
-            raise DataContractError(f"Fundamental reference lacks {name}") from exc
-
-    def single(self, name: str) -> np.ndarray:
-        """Convert a year-to-date flow into single-quarter values."""
-        if name not in self._singles:
-            ytd = self.value(name)
-            previous = lag(ytd, 1)
-            self._singles[name] = np.where(self.quarter_index[None, :] == 0, ytd, ytd - previous)
-        return self._singles[name]
-
-    def ttm(self, name: str) -> np.ndarray:
-        single = self.single(name)
-        return single + lag(single, 1) + lag(single, 2) + lag(single, 3)
-
-    def annual(self, name: str) -> np.ndarray:
-        """Fiscal-year totals (Q4 year-to-date) at Q4 columns; flows only."""
-        return np.where(self.quarter_index[None, :] == 3, self.value(name), np.nan)
-
-    def panel(self, values: np.ndarray, *, annual: bool = False) -> Panel:
-        anchor = self.annual_anchor if annual else self.anchor
-        columns = np.broadcast_to(np.arange(len(self.instruments)), anchor.shape)
-        result = values[columns, np.clip(anchor, 0, None)] if values.size else np.full(anchor.shape, np.nan)
-        result = np.where(anchor >= 0, result, np.nan)
-        return Panel(result, index=self.dates, columns=self.instruments)
+    def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        outputs = _daily_graph(inputs)
+        trading = k.notna(inputs["close"])
+        return {name: k.mask(k.replace_inf(outputs[name]), trading) for name in CHINA_CHARS_NAMES}
 
 
-def lag(values: np.ndarray, periods: int) -> np.ndarray:
-    """Shift quarter columns right so column q holds quarter q - periods."""
-    result = np.full(values.shape, np.nan)
-    if periods < values.shape[1]:
-        result[:, periods:] = values[:, : values.shape[1] - periods]
-    return result
+# ---------------------------------------------------------------------------------------------------- statements
+def _statement_graph(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """Statement formulas over fiscal quarters (rows) x instruments."""
+    fiscal_quarter = inputs["fiscal_quarter"]
+    singles: dict[str, Any] = {}
+
+    def value(name: str) -> Any:
+        return inputs[name]
+
+    def lag(node: Any, periods: int) -> Any:
+        return k.delay(node, periods)
+
+    def single(name: str) -> Any:
+        """A year-to-date flow as single-quarter values."""
+        if name not in singles:
+            ytd = value(name)
+            singles[name] = k.select(k.eq(fiscal_quarter, 0.0), ytd, ytd - lag(ytd, 1))
+        return singles[name]
+
+    def ttm(name: str) -> Any:
+        flow = single(name)
+        return flow + lag(flow, 1) + lag(flow, 2) + lag(flow, 3)
+
+    def annual(name: str) -> Any:
+        """Fiscal-year totals (Q4 year-to-date) at Q4 rows."""
+        return k.mask(value(name), k.eq(fiscal_quarter, 3.0))
+
+    def growth(current: Any, previous: Any) -> Any:
+        """Relative change, defined only for a positive base."""
+        return k.safe_div(current - previous, k.mask(previous, k.gt(previous, 0.0)))
+
+    ratio = k.safe_div
+    assets = value("total_assets")
+    book = value("total_hldr_eqy_exc_min_int") - value("oth_eqt_tools_p_shr")
+    debt = value("st_borr") + value("non_cur_liab_due_1y") + value("lt_borr") + value("bond_payable")
+    net_operating_assets = value("total_hldr_eqy_inc_min_int") + debt - value("money_cap") - value("trad_asset")
+
+    def operating_profit(flow: Callable[[str], Any]) -> Any:
+        return flow("revenue") - flow("oper_cost") - flow("sell_exp") - flow("admin_exp") - flow("fin_exp")
+
+    def lagged_assets_change(node: Any) -> Any:
+        return ratio(node - lag(node, 4), lag(assets, 4))
+
+    def change_gap(first: Any, second: Any) -> Any:
+        return growth(first, lag(first, 4)) - growth(second, lag(second, 4))
+
+    def surprise(node: Any) -> Any:
+        change = node - lag(node, 4)
+        return ratio(change, k.rolling_nan_std(change, 8, 6))
+
+    out: dict[str, Any] = {}
+    # Profitability
+    roe = ratio(single("n_income_attr_p"), lag(book, 1))
+    roa = ratio(single("n_income"), lag(assets, 1))
+    out["q_roe"] = roe
+    out["q_droe"] = roe - lag(roe, 4)
+    out["q_roa"] = roa
+    out["q_droa"] = roa - lag(roa, 4)
+    out["q_rna"] = ratio(single("operate_profit"), lag(net_operating_assets, 1))
+    out["q_pm"] = ratio(single("operate_profit"), single("revenue"))
+    out["q_ato"] = ratio(single("revenue"), lag(net_operating_assets, 1))
+    out["q_ct"] = ratio(single("revenue"), lag(assets, 1))
+    out["y_gpa"] = ratio(annual("revenue") - annual("oper_cost"), assets)
+    out["q_gpla"] = ratio(single("revenue") - single("oper_cost"), lag(assets, 1))
+    out["y_ope"] = ratio(operating_profit(annual), book)
+    out["q_ople"] = ratio(operating_profit(single), lag(book, 1))
+    out["y_opa"] = ratio(operating_profit(annual), assets)
+    out["q_opla"] = ratio(operating_profit(single), lag(assets, 1))
+    out["q_tbi"] = ratio(single("total_profit"), single("n_income"))
+    out["q_bl"] = ratio(assets, book)
+    out["y_sg"] = growth(annual("revenue"), lag(annual("revenue"), 4))
+    out["q_sgq"] = growth(single("revenue"), lag(single("revenue"), 4))
+    out["q_fscore"] = _fscore(value, single, lag)
+    out["q_oscore"] = _oscore(value, ttm, lag)
+    # Value
+    depreciation = ttm("depr_fa_coga_dpba") + ttm("amort_intang_assets") + ttm("lt_amort_deferred_exp")
+    revenue = annual("revenue")
+    out["q_book"] = book
+    out["q_total_liab"] = value("total_liab")
+    out["q_total_assets"] = assets
+    out["q_earnings_ttm"] = ttm("n_income_attr_p")
+    out["q_cash_earnings_ttm"] = ttm("n_income") + depreciation
+    sales_growth = k.const(0.0)
+    for year in range(1, 6):
+        sales_growth = sales_growth + (6 - year) * growth(lag(revenue, 4 * (year - 1)), lag(revenue, 4 * year))
+    out["y_sr"] = sales_growth / 15.0
+    out["q_enterprise_debt"] = (
+        debt + value("oth_eqt_tools_p_shr") + value("minority_int") - value("money_cap") - value("trad_asset")
+    )
+    out["q_ebitda_ttm"] = ttm("total_profit") + ttm("fin_exp") + depreciation
+    out["q_revenue_ttm"] = ttm("revenue")
+    out["q_operating_cash_ttm"] = ttm("n_cashflow_act")
+    out["y_de"] = ratio(value("total_liab"), book)
+    out["q_net_debt"] = debt + value("oth_eqt_tools_p_shr") - value("money_cap") - value("trad_asset")
+    # Investment
+    out["q_ag"] = growth(assets, lag(assets, 4))
+    out["q_dpia"] = lagged_assets_change(value("fix_assets") + value("inventories"))
+    out["q_noa"] = ratio(net_operating_assets, lag(assets, 4))
+    out["q_dnoa"] = lagged_assets_change(net_operating_assets)
+    capex = annual("c_pay_acq_const_fiolta")
+    out["y_ig"] = growth(capex, lag(capex, 4))
+    liabilities = value("total_liab")
+    base = lag(liabilities, 20)
+    out["y_cdi"] = k.log(ratio(liabilities, k.mask(base, k.gt(base, 0.0))))
+    inventory = value("inventories")
+    out["y_ivg"] = growth(inventory, lag(inventory, 4))
+    out["y_ivchg"] = ratio(inventory - lag(inventory, 4), (assets + lag(assets, 4)) / 2.0)
+    out["y_oacc"] = ratio(annual("n_income") - annual("n_cashflow_act"), lag(assets, 4))
+    current_assets = value("total_cur_assets") - value("money_cap") - value("trad_asset")
+    current_liabilities = value("total_cur_liab") - value("st_borr") - value("non_cur_liab_due_1y")
+    non_current_assets = value("total_assets") - value("total_cur_assets") - value("lt_eqt_invest")
+    non_current_liabilities = (
+        value("total_liab") - value("total_cur_liab") - value("lt_borr") - value("bond_payable")
+    )
+    financial = value("trad_asset") + value("lt_eqt_invest") - debt - value("oth_eqt_tools_p_shr")
+    working = current_assets - current_liabilities
+    total = working + (non_current_assets - non_current_liabilities) + financial
+    out["y_tacc"] = lagged_assets_change(total)
+    out["y_dwc"] = lagged_assets_change(current_assets - current_liabilities)
+    out["y_dcoa"] = lagged_assets_change(current_assets)
+    out["y_dcol"] = lagged_assets_change(current_liabilities)
+    out["y_dnco"] = lagged_assets_change(non_current_assets - non_current_liabilities)
+    out["y_dnca"] = lagged_assets_change(non_current_assets)
+    out["y_dncl"] = lagged_assets_change(non_current_liabilities)
+    out["y_dfin"] = lagged_assets_change(financial)
+    out["y_dbe"] = lagged_assets_change(book)
+    # Other
+    out["q_rd"] = single("rd_exp")
+    out["q_rds"] = ratio(single("rd_exp"), single("revenue"))
+    out["y_ol"] = ratio(annual("oper_cost") + annual("sell_exp") + annual("admin_exp"), assets)
+    out["y_dsi"] = change_gap(annual("revenue"), value("inventories"))
+    out["y_dsa"] = change_gap(annual("revenue"), value("accounts_receiv"))
+    out["y_dgs"] = change_gap(annual("revenue") - annual("oper_cost"), annual("revenue"))
+    out["y_dss"] = change_gap(annual("revenue"), annual("sell_exp") + annual("admin_exp"))
+    rate = ratio(annual("income_tax"), annual("total_profit"))
+    out["y_etr_rate_change"] = rate - k.nan_mean(*(lag(rate, 4 * years) for years in (1, 2, 3)))
+    income = annual("n_income_attr_p")
+    out["y_earnings_change"] = income - lag(income, 4)
+    tangible = (
+        value("money_cap")
+        + 0.715 * value("accounts_receiv")
+        + 0.547 * value("inventories")
+        + 0.535 * value("fix_assets")
+    )
+    out["q_tan"] = ratio(tangible, assets)
+    out["q_vcf"] = k.rolling_nan_std(ratio(single("n_cashflow_act"), single("revenue")), 16, 8)
+    out["q_cta"] = ratio(value("money_cap"), assets)
+    earnings = k.rolling_nan_std(ratio(single("n_income"), lag(assets, 1)), 16, 8)
+    cash = k.rolling_nan_std(ratio(single("n_cashflow_act"), lag(assets, 1)), 16, 8)
+    out["q_esm"] = ratio(earnings, cash)
+    current = value("total_cur_assets")
+    money = value("money_cap")
+    liquidity = money + 0.75 * (current - money) + 0.5 * (assets - current - value("goodwill") - value("intan_assets"))
+    out["q_ala"] = ratio(liquidity, lag(assets, 1))
+    out["q_asset_liquidity"] = liquidity
+    out["q_debt_value"] = assets - book
+    out["q_sue"] = surprise(single("n_income_attr_p"))
+    out["q_rs"] = surprise(single("revenue"))
+    tax = single("income_tax")
+    out["q_tes"] = ratio(tax - lag(tax, 4), lag(assets, 4))
+    return {name: out[name] for name in STATEMENT_OUTPUTS}
 
 
-def ratio(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
-    with np.errstate(divide="ignore", invalid="ignore"):
-        result = numerator / np.where(np.abs(denominator) < 1e-12, np.nan, denominator)
-    return np.where(np.isfinite(result), result, np.nan)
+def _fscore(value: Callable[[str], Any], single: Callable[[str], Any], lag: Callable[[Any, int], Any]) -> Any:
+    """Piotroski F-score: nine binary signals, missing unless every signal's inputs are known."""
+    ratio = k.safe_div
+    assets = value("total_assets")
+    income = single("n_income")
+    cash_flow = single("n_cashflow_act")
+    revenue = single("revenue")
+    roa = ratio(income, lag(assets, 1))
+    leverage = ratio(value("lt_borr") + value("bond_payable"), assets)
+    current = ratio(value("total_cur_assets"), value("total_cur_liab"))
+    margin = ratio(revenue - single("oper_cost"), revenue)
+    turnover = ratio(revenue, lag(assets, 1))
+    shares = value("total_share")
+    components = (
+        (roa, k.gt(roa, 0.0)),
+        (cash_flow, k.gt(cash_flow, 0.0)),
+        (roa - lag(roa, 4), k.gt(roa - lag(roa, 4), 0.0)),
+        (cash_flow - income, k.gt(cash_flow, income)),
+        (leverage - lag(leverage, 4), k.lt(leverage, lag(leverage, 4))),
+        (current - lag(current, 4), k.gt(current, lag(current, 4))),
+        (shares - lag(shares, 4), k.le(shares, lag(shares, 4))),
+        (margin - lag(margin, 4), k.gt(margin, lag(margin, 4))),
+        (turnover - lag(turnover, 4), k.gt(turnover, lag(turnover, 4))),
+    )
+    score = k.indicator(components[0][1])
+    for _, signal in components[1:]:
+        score = score + k.indicator(signal)
+    return k.mask(score, k.valid(*(component for component, _ in components)))
 
 
-def growth(current: np.ndarray, previous: np.ndarray) -> np.ndarray:
-    """Relative change, defined only for a positive base."""
-    return ratio(current - previous, np.where(previous > 0, previous, np.nan))
+def _oscore(value: Callable[[str], Any], ttm: Callable[[str], Any], lag: Callable[[Any, int], Any]) -> Any:
+    """Ohlson O-score from the latest quarter's balance sheet and trailing-twelve-month flows."""
+    ratio = k.safe_div
+    assets = value("total_assets")
+    liabilities = value("total_liab")
+    current_assets = value("total_cur_assets")
+    current_liabilities = value("total_cur_liab")
+    income = ttm("n_income")
+    previous = lag(income, 4)
+    log_assets = k.log(k.mask(assets, k.gt(assets, 0.0)))
+    insolvent = k.mask(k.indicator(k.gt(liabilities, assets)), k.valid(liabilities - assets))
+    two_losses = k.mask(
+        k.indicator(k.all_of(k.lt(income, 0.0), k.lt(previous, 0.0))), k.valid(income + previous)
+    )
+    return (
+        k.const(-1.32)
+        - 0.407 * log_assets
+        + 6.03 * ratio(liabilities, assets)
+        - 1.43 * ratio(current_assets - current_liabilities, assets)
+        + 0.076 * ratio(current_liabilities, current_assets)
+        - 1.72 * insolvent
+        - 2.37 * ratio(income, assets)
+        - 1.83 * ratio(ttm("n_cashflow_act"), liabilities)
+        + 0.285 * two_losses
+        - 0.521 * ratio(income - previous, k.absolute(income) + k.absolute(previous))
+    )
 
 
-def nan_mean(stacked: np.ndarray, axis: int) -> tuple[np.ndarray, np.ndarray]:
-    """Mean of the finite values along ``axis`` (missing when none) and their count."""
-    finite = np.isfinite(stacked)
-    count = finite.sum(axis=axis)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = np.where(finite, stacked, 0.0).sum(axis=axis) / count
-    return np.where(count > 0, mean, np.nan), count
+# ---------------------------------------------------------------------------------------------------- daily graph
+def _daily_graph(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """Every characteristic before the trading-day mask, from prices and the published statement results."""
+    close, amount, cap = inputs["close"], inputs["amount"], inputs["cap"]
+    turnover, float_value = inputs["basic_turnover_rate"], inputs["basic_circ_mv"]
+    market = [inputs[name] for name in MARKET_FACTORS]
+    positive_cap = k.mask(cap, k.gt(cap, 0.0))
 
+    def to_price(node: Any) -> Any:
+        return k.safe_div(node, positive_cap)
 
-def rolling_quarter_std(values: np.ndarray, window: int, minimum: int) -> np.ndarray:
-    """Sample standard deviation over the current and ``window - 1`` previous quarters."""
-    stacked = np.stack([lag(values, k) for k in range(window)], axis=2)
-    mean, count = nan_mean(stacked, 2)
-    squares = np.where(np.isfinite(stacked), (stacked - mean[..., None]) ** 2, 0.0).sum(axis=2)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        result = np.sqrt(squares / (count - 1))
-    return np.where(count >= max(minimum, 2), result, np.nan)
-
-
-def _window_sums(values: np.ndarray, window: int) -> np.ndarray:
-    """Sums over every trailing ``window`` rows, one result per window end row from ``window - 1`` on."""
-    prefix = np.concatenate([np.zeros((1, *values.shape[1:])), np.cumsum(values, axis=0)])
-    return prefix[window:] - prefix[:-window]
-
-
-def _range_sums(prefix: np.ndarray, first: np.ndarray, last: np.ndarray) -> np.ndarray:
-    return prefix[last] - prefix[first]
-
-
-def rolling_regression(
-    y: np.ndarray,
-    x: np.ndarray,
-    window: int,
-    minimum: int,
-    *,
-    residual_slices: Mapping[str, tuple[int, int]] | None = None,
-) -> dict[str, np.ndarray]:
-    """OLS of every stock column of ``y`` on a constant and the columns of ``x`` over trailing windows.
-
-    Missing stock or regressor rows are dropped inside each window. Statistics are placed on the window's last row.
-    The first ``x`` column is the market for co-skewness. ``residual_slices`` maps output names to positions inside
-    the window whose residual mean over residual standard deviation is reported (residual momentum).
-
-    Window statistics come from prefix sums of cross-products up to third order, so the cost does not grow with the
-    window length; a window's result depends only on rows up to its last row.
-    """
-    dates, stocks = y.shape
-    residual_slices = dict(residual_slices or {})
-    names = ("beta", "slopes", "resid_std", "resid_skew", "coskew", *residual_slices)
-    out = {name: np.full((dates, stocks), np.nan) for name in names}
-    if dates < window:
-        return out
-    design = np.column_stack([np.ones(dates), x])
-    design_ok = np.isfinite(design).all(axis=1)
-    design = np.where(design_ok[:, None], design, 0.0)
-    k = design.shape[1]
-    outer = design[:, :, None] * design[:, None, :]
-    cubic = outer[:, :, :, None] * design[:, None, None, :]
-    identity = np.eye(k)
-    ends = np.arange(window - 1, dates)
-    rows = slice(window - 1, dates)
-    for column in range(stocks):
-        series = y[:, column]
-        mask = np.isfinite(series) & design_ok
-        if mask.sum() < minimum:
-            continue
-        weight = mask.astype(float)
-        value = np.where(mask, series, 0.0)
-        count = _window_sums(weight, window)
-        valid = count >= minimum
-        if not valid.any():
-            continue
-        sum_x = _window_sums(design * weight[:, None], window)
-        gram = _window_sums(outer * weight[:, None, None], window)
-        sum_y = _window_sums(value, window)
-        sum_yy = _window_sums(value**2, window)
-        sum_xy = _window_sums(design * value[:, None], window)
-        gram[~valid] = identity
-        try:
-            beta = np.linalg.solve(gram, sum_xy[..., None])[..., 0]
-        except np.linalg.LinAlgError:
-            beta = (np.linalg.pinv(gram) @ sum_xy[..., None])[..., 0]
-        fitted_xy = np.einsum("nk,nk->n", beta, sum_xy)
-        squared = sum_yy - 2.0 * fitted_xy + np.einsum("nk,nkl,nl->n", beta, gram, beta)
-        sum_e = sum_y - np.einsum("nk,nk->n", beta, sum_x)
-        sum_xyy = _window_sums(design * (value**2)[:, None], window)
-        sum_xxy = _window_sums(outer * value[:, None, None], window)
-        sum_xxx = _window_sums(cubic * weight[:, None, None, None], window)
-        cubed = (
-            _window_sums(value**3, window)
-            - 3.0 * np.einsum("nk,nk->n", beta, sum_xyy)
-            + 3.0 * np.einsum("nk,nkl,nl->n", beta, sum_xxy, beta)
-            - np.einsum("ni,nj,nl,nijl->n", beta, beta, beta, sum_xxx)
+    def rolling(node: Any, window: int, minimum: int, statistic: str) -> Any:
+        return k.series_kernel(
+            [node],
+            f"for (int t = 0; t < n; ++t) out[t] = rq_cnc::rolling(x0, t, {window}, {minimum}, rq_cnc::{statistic});",
         )
-        # Residual moments against the market column: sum(e m) and sum(e m^2).
-        e_m = sum_xy[:, 1] - np.einsum("nk,nk->n", beta, gram[:, :, 1])
-        e_mm = sum_xxy[:, 1, 1] - np.einsum("nk,nk->n", beta, sum_xxx[:, :, 1, 1])
-        with np.errstate(invalid="ignore", divide="ignore"):
-            market_mean = sum_x[:, 1] / count
-            centered_squares = gram[:, 1, 1] - count * market_mean**2
-            co_moment = e_mm - 2.0 * market_mean * e_m + market_mean**2 * sum_e
-            variance = squared / count
-            dof = np.where(count > k, count - k, np.nan)
-            resid_std = np.sqrt(squared / dof)
-            resid_skew = (cubed / count) / variance**1.5
-            coskew = (co_moment / count) / (np.sqrt(variance) * centered_squares / count)
-        # Prefix-sum rounding can leave a tiny negative or zero residual sum of squares for an exact fit.
-        keep = valid & (squared > 1e-14 * np.maximum(sum_yy, 1e-300))
-        out["beta"][rows, column] = np.where(valid, beta[:, 1], np.nan)
-        out["slopes"][rows, column] = np.where(valid, beta[:, 1:].sum(axis=1), np.nan)
-        out["resid_std"][rows, column] = np.where(keep, resid_std, np.nan)
-        out["resid_skew"][rows, column] = np.where(keep, resid_skew, np.nan)
-        out["coskew"][rows, column] = np.where(keep, coskew, np.nan)
-        if not residual_slices:
-            continue
-        prefix = {
-            "n": np.concatenate([[0.0], np.cumsum(weight)]),
-            "y": np.concatenate([[0.0], np.cumsum(value)]),
-            "yy": np.concatenate([[0.0], np.cumsum(value**2)]),
-            "x": np.concatenate([np.zeros((1, k)), np.cumsum(design * weight[:, None], axis=0)]),
-            "xy": np.concatenate([np.zeros((1, k)), np.cumsum(design * value[:, None], axis=0)]),
-            "xx": np.concatenate([np.zeros((1, k, k)), np.cumsum(outer * weight[:, None, None], axis=0)]),
-        }
-        for name, (first, last) in residual_slices.items():
-            start = ends - window + 1 + first
-            stop = ends - window + 1 + last
-            part_count = _range_sums(prefix["n"], start, stop)
-            part_e = _range_sums(prefix["y"], start, stop) - np.einsum(
-                "nk,nk->n", beta, _range_sums(prefix["x"], start, stop)
-            )
-            part_ee = (
-                _range_sums(prefix["yy"], start, stop)
-                - 2.0 * np.einsum("nk,nk->n", beta, _range_sums(prefix["xy"], start, stop))
-                + np.einsum("nk,nkl,nl->n", beta, _range_sums(prefix["xx"], start, stop), beta)
-            )
-            with np.errstate(invalid="ignore", divide="ignore"):
-                mean = part_e / part_count
-                spread = np.sqrt((part_ee - part_count * mean**2) / (part_count - 1))
-                momentum = mean / spread
-            enough = valid & (part_count >= (last - first) // 2) & (spread > 0)
-            out[name][rows, column] = np.where(enough, momentum, np.nan)
+
+    def monthly_log(node: Any, window: int, minimum: int) -> Any:
+        mean = rolling(node, window, minimum, "kMean")
+        return k.log(k.mask(mean * float(MONTH), k.gt(mean, 0.0)))
+
+    def on_returns(statement: str) -> Any:
+        """A kernel over the stock's daily returns ``r`` (from ``x0``, the close) and further inputs ``x1, ...``."""
+        return f"const std::vector<double> r = rq_cnc::simple_returns(n, x0);\n{statement}"
+
+    def returns_rolling(window: int, minimum: int, statistic: str) -> Any:
+        return k.series_kernel(
+            [close],
+            on_returns(
+                f"for (int t = 0; t < n; ++t) out[t] = rq_cnc::rolling(r.data(), t, {window}, {minimum}, "
+                f"rq_cnc::{statistic});"
+            ),
+        )
+
+    def regression(regressors: list[Any], window: int, minimum: int, fit: str, first: int = 0, last: int = 0) -> Any:
+        columns = ", ".join(f"x{index}" for index in range(1, len(regressors) + 1))
+        return k.series_kernel(
+            [close, *regressors],
+            on_returns(
+                f"rq_cnc::rolling_regression(n, r.data(), {{{columns}}}, {window}, {minimum}, rq_cnc::{fit}, {first}, "
+                f"{last}, out);"
+            ),
+        )
+
+    def momentum(start: int, end: int) -> Any:
+        """Return from ``start`` trading days ago to ``end`` trading days ago, on the forward-filled close."""
+        return k.series_kernel(
+            [close],
+            "const std::vector<double> price = rq_cnc::forward_filled(n, x0);\n"
+            f"for (int t = {start}; t < n; ++t) out[t] = price[t - {end}] / price[t - {start}] - 1.0;",
+        )
+
+    out: dict[str, Any] = {}
+    # Liquidity
+    out["size"] = k.log(k.mask(float_value, k.gt(float_value, 0.0)))
+    out["size3"] = k.power(out["size"], 3.0)
+    out["turnm"] = monthly_log(turnover, MONTH, 15)
+    out["turnq"] = monthly_log(turnover, QUARTER, 40)
+    out["turna"] = monthly_log(turnover, YEAR, 120)
+    out["vturn"] = rolling(turnover, HALF_YEAR, 40, "kStd")
+    out["cvturn"] = k.safe_div(out["vturn"], rolling(turnover, HALF_YEAR, 40, "kMean"))
+    out["abturn"] = k.safe_div(rolling(turnover, MONTH, 7, "kMean"), rolling(turnover, 250, 85, "kMean"))
+    out["dtvm"] = monthly_log(amount, MONTH, 15)
+    out["dtvq"] = monthly_log(amount, QUARTER, 40)
+    out["dtva"] = monthly_log(amount, YEAR, 120)
+    out["vdtv"] = rolling(amount, HALF_YEAR, 40, "kStd")
+    out["cvd"] = k.safe_div(out["vdtv"], rolling(amount, HALF_YEAR, 40, "kMean"))
+    out["ami"] = k.series_kernel(
+        [close, amount],
+        on_returns(
+            "std::vector<double> illiquidity(n, rq_cnc::kNaN);\n"
+            "for (int t = 0; t < n; ++t) illiquidity[t] = x1[t] > 0 ? rq_cnc::safe_div(std::fabs(r[t]), x1[t]) "
+            ": rq_cnc::kNaN;\n"
+            f"for (int t = 0; t < n; ++t) out[t] = rq_cnc::rolling(illiquidity.data(), t, {MONTH}, 15, rq_cnc::kMean);"
+        ),
+    )
+    # Risk
+    out["idvc"] = regression(market[:1], HALF_YEAR, 40, "kResidualStd")
+    out["idvff"] = regression(market, HALF_YEAR, 40, "kResidualStd")
+    out["tv"] = returns_rolling(HALF_YEAR, 40, "kStd")
+    out["idsff"] = regression(market, HALF_YEAR, 40, "kResidualSkew")
+    out["idsc"] = regression(market[:1], HALF_YEAR, 40, "kResidualSkew")
+    out["ts"] = returns_rolling(HALF_YEAR, 40, "kSkew")
+    out["cs"] = regression(market[:1], HALF_YEAR, 40, "kCoskew")
+    out["dbeta"] = k.series_kernel(
+        [close, market[0]],
+        on_returns(
+            """
+            // Beta on the days the market return is below its 240-day mean.
+            const int window = 240, minimum = 50;
+            for (int t = window - 1; t < n; ++t) {
+                double market_total = 0.0;
+                int market_count = 0;
+                for (int i = t - window + 1; i <= t; ++i)
+                    if (std::isfinite(x1[i])) { market_total += x1[i]; ++market_count; }
+                const double market_mean = market_total / market_count;
+                double count = 0.0, sum_r = 0.0, sum_m = 0.0, sum_rm = 0.0, sum_mm = 0.0;
+                for (int i = t - window + 1; i <= t; ++i) {
+                    if (!(x1[i] < market_mean) || !std::isfinite(r[i])) continue;
+                    count += 1.0;
+                    sum_r += r[i];
+                    sum_m += x1[i];
+                    sum_rm += r[i] * x1[i];
+                    sum_mm += x1[i] * x1[i];
+                }
+                const double mean_r = sum_r / count, mean_m = sum_m / count;
+                const double covariance = sum_rm / count - mean_r * mean_m;
+                const double variance = sum_mm / count - mean_m * mean_m;
+                if (count >= minimum && variance > 0) out[t] = covariance / variance;
+            }"""
+        ),
+    )
+    out["betafp"] = k.series_kernel(
+        [close, market[0]],
+        on_returns(
+            f"""
+            // Frazzini-Pedersen: correlation of 3-day log returns times the ratio of daily log-return volatilities.
+            const int window = {HALF_YEAR}, minimum = 40;
+            std::vector<double> stock(n), index(n), index_on_stock(n), stock3(n, rq_cnc::kNaN), index3(n, rq_cnc::kNaN);
+            for (int t = 0; t < n; ++t) {{
+                stock[t] = std::log1p(r[t]);
+                index[t] = std::log1p(x1[t]);
+                index_on_stock[t] = std::isfinite(stock[t]) ? index[t] : rq_cnc::kNaN;
+            }}
+            for (int t = 2; t < n; ++t) {{
+                stock3[t] = stock[t - 2] + stock[t - 1] + stock[t];
+                index3[t] = index[t - 2] + index[t - 1] + index[t];
+            }}
+            for (int t = 0; t < n; ++t) {{
+                const double ratio = rq_cnc::safe_div(rq_cnc::rolling(stock.data(), t, window, minimum, rq_cnc::kStd),
+                    rq_cnc::rolling(index_on_stock.data(), t, window, minimum, rq_cnc::kStd));
+                double count = 0.0, sum_x = 0.0, sum_y = 0.0;
+                for (int i = t - window + 1 < 0 ? 0 : t - window + 1; i <= t; ++i) {{
+                    if (!std::isfinite(stock3[i]) || !std::isfinite(index3[i])) continue;
+                    count += 1.0;
+                    sum_x += stock3[i];
+                    sum_y += index3[i];
+                }}
+                if (count < minimum) continue;
+                const double mean_x = sum_x / count, mean_y = sum_y / count;
+                double xy = 0.0, xx = 0.0, yy = 0.0;
+                for (int i = t - window + 1 < 0 ? 0 : t - window + 1; i <= t; ++i) {{
+                    if (!std::isfinite(stock3[i]) || !std::isfinite(index3[i])) continue;
+                    xy += (stock3[i] - mean_x) * (index3[i] - mean_y);
+                    xx += (stock3[i] - mean_x) * (stock3[i] - mean_x);
+                    yy += (index3[i] - mean_y) * (index3[i] - mean_y);
+                }}
+                const double correlation = xy / std::sqrt(xx * yy);
+                if (std::isnan(correlation)) continue;
+                out[t] = std::min(1.0, std::max(-1.0, correlation)) * ratio;
+            }}"""
+        ),
+    )
+    out["betadm"] = k.series_kernel(
+        [close, market[0]],
+        on_returns(
+            f"""
+            // Dimson beta: slopes on the lagged, current and next-day market return. A window ending on day d uses
+            // the market return of d + 1, so its estimate is published on d + 1.
+            std::vector<double> lagged(n, rq_cnc::kNaN), lead(n, rq_cnc::kNaN), fit(n, rq_cnc::kNaN);
+            for (int t = 1; t < n; ++t) lagged[t] = x1[t - 1];
+            for (int t = 0; t + 1 < n; ++t) lead[t] = x1[t + 1];
+            rq_cnc::rolling_regression(n, r.data(), {{lagged.data(), x1, lead.data()}}, {HALF_YEAR}, 40,
+                                       rq_cnc::kSlopes, 0, 0, fit.data());
+            for (int t = 1; t < n; ++t) out[t] = fit[t - 1];"""
+        ),
+    )
+    out["beta"] = regression(market[:1], HALF_YEAR, 40, "kBeta")
+    # Past returns
+    out["m1"] = momentum(MONTH, 0)
+    out["m11"] = momentum(YEAR, MONTH)
+    out["m60"] = momentum(5 * YEAR, YEAR)
+    out["m6"] = momentum(6 * MONTH, MONTH)
+    out["m3"] = momentum(3 * MONTH, MONTH)
+    out["indmom"] = _industry_mean(momentum(6 * MONTH, 0), float_value, inputs["sector"])
+    out["m24"] = momentum(3 * YEAR, YEAR)
+    out["mchg"] = momentum(6 * MONTH, MONTH) - momentum(YEAR, 6 * MONTH)
+    residual_window = 720
+    out["im12"] = regression(market, residual_window, 360, "kResidualMomentum", residual_window - YEAR,
+                             residual_window - MONTH)
+    out["im6"] = regression(market, residual_window, 360, "kResidualMomentum", residual_window - 6 * MONTH,
+                            residual_window - MONTH)
+    out["w52"] = k.series_kernel(
+        [close],
+        "const std::vector<double> price = rq_cnc::forward_filled(n, x0);\n"
+        "for (int t = 0; t < n; ++t) out[t] = rq_cnc::safe_div(price[t], "
+        "rq_cnc::rolling(price.data(), t, 240, 120, rq_cnc::kMax));",
+    )
+    out["mdr"] = k.series_kernel(
+        [close],
+        on_returns(
+            f"""
+            // Mean of the five largest daily returns in the month.
+            std::vector<double> window;
+            for (int t = {MONTH} - 1; t < n; ++t) {{
+                window.clear();
+                for (int i = t - {MONTH} + 1; i <= t; ++i) if (std::isfinite(r[i])) window.push_back(r[i]);
+                if (window.size() < 15) continue;
+                std::sort(window.begin(), window.end(), [](double a, double b) {{ return a > b; }});
+                double total = 0.0;
+                for (int i = 0; i < 5; ++i) total += window[i];
+                out[t] = total / 5;
+            }}"""
+        ),
+    )
+    out["pr"] = inputs["basic_close"]
+    out["abr"] = k.series_kernel(
+        [close, market[0], inputs["announced"]],
+        on_returns(
+            """
+            // Abnormal return over days -2..+1 around the latest announcement, published on day +1 and carried forward.
+            std::vector<double> abnormal(n);
+            for (int t = 0; t < n; ++t) abnormal[t] = r[t] - x1[t];
+            double latest = rq_cnc::kNaN;
+            for (int t = 0; t < n; ++t) {
+                if (x2[t] == 1.0) {
+                    const double total = rq_cnc::rolling(abnormal.data(), t, 4, 3, rq_cnc::kSum);
+                    if (std::isfinite(total)) latest = total;
+                }
+                out[t] = latest;
+            }"""
+        ),
+    )
+    out["season"] = k.series_kernel(
+        [close],
+        f"""
+        // Mean same-calendar-month return over the prior five years, with at least three of them.
+        const std::vector<double> price = rq_cnc::forward_filled(n, x0);
+        std::vector<double> monthly(n, rq_cnc::kNaN);
+        for (int t = {MONTH}; t < n; ++t) monthly[t] = price[t] / price[t - {MONTH}] - 1.0;
+        for (int t = 0; t < n; ++t) {{
+            double total = 0.0;
+            int count = 0;
+            for (int years = 1; years <= 5; ++years) {{
+                const int at = t - ({YEAR} * years - {MONTH});
+                if (at >= 0 && std::isfinite(monthly[at])) {{ total += monthly[at]; ++count; }}
+            }}
+            if (count >= 3) out[t] = total / count;
+        }}""",
+    )
+    # Profitability, value, investment and other statement-based characteristics
+    for name, result in FROM_STATEMENTS.items():
+        out[name] = inputs[result]
+    for name, result in OVER_MARKET_VALUE.items():
+        out[name] = to_price(inputs[result])
+    ebitda = inputs["q_ebitda_ttm"]
+    out["em"] = k.safe_div(cap + inputs["q_enterprise_debt"], k.mask(ebitda, k.gt(ebitda, 0.0)))
+    out["ebp"] = k.safe_div(inputs["q_net_debt"] + inputs["q_book"], inputs["q_net_debt"] + cap)
+    out["cei"] = k.series_kernel(
+        [close, cap],
+        f"""
+        // One-year log growth of total market value minus log growth of the price.
+        const std::vector<double> price = rq_cnc::forward_filled(n, x0), value = rq_cnc::forward_filled(n, x1);
+        for (int t = {YEAR}; t < n; ++t)
+            out[t] = std::log(rq_cnc::safe_div(value[t], value[t - {YEAR}]))
+                - std::log(rq_cnc::safe_div(price[t], price[t - {YEAR}]));""",
+    )
+    months = (inputs["calendar_day"] - inputs["listed_day"]) / 30.4375
+    out["age"] = k.mask(months, k.ge(months, 0.0))
+    out["etr"] = inputs["y_etr_rate_change"] * to_price(inputs["y_earnings_change"])
+    market_assets = inputs["q_debt_value"] + cap
+    out["alm"] = k.safe_div(inputs["q_asset_liquidity"], k.mask(market_assets, k.gt(market_assets, 0.0)))
     return out
 
 
-class ChinaChars:
-    """Calculator with shared intermediates; ``calculate`` returns one characteristic panel."""
-
-    def __init__(self, inputs: Mapping[str, Any]) -> None:
-        self.inputs = inputs
-        close = inputs["close"]
-        self.dates = pd.DatetimeIndex(close.index)
-        self.instruments = pd.Index(close.columns)
-        self.trading = close.notna()
-        self.price = close.ffill()
-        self.returns = close / close.shift(1) - 1.0
-        self._cache: dict[str, Any] = {}
-        self._grid: QuarterGrid | None = None
-
-    # ------------------------------------------------------------------ infrastructure
-    def calculate(self, name: str) -> Panel:
-        method: Callable[[], Panel] = getattr(self, f"_char_{name}")
-        result = method()
-        if isinstance(result, np.ndarray):
-            result = Panel(result, index=self.dates, columns=self.instruments)
-        result = replace_inf(result.astype(float))
-        return result.where(self.trading)
-
-    def release(self, name: str) -> None:
-        """Drop intermediates no later characteristic needs (outputs are computed in catalog order)."""
-        position = CHINA_CHARS_NAMES.index(name)
-        if position == CHINA_CHARS_NAMES.index("beta"):
-            for key in ("capm", "ff3", "dimson"):
-                self._cache.pop(key, None)
-        if position == CHINA_CHARS_NAMES.index("im6"):
-            self._cache.pop("ff3_momentum", None)
-
-    def _panel(self, key: str) -> Panel:
-        value = self.inputs.get(key)
-        if value is None:
-            raise DataContractError(f"china_chars input is missing: {key}")
-        return value
-
-    def _series(self, key: str) -> np.ndarray:
-        return np.asarray(pd.Series(self._panel(key)).reindex(self.dates), dtype=float)
-
-    @property
-    def grid(self) -> QuarterGrid:
-        if self._grid is None:
-            self._grid = QuarterGrid(self._panel("fundamentals"), self.dates, self.instruments)
-        return self._grid
-
-    def _turnover(self) -> Panel:
-        return self._panel("basic_turnover_rate")
-
-    def _float_value(self) -> Panel:
-        return self._panel("basic_circ_mv")
-
-    def _cap(self) -> Panel:
-        return self._panel("cap")
-
-    def _rolling(self, panel: Panel, window: int, minimum: int) -> Any:
-        return panel.rolling(window, min_periods=minimum)
-
-    def _regression(self, key: str, regressors: tuple[str, ...], window: int, minimum: int, **kwargs: Any) -> dict:
-        if key not in self._cache:
-            x = np.column_stack([self._series(name) for name in regressors])
-            self._cache[key] = rolling_regression(
-                self.returns.to_numpy(dtype=float), x, window, minimum, **kwargs
-            )
-        return self._cache[key]
-
-    def _capm(self) -> dict:
-        return self._regression("capm", ("mkt",), HALF_YEAR, 40)
-
-    def _ff3(self) -> dict:
-        return self._regression("ff3", MARKET_FACTORS, HALF_YEAR, 40)
-
-    def _momentum(self, start: int, end: int) -> Panel:
-        """Return from ``start`` trading days ago to ``end`` trading days ago (start > end)."""
-        return self.price.shift(end) / self.price.shift(start) - 1.0
-
-    def _market_panel(self, values: np.ndarray) -> Panel:
-        return Panel(np.repeat(values[:, None], len(self.instruments), axis=1), index=self.dates,
-                     columns=self.instruments)
-
-    # ------------------------------------------------------------------ liquidity
-    def _char_size(self) -> Panel:
-        return np.log(self._float_value().where(self._float_value() > 0))
-
-    def _char_size3(self) -> Panel:
-        return self._char_size() ** 3
-
-    def _monthly_turnover(self, window: int, minimum: int) -> Panel:
-        mean = self._rolling(self._turnover(), window, minimum).mean()
-        return np.log((mean * MONTH).where(mean > 0))
-
-    def _char_turnm(self) -> Panel:
-        return self._monthly_turnover(MONTH, 15)
-
-    def _char_turnq(self) -> Panel:
-        return self._monthly_turnover(QUARTER, 40)
-
-    def _char_turna(self) -> Panel:
-        return self._monthly_turnover(YEAR, 120)
-
-    def _char_vturn(self) -> Panel:
-        return self._rolling(self._turnover(), HALF_YEAR, 40).std()
-
-    def _char_cvturn(self) -> Panel:
-        rolling = self._rolling(self._turnover(), HALF_YEAR, 40)
-        return safe_div(rolling.std(), rolling.mean())
-
-    def _char_abturn(self) -> Panel:
-        turnover = self._turnover()
-        return safe_div(self._rolling(turnover, MONTH, 7).mean(), self._rolling(turnover, 250, 85).mean())
-
-    def _monthly_value(self, window: int, minimum: int) -> Panel:
-        mean = self._rolling(self._panel("amount"), window, minimum).mean()
-        return np.log((mean * MONTH).where(mean > 0))
-
-    def _char_dtvm(self) -> Panel:
-        return self._monthly_value(MONTH, 15)
-
-    def _char_dtvq(self) -> Panel:
-        return self._monthly_value(QUARTER, 40)
-
-    def _char_dtva(self) -> Panel:
-        return self._monthly_value(YEAR, 120)
-
-    def _char_vdtv(self) -> Panel:
-        return self._rolling(self._panel("amount"), HALF_YEAR, 40).std()
-
-    def _char_cvd(self) -> Panel:
-        rolling = self._rolling(self._panel("amount"), HALF_YEAR, 40)
-        return safe_div(rolling.std(), rolling.mean())
-
-    def _char_ami(self) -> Panel:
-        amount = self._panel("amount")
-        illiquidity = safe_div(self.returns.abs(), amount.where(amount > 0))
-        return self._rolling(illiquidity, MONTH, 15).mean()
-
-    # ------------------------------------------------------------------ risk
-    def _char_idvc(self) -> np.ndarray:
-        return self._capm()["resid_std"]
-
-    def _char_idvff(self) -> np.ndarray:
-        return self._ff3()["resid_std"]
-
-    def _char_tv(self) -> Panel:
-        return self._rolling(self.returns, HALF_YEAR, 40).std()
-
-    def _char_idsff(self) -> np.ndarray:
-        return self._ff3()["resid_skew"]
-
-    def _char_idsc(self) -> np.ndarray:
-        return self._capm()["resid_skew"]
-
-    def _char_ts(self) -> Panel:
-        return self._rolling(self.returns, HALF_YEAR, 40).skew()
-
-    def _char_cs(self) -> np.ndarray:
-        return self._capm()["coskew"]
-
-    def _char_dbeta(self) -> np.ndarray:
-        window, minimum = 240, 50
-        market = self._series("mkt")
-        returns = self.returns.to_numpy(dtype=float)
-        result = np.full(returns.shape, np.nan)
-        if len(market) < window:
-            return result
-        market_windows = np.lib.stride_tricks.sliding_window_view(market, window)
-        with np.errstate(invalid="ignore"):
-            down = market_windows < nan_mean(market_windows, 1)[0][:, None]
-        market_values = np.where(np.isfinite(market_windows), market_windows, 0.0)
-        for column in range(returns.shape[1]):
-            stock = returns[:, column]
-            observed = np.isfinite(stock)
-            mask = np.lib.stride_tricks.sliding_window_view(observed, window) & down
-            values = np.lib.stride_tricks.sliding_window_view(np.where(observed, stock, 0.0), window) * mask
-            m = market_values * mask
-            count = mask.sum(axis=1)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                mean_r = values.sum(axis=1) / count
-                mean_m = m.sum(axis=1) / count
-                covariance = (values * m).sum(axis=1) / count - mean_r * mean_m
-                variance = (m * m).sum(axis=1) / count - mean_m**2
-                beta = covariance / variance
-            result[window - 1 :, column] = np.where((count >= minimum) & (variance > 0), beta, np.nan)
-        return result
-
-    def _char_betafp(self) -> Panel:
-        log_returns = np.log1p(self.returns)
-        log_market = np.log1p(self._series("mkt"))
-        market = self._market_panel(log_market)
-        sigma_stock = self._rolling(log_returns, HALF_YEAR, 40).std()
-        sigma_market = self._rolling(market.where(log_returns.notna()), HALF_YEAR, 40).std()
-        stock_3d = log_returns.rolling(3, min_periods=3).sum()
-        market_3d = self._market_panel(pd.Series(log_market).rolling(3, min_periods=3).sum().to_numpy())
-        correlation = stock_3d.rolling(HALF_YEAR, min_periods=40).corr(market_3d)
-        return correlation.clip(-1.0, 1.0) * safe_div(sigma_stock, sigma_market)
-
-    def _char_betadm(self) -> np.ndarray:
-        if "dimson" not in self._cache:
-            market = self._series("mkt")
-            lagged = np.concatenate([[np.nan], market[:-1]])
-            lead = np.concatenate([market[1:], [np.nan]])
-            fit = rolling_regression(
-                self.returns.to_numpy(dtype=float), np.column_stack([lagged, market, lead]), HALF_YEAR, 40
-            )
-            # A window ending on day d uses the market return of d + 1, so its estimate is published on d + 1.
-            shifted = np.full(fit["slopes"].shape, np.nan)
-            shifted[1:] = fit["slopes"][:-1]
-            self._cache["dimson"] = shifted
-        return self._cache["dimson"]
-
-    def _char_beta(self) -> np.ndarray:
-        return self._capm()["beta"]
-
-    # ------------------------------------------------------------------ past returns
-    def _char_m1(self) -> Panel:
-        return self._momentum(MONTH, 0)
-
-    def _char_m11(self) -> Panel:
-        return self._momentum(YEAR, MONTH)
-
-    def _char_m60(self) -> Panel:
-        return self._momentum(5 * YEAR, YEAR)
-
-    def _char_m6(self) -> Panel:
-        return self._momentum(6 * MONTH, MONTH)
-
-    def _char_m3(self) -> Panel:
-        return self._momentum(3 * MONTH, MONTH)
-
-    def _char_indmom(self) -> Panel:
-        sector = self._panel("sector")
-        returns = self._momentum(6 * MONTH, 0)
-        weights = self._float_value().where(returns.notna() & self._float_value().gt(0))
-        result = Panel(np.nan, index=self.dates, columns=self.instruments)
-        codes = pd.unique(sector.to_numpy().ravel())
-        for code in codes[np.isfinite(codes)]:
-            members = sector.eq(code)
-            member_weights = weights.where(members)
-            industry = (returns * member_weights).sum(axis=1) / member_weights.sum(axis=1)
-            result = result.mask(members, np.broadcast_to(industry.to_numpy()[:, None], result.shape))
-        return result
-
-    def _char_m24(self) -> Panel:
-        return self._momentum(3 * YEAR, YEAR)
-
-    def _char_mchg(self) -> Panel:
-        return self._momentum(6 * MONTH, MONTH) - self._momentum(YEAR, 6 * MONTH)
-
-    def _residual_momentum(self) -> dict:
-        slices = {"im12": (720 - YEAR, 720 - MONTH), "im6": (720 - 6 * MONTH, 720 - MONTH)}
-        return self._regression("ff3_momentum", MARKET_FACTORS, 720, 360, residual_slices=slices)
-
-    def _char_im12(self) -> np.ndarray:
-        return self._residual_momentum()["im12"]
-
-    def _char_im6(self) -> np.ndarray:
-        return self._residual_momentum()["im6"]
-
-    def _char_w52(self) -> Panel:
-        return safe_div(self.price, self.price.rolling(240, min_periods=120).max())
-
-    def _char_mdr(self) -> np.ndarray:
-        window, minimum, top = MONTH, 15, 5
-        returns = self.returns.to_numpy(dtype=float)
-        result = np.full(returns.shape, np.nan)
-        if len(returns) < window:
-            return result
-        for first in range(0, returns.shape[1], 64):
-            block = np.lib.stride_tricks.sliding_window_view(returns[:, first : first + 64], window, axis=0)
-            count = np.isfinite(block).sum(axis=2)
-            largest = -np.sort(np.where(np.isfinite(block), -block, np.inf), axis=2)[:, :, :top]
-            mean, _ = nan_mean(largest, 2)
-            result[window - 1 :, first : first + 64] = np.where(count >= minimum, mean, np.nan)
-        return result
-
-    def _char_pr(self) -> Panel:
-        return self._panel("basic_close")
-
-    def _char_abr(self) -> Panel:
-        frame = self._panel("fundamentals")
-        abnormal = self.returns.sub(self._series("mkt"), axis=0)
-        window_sum = abnormal.rolling(4, min_periods=3).sum().to_numpy()
-        announcement = np.searchsorted(self.dates.to_numpy(), pd.to_datetime(frame["ann_date"]).to_numpy())
-        columns = self.instruments.get_indexer(frame["instrument"])
-        published = announcement + 1
-        keep = (columns >= 0) & (published < len(self.dates))
-        events = np.full(window_sum.shape, np.nan)
-        events[published[keep], columns[keep]] = window_sum[published[keep], columns[keep]]
-        return Panel(events, index=self.dates, columns=self.instruments).ffill()
-
-    def _char_season(self) -> Panel:
-        monthly = self._momentum(MONTH, 0)
-        stacked = np.stack([monthly.shift(YEAR * k - MONTH).to_numpy() for k in range(1, 6)], axis=2)
-        mean, count = nan_mean(stacked, 2)
-        return np.where(count >= 3, mean, np.nan)
-
-    # ------------------------------------------------------------------ fundamentals helpers
-    def _q(self, values: np.ndarray) -> Panel:
-        return self.grid.panel(values)
-
-    def _y(self, values: np.ndarray) -> Panel:
-        return self.grid.panel(values, annual=True)
-
-    def _book_equity(self) -> np.ndarray:
-        g = self.grid
-        return g.value("total_hldr_eqy_exc_min_int") - g.value("oth_eqt_tools_p_shr")
-
-    def _debt(self) -> np.ndarray:
-        g = self.grid
-        return g.value("st_borr") + g.value("non_cur_liab_due_1y") + g.value("lt_borr") + g.value("bond_payable")
-
-    def _net_operating_assets(self) -> np.ndarray:
-        g = self.grid
-        return (
-            g.value("total_hldr_eqy_inc_min_int")
-            + self._debt()
-            - g.value("money_cap")
-            - g.value("trad_asset")
-        )
-
-    def _operating_profit(self, flow: Callable[[str], np.ndarray]) -> np.ndarray:
-        return flow("revenue") - flow("oper_cost") - flow("sell_exp") - flow("admin_exp") - flow("fin_exp")
-
-    def _roe(self) -> np.ndarray:
-        return ratio(self.grid.single("n_income_attr_p"), lag(self._book_equity(), 1))
-
-    def _roa(self) -> np.ndarray:
-        return ratio(self.grid.single("n_income"), lag(self.grid.value("total_assets"), 1))
-
-    def _lagged_assets_change(self, values: np.ndarray) -> np.ndarray:
-        assets = self.grid.value("total_assets")
-        return ratio(values - lag(values, 4), lag(assets, 4))
-
-    # ------------------------------------------------------------------ profitability
-    def _char_roe(self) -> Panel:
-        return self._q(self._roe())
-
-    def _char_droe(self) -> Panel:
-        roe = self._roe()
-        return self._q(roe - lag(roe, 4))
-
-    def _char_roa(self) -> Panel:
-        return self._q(self._roa())
-
-    def _char_droa(self) -> Panel:
-        roa = self._roa()
-        return self._q(roa - lag(roa, 4))
-
-    def _char_rna(self) -> Panel:
-        return self._q(ratio(self.grid.single("operate_profit"), lag(self._net_operating_assets(), 1)))
-
-    def _char_pm(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.single("operate_profit"), g.single("revenue")))
-
-    def _char_ato(self) -> Panel:
-        return self._q(ratio(self.grid.single("revenue"), lag(self._net_operating_assets(), 1)))
-
-    def _char_ct(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.single("revenue"), lag(g.value("total_assets"), 1)))
-
-    def _char_gpa(self) -> Panel:
-        g = self.grid
-        return self._y(ratio(g.annual("revenue") - g.annual("oper_cost"), g.value("total_assets")))
-
-    def _char_gpla(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.single("revenue") - g.single("oper_cost"), lag(g.value("total_assets"), 1)))
-
-    def _char_ope(self) -> Panel:
-        return self._y(ratio(self._operating_profit(self.grid.annual), self._book_equity()))
-
-    def _char_ople(self) -> Panel:
-        return self._q(ratio(self._operating_profit(self.grid.single), lag(self._book_equity(), 1)))
-
-    def _char_opa(self) -> Panel:
-        return self._y(ratio(self._operating_profit(self.grid.annual), self.grid.value("total_assets")))
-
-    def _char_opla(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(self._operating_profit(g.single), lag(g.value("total_assets"), 1)))
-
-    def _char_tbi(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.single("total_profit"), g.single("n_income")))
-
-    def _char_bl(self) -> Panel:
-        return self._q(ratio(self.grid.value("total_assets"), self._book_equity()))
-
-    def _char_sg(self) -> Panel:
-        revenue = self.grid.annual("revenue")
-        return self._y(growth(revenue, lag(revenue, 4)))
-
-    def _char_sgq(self) -> Panel:
-        revenue = self.grid.single("revenue")
-        return self._q(growth(revenue, lag(revenue, 4)))
-
-    def _char_fscore(self) -> Panel:
-        g = self.grid
-        assets = g.value("total_assets")
-        income = g.single("n_income")
-        cash_flow = g.single("n_cashflow_act")
-        revenue = g.single("revenue")
-        roa = ratio(income, lag(assets, 1))
-        leverage = ratio(g.value("lt_borr") + g.value("bond_payable"), assets)
-        current = ratio(g.value("total_cur_assets"), g.value("total_cur_liab"))
-        margin = ratio(revenue - g.single("oper_cost"), revenue)
-        turnover = ratio(revenue, lag(assets, 1))
-        shares = g.value("total_share")
-        components = (
-            (roa, roa > 0),
-            (cash_flow, cash_flow > 0),
-            (roa - lag(roa, 4), roa - lag(roa, 4) > 0),
-            (cash_flow - income, cash_flow > income),
-            (leverage - lag(leverage, 4), leverage < lag(leverage, 4)),
-            (current - lag(current, 4), current > lag(current, 4)),
-            (shares - lag(shares, 4), shares <= lag(shares, 4)),
-            (margin - lag(margin, 4), margin > lag(margin, 4)),
-            (turnover - lag(turnover, 4), turnover > lag(turnover, 4)),
-        )
-        known = np.all([np.isfinite(value) for value, _ in components], axis=0)
-        score = np.sum([signal.astype(float) for _, signal in components], axis=0)
-        return self._q(np.where(known, score, np.nan))
-
-    def _char_oscore(self) -> Panel:
-        g = self.grid
-        assets = g.value("total_assets")
-        liabilities = g.value("total_liab")
-        current_assets = g.value("total_cur_assets")
-        current_liabilities = g.value("total_cur_liab")
-        income = g.ttm("n_income")
-        previous = lag(income, 4)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            log_assets = np.log(np.where(assets > 0, assets, np.nan))
-        score = (
-            -1.32
-            - 0.407 * log_assets
-            + 6.03 * ratio(liabilities, assets)
-            - 1.43 * ratio(current_assets - current_liabilities, assets)
-            + 0.076 * ratio(current_liabilities, current_assets)
-            - 1.72 * np.where(np.isfinite(liabilities - assets), (liabilities > assets).astype(float), np.nan)
-            - 2.37 * ratio(income, assets)
-            - 1.83 * ratio(g.ttm("n_cashflow_act"), liabilities)
-            + 0.285 * np.where(np.isfinite(income + previous), ((income < 0) & (previous < 0)).astype(float), np.nan)
-            - 0.521 * ratio(income - previous, np.abs(income) + np.abs(previous))
-        )
-        return self._q(score)
-
-    # ------------------------------------------------------------------ value
-    def _to_price(self, numerator: Panel) -> Panel:
-        cap = self._cap()
-        return safe_div(numerator, cap.where(cap > 0))
-
-    def _char_bm(self) -> Panel:
-        return self._to_price(self._q(self._book_equity()))
-
-    def _char_dm(self) -> Panel:
-        return self._to_price(self._q(self.grid.value("total_liab")))
-
-    def _char_am(self) -> Panel:
-        return self._to_price(self._q(self.grid.value("total_assets")))
-
-    def _char_ep(self) -> Panel:
-        return self._to_price(self._q(self.grid.ttm("n_income_attr_p")))
-
-    def _depreciation_ttm(self) -> np.ndarray:
-        g = self.grid
-        return g.ttm("depr_fa_coga_dpba") + g.ttm("amort_intang_assets") + g.ttm("lt_amort_deferred_exp")
-
-    def _char_cfp(self) -> Panel:
-        return self._to_price(self._q(self.grid.ttm("n_income") + self._depreciation_ttm()))
-
-    def _char_sr(self) -> Panel:
-        revenue = self.grid.annual("revenue")
-        total = np.zeros(revenue.shape)
-        for year in range(1, 6):
-            total = total + (6 - year) * growth(lag(revenue, 4 * (year - 1)), lag(revenue, 4 * year))
-        return self._y(total / 15.0)
-
-    def _char_em(self) -> Panel:
-        g = self.grid
-        net_debt = self._q(self._debt() + g.value("oth_eqt_tools_p_shr") + g.value("minority_int")
-                           - g.value("money_cap") - g.value("trad_asset"))
-        ebitda = self._q(g.ttm("total_profit") + g.ttm("fin_exp") + self._depreciation_ttm())
-        return safe_div(self._cap() + net_debt, ebitda.where(ebitda > 0))
-
-    def _char_sp(self) -> Panel:
-        return self._to_price(self._q(self.grid.ttm("revenue")))
-
-    def _char_ocfp(self) -> Panel:
-        return self._to_price(self._q(self.grid.ttm("n_cashflow_act")))
-
-    def _char_de(self) -> Panel:
-        return self._y(ratio(self.grid.value("total_liab"), self._book_equity()))
-
-    def _net_debt(self) -> np.ndarray:
-        g = self.grid
-        return self._debt() + g.value("oth_eqt_tools_p_shr") - g.value("money_cap") - g.value("trad_asset")
-
-    def _char_ebp(self) -> Panel:
-        net_debt = self._q(self._net_debt())
-        book = self._q(self._book_equity())
-        return safe_div(net_debt + book, net_debt + self._cap())
-
-    def _char_ndp(self) -> Panel:
-        return self._to_price(self._q(self._net_debt()))
-
-    # ------------------------------------------------------------------ investment
-    def _char_ag(self) -> Panel:
-        assets = self.grid.value("total_assets")
-        return self._q(growth(assets, lag(assets, 4)))
-
-    def _char_dpia(self) -> Panel:
-        g = self.grid
-        return self._q(self._lagged_assets_change(g.value("fix_assets") + g.value("inventories")))
-
-    def _char_noa(self) -> Panel:
-        return self._q(ratio(self._net_operating_assets(), lag(self.grid.value("total_assets"), 4)))
-
-    def _char_dnoa(self) -> Panel:
-        return self._q(self._lagged_assets_change(self._net_operating_assets()))
-
-    def _char_ig(self) -> Panel:
-        capex = self.grid.annual("c_pay_acq_const_fiolta")
-        return self._y(growth(capex, lag(capex, 4)))
-
-    def _char_cei(self) -> Panel:
-        cap = self._cap().ffill()
-        with np.errstate(invalid="ignore", divide="ignore"):
-            value_growth = np.log(safe_div(cap, cap.shift(YEAR)))
-            price_growth = np.log(safe_div(self.price, self.price.shift(YEAR)))
-        return value_growth - price_growth
-
-    def _char_cdi(self) -> Panel:
-        liabilities = self.grid.value("total_liab")
-        base = lag(liabilities, 20)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            result = np.log(ratio(liabilities, np.where(base > 0, base, np.nan)))
-        return self._y(result)
-
-    def _char_ivg(self) -> Panel:
-        inventory = self.grid.value("inventories")
-        return self._y(growth(inventory, lag(inventory, 4)))
-
-    def _char_ivchg(self) -> Panel:
-        g = self.grid
-        inventory = g.value("inventories")
-        assets = g.value("total_assets")
-        return self._y(ratio(inventory - lag(inventory, 4), (assets + lag(assets, 4)) / 2.0))
-
-    def _char_oacc(self) -> Panel:
-        g = self.grid
-        return self._y(ratio(g.annual("n_income") - g.annual("n_cashflow_act"), lag(g.value("total_assets"), 4)))
-
-    def _working_capital(self) -> tuple[np.ndarray, np.ndarray]:
-        g = self.grid
-        operating_assets = g.value("total_cur_assets") - g.value("money_cap") - g.value("trad_asset")
-        operating_liabilities = g.value("total_cur_liab") - g.value("st_borr") - g.value("non_cur_liab_due_1y")
-        return operating_assets, operating_liabilities
-
-    def _non_current(self) -> tuple[np.ndarray, np.ndarray]:
-        g = self.grid
-        assets = g.value("total_assets") - g.value("total_cur_assets") - g.value("lt_eqt_invest")
-        liabilities = g.value("total_liab") - g.value("total_cur_liab") - g.value("lt_borr") - g.value("bond_payable")
-        return assets, liabilities
-
-    def _financial(self) -> np.ndarray:
-        g = self.grid
-        return g.value("trad_asset") + g.value("lt_eqt_invest") - self._debt() - g.value("oth_eqt_tools_p_shr")
-
-    def _char_tacc(self) -> Panel:
-        current_assets, current_liabilities = self._working_capital()
-        non_current_assets, non_current_liabilities = self._non_current()
-        working = current_assets - current_liabilities
-        total = working + (non_current_assets - non_current_liabilities) + self._financial()
-        return self._y(self._lagged_assets_change(total))
-
-    def _char_dwc(self) -> Panel:
-        current_assets, current_liabilities = self._working_capital()
-        return self._y(self._lagged_assets_change(current_assets - current_liabilities))
-
-    def _char_dcoa(self) -> Panel:
-        return self._y(self._lagged_assets_change(self._working_capital()[0]))
-
-    def _char_dcol(self) -> Panel:
-        return self._y(self._lagged_assets_change(self._working_capital()[1]))
-
-    def _char_dnco(self) -> Panel:
-        assets, liabilities = self._non_current()
-        return self._y(self._lagged_assets_change(assets - liabilities))
-
-    def _char_dnca(self) -> Panel:
-        return self._y(self._lagged_assets_change(self._non_current()[0]))
-
-    def _char_dncl(self) -> Panel:
-        return self._y(self._lagged_assets_change(self._non_current()[1]))
-
-    def _char_dfin(self) -> Panel:
-        return self._y(self._lagged_assets_change(self._financial()))
-
-    def _char_dbe(self) -> Panel:
-        return self._y(self._lagged_assets_change(self._book_equity()))
-
-    # ------------------------------------------------------------------ other
-    def _char_rdm(self) -> Panel:
-        return self._to_price(self._q(self.grid.single("rd_exp")))
-
-    def _char_rds(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.single("rd_exp"), g.single("revenue")))
-
-    def _char_ol(self) -> Panel:
-        g = self.grid
-        costs = g.annual("oper_cost") + g.annual("sell_exp") + g.annual("admin_exp")
-        return self._y(ratio(costs, g.value("total_assets")))
-
-    def _char_age(self) -> Panel:
-        listed = pd.Series(self._panel("list_date")).reindex(self.instruments)
-        days = self.dates.to_numpy()[:, None] - pd.to_datetime(listed).to_numpy()[None, :]
-        months = days / np.timedelta64(1, "D") / 30.4375
-        return np.where(months >= 0, months, np.nan)
-
-    def _annual_change_gap(self, first: np.ndarray, second: np.ndarray) -> Panel:
-        return self._y(growth(first, lag(first, 4)) - growth(second, lag(second, 4)))
-
-    def _char_dsi(self) -> Panel:
-        g = self.grid
-        return self._annual_change_gap(g.annual("revenue"), g.value("inventories"))
-
-    def _char_dsa(self) -> Panel:
-        g = self.grid
-        return self._annual_change_gap(g.annual("revenue"), g.value("accounts_receiv"))
-
-    def _char_dgs(self) -> Panel:
-        g = self.grid
-        return self._annual_change_gap(g.annual("revenue") - g.annual("oper_cost"), g.annual("revenue"))
-
-    def _char_dss(self) -> Panel:
-        g = self.grid
-        return self._annual_change_gap(g.annual("revenue"), g.annual("sell_exp") + g.annual("admin_exp"))
-
-    def _char_etr(self) -> Panel:
-        g = self.grid
-        rate = ratio(g.annual("income_tax"), g.annual("total_profit"))
-        average, _ = nan_mean(np.stack([lag(rate, 4 * k) for k in (1, 2, 3)], axis=2), 2)
-        income = g.annual("n_income_attr_p")
-        earnings_change = self._y(income - lag(income, 4))
-        return self._y(rate - average) * self._to_price(earnings_change)
-
-    def _char_tan(self) -> Panel:
-        g = self.grid
-        tangible = (
-            g.value("money_cap")
-            + 0.715 * g.value("accounts_receiv")
-            + 0.547 * g.value("inventories")
-            + 0.535 * g.value("fix_assets")
-        )
-        return self._q(ratio(tangible, g.value("total_assets")))
-
-    def _char_vcf(self) -> Panel:
-        g = self.grid
-        return self._q(rolling_quarter_std(ratio(g.single("n_cashflow_act"), g.single("revenue")), 16, 8))
-
-    def _char_cta(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.value("money_cap"), g.value("total_assets")))
-
-    def _char_esm(self) -> Panel:
-        g = self.grid
-        lagged_assets = lag(g.value("total_assets"), 1)
-        earnings = rolling_quarter_std(ratio(g.single("n_income"), lagged_assets), 16, 8)
-        cash = rolling_quarter_std(ratio(g.single("n_cashflow_act"), lagged_assets), 16, 8)
-        return self._q(ratio(earnings, cash))
-
-    def _asset_liquidity(self) -> np.ndarray:
-        g = self.grid
-        cash = g.value("money_cap")
-        current = g.value("total_cur_assets")
-        assets = g.value("total_assets")
-        return cash + 0.75 * (current - cash) + 0.5 * (assets - current - g.value("goodwill") - g.value("intan_assets"))
-
-    def _char_ala(self) -> Panel:
-        return self._q(ratio(self._asset_liquidity(), lag(self.grid.value("total_assets"), 1)))
-
-    def _char_alm(self) -> Panel:
-        g = self.grid
-        market_assets = self._q(g.value("total_assets") - self._book_equity()) + self._cap()
-        return safe_div(self._q(self._asset_liquidity()), market_assets.where(market_assets > 0))
-
-    def _surprise(self, values: np.ndarray) -> np.ndarray:
-        change = values - lag(values, 4)
-        return ratio(change, rolling_quarter_std(change, 8, 6))
-
-    def _char_sue(self) -> Panel:
-        return self._q(self._surprise(self.grid.single("n_income_attr_p")))
-
-    def _char_rs(self) -> Panel:
-        return self._q(self._surprise(self.grid.single("revenue")))
-
-    def _char_tes(self) -> Panel:
-        g = self.grid
-        tax = g.single("income_tax")
-        return self._q(ratio(tax - lag(tax, 4), lag(g.value("total_assets"), 4)))
+def _industry_mean(value: Any, weight: Any, sector: Any) -> Any:
+    """Weighted mean of ``value`` over each day's members of the stock's sector (weights positive, values known)."""
+    return _industry_mean_operator()(value, weight, sector)
+
+
+@lru_cache(maxsize=1)
+def _industry_mean_operator() -> type:
+    base = kunquant_symbols("GenericCrossSectionalOp")["GenericCrossSectionalOp"]
+
+    class IndustryMean(base):
+        def __init__(self, value: Any, weight: Any, sector: Any) -> None:
+            super().__init__([value, weight, sector], None)
+
+        def generate_head(self) -> str:
+            return "std::vector<T> rq_codes, rq_weighted, rq_weights;\n"
+
+        def generate_body(self) -> str:
+            return r"""
+            rq_codes.clear();
+            rq_weighted.clear();
+            rq_weights.clear();
+            for (size_t i = 0; i < num_stocks; ++i) {
+                const T code = input_2[i];
+                if (std::isnan(code)) continue;
+                const size_t group = std::find(rq_codes.begin(), rq_codes.end(), code) - rq_codes.begin();
+                if (group == rq_codes.size()) {
+                    rq_codes.push_back(code);
+                    rq_weighted.push_back(0);
+                    rq_weights.push_back(0);
+                }
+                const T value = input_0[i], weight = input_1[i];
+                if (std::isnan(value) || !(weight > 0)) continue;
+                rq_weighted[group] += value * weight;
+                rq_weights[group] += weight;
+            }
+            for (size_t i = 0; i < num_stocks; ++i) {
+                const T code = input_2[i];
+                const size_t group = std::find(rq_codes.begin(), rq_codes.end(), code) - rq_codes.begin();
+                output_0[i] = group == rq_codes.size() ? std::numeric_limits<T>::quiet_NaN()
+                                                       : rq_weighted[group] / rq_weights[group];
+            }
+            """
+
+    IndustryMean.__name__ = "RQuantIndustryMean"
+    return IndustryMean

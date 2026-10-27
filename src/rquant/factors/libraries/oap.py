@@ -52,14 +52,8 @@ import pandas as pd
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS
 from rquant.errors import DataContractError
 from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.libraries.china_chars import (
-    QuarterGrid,
-    lag,
-    nan_mean,
-    ratio,
-    rolling_quarter_std,
-    rolling_regression,
-)
+from rquant.factors.panel_operators import rolling_regression
+from rquant.factors.statements import QuarterGrid, lag, nan_mean, ratio, rolling_quarter_std
 from rquant.io import sha256_file, stable_hash
 
 Panel = pd.DataFrame
@@ -383,11 +377,11 @@ class OAPLibrary(PanelFactorLibrary):
     @property
     def implementation_fingerprint(self) -> str:
         """Also pin the shared statement grid and the statement fields, which live in other modules."""
-        shared = importlib.import_module("rquant.factors.libraries.china_chars")
         return stable_hash(
             {
                 "module": super().implementation_fingerprint,
-                "quarter_grid": inspect.getsource(shared),
+                "quarter_grid": inspect.getsource(importlib.import_module("rquant.factors.statements")),
+                "panel_operators": inspect.getsource(importlib.import_module("rquant.factors.panel_operators")),
                 "statement_fields": {name: list(fields) for name, fields in FUNDAMENTAL_ENDPOINT_FIELDS.items()},
             }
         )

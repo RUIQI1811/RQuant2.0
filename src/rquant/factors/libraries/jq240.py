@@ -10,10 +10,10 @@ Daily adaptation
 * Rows are trading dates and columns are instruments. Price and volume indicators run on each stock's own trading
   days (suspended days are removed first and stay missing), so a gap does not reset an EMA or shorten a window.
 * Financial statements are the first-reported values of ``reference/fundamentals.parquet``, usable from the first
-  trading day after every earlier quarter is also out (``china_chars.QuarterGrid``). ``_ttm`` items are trailing
-  twelve-month sums of single quarters; items without ``_ttm`` that JoinQuant reports per period use the latest single
-  quarter; balance-sheet items are the latest quarter end. "Average" balances are the mean of the latest quarter and
-  the same quarter a year earlier. Year-on-year growth divides by the absolute value of the base.
+  trading day after every earlier quarter is also out (``rquant.factors.statements.QuarterGrid``). ``_ttm`` items are
+  trailing twelve-month sums of single quarters; items without ``_ttm`` that JoinQuant reports per period use the latest
+  single quarter; balance-sheet items are the latest quarter end. "Average" balances are the mean of the latest quarter
+  and the same quarter a year earlier. Year-on-year growth divides by the absolute value of the base.
 * Prices are RQuant's backward-adjusted canonical prices, whose level is arbitrary per stock. JoinQuant already
   publishes moving averages, Bollinger bands and MACD over the close; indicators it leaves in price units (ATR, bull
   and bear power) are divided by the close here as well. ``price_no_fq`` is the unadjusted close from daily_basic.
@@ -42,8 +42,8 @@ import pandas as pd
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS
 from rquant.errors import DataContractError
 from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.libraries.china_chars import QuarterGrid, lag, nan_mean, ratio
 from rquant.factors.panel_operators import replace_inf
+from rquant.factors.statements import QuarterGrid, lag, nan_mean, ratio
 from rquant.io import sha256_file, stable_hash
 
 Panel = pd.DataFrame
@@ -519,11 +519,11 @@ class JQ240Library(PanelFactorLibrary):
     @property
     def implementation_fingerprint(self) -> str:
         """Also pin the shared statement grid and the statement fields, which live in other modules."""
-        shared = importlib.import_module("rquant.factors.libraries.china_chars")
         return stable_hash(
             {
                 "module": super().implementation_fingerprint,
-                "quarter_grid": inspect.getsource(shared),
+                "quarter_grid": inspect.getsource(importlib.import_module("rquant.factors.statements")),
+                "panel_operators": inspect.getsource(importlib.import_module("rquant.factors.panel_operators")),
                 "statement_fields": {name: list(fields) for name, fields in FUNDAMENTAL_ENDPOINT_FIELDS.items()},
             }
         )

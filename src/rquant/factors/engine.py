@@ -186,7 +186,6 @@ class KunQuantFactorEngine:
 
     def build_graph(self) -> Any:
         try:
-            from KunQuant.Driver import KunCompilerConfig
             from KunQuant.Op import Builder, Input, Output
             from KunQuant.Stage import Function
         except ImportError as exc:
@@ -217,7 +216,12 @@ class KunQuantFactorEngine:
             for canonical_name, expression in outputs.items():
                 Output(expression, canonical_name)
 
-        return Function(builder.ops), KunCompilerConfig(
+        return Function(builder.ops), self._kun_compiler_config()
+
+    def _kun_compiler_config(self) -> Any:
+        from KunQuant.Driver import KunCompilerConfig
+
+        return KunCompilerConfig(
             dtype=self.config.dtype,
             input_layout=self.config.input_layout,
             output_layout=self.config.output_layout,
@@ -226,6 +230,35 @@ class KunQuantFactorEngine:
             # Prefer deterministic double-precision rolling statistics over the faster incremental approximation.
             options={"no_fast_stat": True},
         )
+
+    @property
+    def statement_libraries(self) -> tuple[Any, ...]:
+        return tuple(library for library in self.libraries if library.statement_outputs)
+
+    def build_statement_graphs(self) -> list[tuple[str, Any, Any]]:
+        """One KunQuant function per library with a statement graph, over fiscal quarters x instruments."""
+        try:
+            from KunQuant.Op import Builder, Input, Output
+            from KunQuant.Stage import Function
+        except ImportError as exc:
+            raise DependencyError("KunQuant==0.1.11 is required for factor computation") from exc
+
+        functions = []
+        for library in self.statement_libraries:
+            if any(not name.startswith(("q_", "y_")) for name in library.statement_outputs):
+                raise FactorContractError(f"Statement outputs of {library.family} must start with q_ or y_")
+            if not set(library.statement_outputs) <= set(library.reference_inputs):
+                raise FactorContractError(f"Statement outputs of {library.family} must be reference inputs")
+            builder = Builder()
+            with builder:
+                inputs = {name: Input(name) for name in (*library.statement_fields, "fiscal_quarter")}
+                outputs = dict(library.build_statements(inputs))
+                if tuple(outputs) != library.statement_outputs:
+                    raise FactorContractError(f"Statement graph of {library.family} differs from its declared outputs")
+                for name, expression in outputs.items():
+                    Output(expression, name)
+            functions.append((f"statements_{library.family}", Function(builder.ops), self._kun_compiler_config()))
+        return functions
 
     def compile(self) -> Any:
         try:
@@ -261,6 +294,64 @@ class KunQuantFactorEngine:
             },
         )
         return library.getModule("rquant_factors")
+
+    def compile_statements(self) -> dict[str, Any]:
+        """Compile the statement graphs; returns each library family's KunQuant module."""
+        functions = self.build_statement_graphs()
+        if not functions:
+            return {}
+        from KunQuant.jit import cfake
+
+        expose_msvc_compiler()
+        fingerprint = self.compilation_fingerprint()
+        target = self.cache_dir / "kunquant" / fingerprint
+        target.mkdir(parents=True, exist_ok=True)
+        with _stdout_to_stderr():
+            compiled = cfake.compileit(
+                functions,
+                f"rquant_{self.config.factor_set}_{fingerprint[:12]}_statements",
+                self.compiler_config(),
+                tempdir=str(target),
+                keep_files=True,
+                load=False,
+            )
+        library = load_kunquant_library(compiled)
+        return {name.removeprefix("statements_"): library.getModule(name) for name, _, _ in functions}
+
+    def statement_inputs(
+        self, inputs: dict[str, Any], dates: Any, instruments: Any, modules: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Run the statement graphs over ``inputs["fundamentals"]`` and publish each result as a dates x instruments
+        array: ``q_`` results from the latest quarter known on the day, ``y_`` results from the latest fiscal year."""
+        if not self.statement_libraries:
+            return {}
+        try:
+            import numpy as np
+            import pandas as pd
+            from KunQuant.runner import KunRunner as kr
+        except ImportError as exc:
+            raise DependencyError("NumPy, pandas and KunQuant are required for factor computation") from exc
+        from rquant.factors.statements import QuarterGrid
+
+        if "fundamentals" not in inputs:
+            raise DataContractError("Statement graphs need the reference input `fundamentals`")
+        modules = self.compile_statements() if modules is None else modules
+        dtype = np.float64 if self.config.dtype == "double" else np.float32
+        grid = QuarterGrid(inputs["fundamentals"], pd.DatetimeIndex(dates), pd.Index(instruments))
+        executor = kr.createMultiThreadExecutor(self.config.workers)
+        published: dict[str, Any] = {}
+        for library in self.statement_libraries:
+            module = modules[library.family]
+            pad = (-len(instruments)) % int(module.blocking_len)
+            arrays = {
+                name: np.pad(values.astype(dtype), ((0, 0), (0, pad)), constant_values=np.nan)
+                for name, values in grid.statement_arrays(library.statement_fields).items()
+            }
+            output = kr.runGraph(executor, module, arrays, 0, grid.quarters)
+            for name in library.statement_outputs:
+                values = output[name][:, : len(instruments)]
+                published[name] = grid.gather(values, annual=name.startswith("y_")).astype(dtype, copy=False)
+        return published
 
     def run(
         self,
@@ -357,6 +448,7 @@ class KunQuantFactorEngine:
         external, reference_hashes = _load_panel_references(
             self.libraries, Path(canonical_root), dates, instruments, dict(self.config.external_inputs), pd
         )
+        external.update(self.statement_inputs(external, dates, instruments))
         # Cross-sectional operators use the research universe's members of each day.
         external["universe"] = pd.DataFrame(output_mask, index=dates, columns=instruments)
         missing_references = sorted(set(self.reference_fields) - set(external))
