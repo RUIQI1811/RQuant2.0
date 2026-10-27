@@ -16,9 +16,11 @@ from typing import Any
 
 from tqdm import tqdm
 
+from rquant.data.canonical import ts_code_to_qlib
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS, RAW_DAILY_ENDPOINTS
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, sha256_file, stable_hash
+from rquant.universe import BOARD_PREFIXES
 
 # Tushare caps some statement responses at 100 rows without saying so; a window that reaches the cap is refetched
 # year by year instead of being trusted.
@@ -198,8 +200,10 @@ class TushareCollector:
         date_column = next(
             (name for name in ("trade_date", "cal_date", "in_date", "ann_date") if name in frame.columns), None
         )
-        min_date = str(frame[date_column].min()) if date_column and not frame.empty else None
-        max_date = str(frame[date_column].max()) if date_column and not frame.empty else None
+        # Some endpoints (namechange) leave the date empty on a few rows.
+        dates = frame[date_column].dropna().astype(str) if date_column else None
+        min_date = dates.min() if dates is not None and len(dates) else None
+        max_date = dates.max() if dates is not None and len(dates) else None
         artifact = FetchArtifact(
             endpoint=endpoint,
             query=query,
@@ -318,7 +322,7 @@ class TushareCollector:
             open_dates = completed_open_dates[-(warmup_trading_days + _formal_day_count(formal_start, through)) :]
             month_starts = _month_starts(fetch_start, through)
             # One historical and one current industry-membership page are known up front. The total grows only
-            # when either query requires another page.
+            # when either query requires another page, and once per stock for the name histories.
             progress.total = 4 + len(open_dates) * len(RAW_DAILY_ENDPOINTS) + 1 + len(month_starts) + 2
             progress.refresh()
 
@@ -327,7 +331,8 @@ class TushareCollector:
                 for trade_date in open_dates
                 for endpoint in RAW_DAILY_ENDPOINTS
             ]
-            artifacts.extend(self._fetch_daily_partitions(daily_requests, fetch=fetch, workers=workers))
+            daily_artifacts = self._fetch_daily_partitions(daily_requests, fetch=fetch, workers=workers)
+            artifacts.extend(daily_artifacts)
 
             artifacts.append(
                 fetch(
@@ -351,6 +356,10 @@ class TushareCollector:
                 )
 
             artifacts.extend(self._fetch_industry_history(fetch=fetch, progress=progress, snapshot_date=through))
+            codes = self._stock_codes([*artifacts[:3], *daily_artifacts])
+            progress.total += len(codes)
+            progress.refresh()
+            artifacts.extend(self._fetch_name_history(codes, fetch=fetch, workers=workers, snapshot_date=through))
             manifest = {
                 "status": "complete",
                 "formal_start": formal_start.isoformat(),
@@ -359,6 +368,7 @@ class TushareCollector:
                 "warmup_trading_days": warmup_trading_days,
                 "index_code": index_code,
                 "industry_snapshot": through.isoformat(),
+                "namechange_snapshot": through.isoformat(),
                 "max_requests_per_minute": self.rate_limiter.max_requests_per_minute,
                 "artifacts": len(artifacts),
                 "cached_artifacts": cached_artifacts,
@@ -539,7 +549,7 @@ class TushareCollector:
             raise DataContractError("Raw sync is not complete; finish `rquant data sync` first")
         if universe == "csi300":
             endpoint, column = "index_weight", "con_code"
-        elif universe == "all":
+        elif universe in (*BOARD_PREFIXES, "all"):
             endpoint, column = "stock_basic", "ts_code"
         else:
             raise DataContractError(f"Unsupported fundamental universe: {universe!r}")
@@ -553,6 +563,9 @@ class TushareCollector:
         if endpoint == "index_weight" and index_code and "index_code" in frame.columns:
             frame = frame[frame["index_code"] == index_code]
         codes = sorted(str(code) for code in frame[column].dropna().unique())
+        if universe in BOARD_PREFIXES:
+            # ST and listing-age filters change over time, so every stock on the boards may enter the universe.
+            codes = [code for code in codes if ts_code_to_qlib(code).startswith(BOARD_PREFIXES[universe])]
         if not codes:
             raise DataContractError(f"No stocks found for fundamental universe {universe}")
         return codes
@@ -572,15 +585,7 @@ class TushareCollector:
             # Every open trading day has quotes; an empty answer means "not published yet".
             return fetch(endpoint, {"trade_date": query_date}, f"trade_date={query_date}", require_rows=True)
 
-        if workers == 1:
-            return [fetch_one(request) for request in requests]
-        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-sync")
-        futures = [executor.submit(fetch_one, request) for request in requests]
-        try:
-            return [future.result() for future in futures]
-        finally:
-            # On the first failure, stop queued requests instead of draining the whole history.
-            executor.shutdown(wait=True, cancel_futures=True)
+        return _map_in_order(fetch_one, requests, workers)
 
     def _fetch_industry_history(self, *, fetch: Any, progress: Any, snapshot_date: date) -> list[FetchArtifact]:
         artifacts: list[FetchArtifact] = []
@@ -606,6 +611,43 @@ class TushareCollector:
         return artifacts
 
     @staticmethod
+    def _stock_codes(artifacts: list[FetchArtifact]) -> list[str]:
+        """Every Tushare code in the given stock_basic and daily partitions.
+
+        The daily partitions add stocks listed after the cached stock_basic snapshot.
+        """
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise DependencyError("pandas and pyarrow are required for stock code collection") from exc
+        codes: set[str] = set()
+        for artifact in artifacts:
+            if artifact.rows:
+                codes.update(pd.read_parquet(artifact.path, columns=["ts_code"])["ts_code"].dropna().astype(str))
+        if not codes:
+            raise DataContractError("No stock codes to fetch name histories for")
+        return sorted(codes)
+
+    @staticmethod
+    def _fetch_name_history(
+        codes: list[str], *, fetch: Any, workers: int, snapshot_date: date
+    ) -> list[FetchArtifact]:
+        """Fetch each stock's name history, which marks its point-in-time ST and delisting periods.
+
+        The all-stock query pages by offset over an unstable order and silently drops rows, so every stock is asked
+        for on its own.
+        """
+
+        def fetch_one(code: str) -> FetchArtifact:
+            return fetch(
+                "namechange",
+                {"ts_code": code, "fields": "ts_code,name,start_date,end_date,ann_date,change_reason"},
+                f"snapshot={snapshot_date:%Y%m%d}/ts_code={code}",
+            )
+
+        return _map_in_order(fetch_one, codes, workers)
+
+    @staticmethod
     def _open_dates(calendar_path: Path) -> list[date]:
         try:
             import pandas as pd
@@ -616,6 +658,23 @@ class TushareCollector:
             raise DataContractError("trade_cal response lacks cal_date/is_open")
         values = frame.loc[frame["is_open"].astype(int).eq(1), "cal_date"].astype(str)
         return sorted(datetime.strptime(value, "%Y%m%d").date() for value in values)
+
+
+def _map_in_order(function: Callable[[Any], FetchArtifact], items: list[Any], workers: int) -> list[FetchArtifact]:
+    """Run ``function`` over ``items`` on ``workers`` threads and return results in item order.
+
+    The shared rate limiter still caps total throughput, and the order keeps the sync fingerprint independent of the
+    worker count.
+    """
+    if workers == 1:
+        return [function(item) for item in items]
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-sync")
+    futures = [executor.submit(function, item) for item in items]
+    try:
+        return [future.result() for future in futures]
+    finally:
+        # On the first failure, stop queued requests instead of draining the whole history.
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _date_text(value: date) -> str:

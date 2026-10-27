@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,15 +12,21 @@ import pandas as pd
 
 from rquant.data.reference import first_reported
 from rquant.factors.catalog import get_catalog
-from rquant.factors.engine import FactorBuildConfig, PanelFactorEngine, create_factor_engine
-from rquant.factors.libraries.china_chars import (
-    CHINA_CHARS_NAMES,
-    ChinaChars,
-    ChinaCharsLibrary,
-    QuarterGrid,
-    rolling_regression,
+from rquant.factors.engine import (
+    FactorBuildConfig,
+    KunQuantFactorEngine,
+    cpp_compiler_available,
+    create_factor_engine,
 )
+from rquant.factors.libraries.china_chars import CHINA_CHARS_NAMES, ChinaCharsLibrary
+from rquant.factors.panel_operators import rolling_regression
+from rquant.factors.statements import QuarterGrid
 from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from panel_reference.china_chars import ChinaChars, calculate  # noqa: E402
+
+KUNQUANT_READY = importlib.util.find_spec("KunQuant") is not None and cpp_compiler_available()
 
 FLOWS = (
     "total_revenue",
@@ -145,20 +153,61 @@ class ChinaCharsCatalogTests(unittest.TestCase):
         self.assertEqual("cnc_001", names[0])
         self.assertEqual("cnc_109", names[-1])
         self.assertEqual(len(set(CHINA_CHARS_NAMES)), len(CHINA_CHARS_NAMES))
-        self.assertEqual(1554, len(catalog.specs))
+        self.assertEqual(1696, len(catalog.specs))
         for dropped in ("hn", "lfe", "adm", "gad", "idvq", "idsq", "tail", "mkt_beta"):
             self.assertNotIn(dropped, CHINA_CHARS_NAMES)
 
-    def test_every_characteristic_has_a_calculator(self) -> None:
+    def test_every_characteristic_has_a_reference_calculator(self) -> None:
         for name in CHINA_CHARS_NAMES:
             self.assertTrue(hasattr(ChinaChars, f"_char_{name}"), name)
 
 
+def kunquant_arrays(engine: KunQuantFactorEngine, inputs: dict[str, object]) -> dict[str, np.ndarray]:
+    """The daily graph's input arrays, with market series repeated for every instrument."""
+    close = inputs["close"]
+    arrays = {}
+    for name in engine.input_fields:
+        value = inputs[name]
+        if isinstance(value, pd.Series):
+            value = np.repeat(value.reindex(close.index).to_numpy(dtype=float)[:, None], close.shape[1], axis=1)
+        arrays[name] = np.asarray(value, dtype=float)
+    return arrays
+
+
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class ChinaCharsCalculationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        cls.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.engine = KunQuantFactorEngine(cls.temporary.name, FactorBuildConfig(factor_set="china_chars", workers=2))
+        cls.module = cls.engine.compile()
+        cls.statements = cls.engine.compile_statements()
         cls.inputs = synthetic_inputs()
-        cls.outputs = ChinaCharsLibrary().calculate(cls.inputs)
+        cls.outputs = cls.calculate(cls.inputs)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    @classmethod
+    def calculate(cls, inputs: dict[str, object]) -> dict[str, pd.DataFrame]:
+        """KunQuant outputs by source name, as panels shaped like the inputs."""
+        close = inputs["close"]
+        aligned = ChinaCharsLibrary().align_reference_inputs(inputs, close.index, close.columns)
+        statements = cls.engine.run_statements(aligned, close.index, close.columns, cls.statements)
+        aligned.update({name: statements.daily(name) for name in cls.engine.input_fields if name in statements})
+        output = cls.engine.run(kunquant_arrays(cls.engine, aligned), module=cls.module, statements=statements)
+        return {
+            spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
+            for spec in ChinaCharsLibrary().specs
+        }
+
+    def test_every_characteristic_matches_the_pandas_reference(self) -> None:
+        expected = calculate(self.inputs)
+        for name in CHINA_CHARS_NAMES:
+            np.testing.assert_allclose(self.outputs[name].to_numpy(), expected[name].to_numpy(), rtol=1e-9,
+                                       atol=1e-13, equal_nan=True, err_msg=name)
 
     def test_all_characteristics_are_aligned_and_populated(self) -> None:
         close = self.inputs["close"]
@@ -175,7 +224,7 @@ class ChinaCharsCalculationTests(unittest.TestCase):
         dates = self.inputs["close"].index
         for cut in (700, 1300):
             last = dates[cut]
-            past = ChinaCharsLibrary().calculate(truncated(self.inputs, last))
+            past = self.calculate(truncated(self.inputs, last))
             for name in CHINA_CHARS_NAMES:
                 expected = self.outputs[name].loc[:last].to_numpy()
                 actual = past[name].to_numpy()
@@ -196,6 +245,8 @@ class ChinaCharsCalculationTests(unittest.TestCase):
         market = self.inputs["mkt"].iloc[row - 119 : row + 1]
         slope = np.polyfit(market.to_numpy(), returns.to_numpy(), 1)[0]
         np.testing.assert_allclose(self.outputs["beta"].iloc[row, column], slope, rtol=1e-8)
+        listed = self.inputs["list_date"].iloc[column]
+        self.assertAlmostEqual((close.index[row] - listed).days / 30.4375, self.outputs["age"].iloc[row, column])
 
     def test_quarterly_values_appear_on_the_announcement_day(self) -> None:
         fundamentals = self.inputs["fundamentals"]
@@ -210,6 +261,80 @@ class ChinaCharsCalculationTests(unittest.TestCase):
         cash_to_assets = self.outputs["cta"][instrument]
         self.assertAlmostEqual(report["money_cap"] / report["total_assets"], cash_to_assets.iloc[position])
         self.assertNotAlmostEqual(report["money_cap"] / report["total_assets"], cash_to_assets.iloc[position - 1])
+
+    def test_engine_reads_audited_reference_files(self) -> None:
+        inputs = synthetic_inputs(days=300, stocks=4)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+            root = Path(temporary)
+            canonical = root / "canonical"
+            reference = canonical / "reference"
+            dates = inputs["close"].index
+            records = []
+            for field in ("close", "amount", "cap", "sector"):
+                stacked = inputs[field].stack(future_stack=True).rename(field)
+                records.append(stacked)
+            bars = pd.concat(records, axis=1).reset_index()
+            bars["in_csi300"] = True
+            year = reference.parent / "bars" / "year=2014" / "bars.parquet"
+            year.parent.mkdir(parents=True)
+            bars.to_parquet(year, index=False)
+            atomic_write_json(canonical / "manifest.json", {"status": "complete", "fingerprint": "canonical-fixture",
+                                                            "raw_fingerprint": "raw-fixture"})
+            files = {}
+            daily = pd.concat(
+                [
+                    inputs["basic_turnover_rate"].stack().rename("turnover_rate") * 100.0,
+                    (inputs["basic_circ_mv"].stack() / 10_000.0).rename("circ_mv"),
+                    inputs["basic_close"].stack().rename("close"),
+                ],
+                axis=1,
+            ).reset_index()
+            for year_value, frame in daily.groupby(daily["datetime"].dt.year):
+                path = reference / "daily_basic" / f"year={year_value}" / "data.parquet"
+                path.parent.mkdir(parents=True)
+                frame.to_parquet(path, index=False)
+                files[f"daily_basic/year={year_value}/data.parquet"] = sha256_file(path)
+            pd.DataFrame(
+                {"datetime": dates, "mkt": inputs["mkt"].to_numpy(), "smb": inputs["smb"].to_numpy(),
+                 "hml": inputs["hml"].to_numpy(), "stocks": 200}
+            ).to_parquet(reference / "market_factors.parquet", index=False)
+            files["market_factors.parquet"] = sha256_file(reference / "market_factors.parquet")
+            inputs["fundamentals"].to_parquet(reference / "fundamentals.parquet", index=False)
+            files["fundamentals.parquet"] = sha256_file(reference / "fundamentals.parquet")
+            pd.DataFrame(
+                {"ts_code": [f"60000{i}.SH" for i in range(4)], "list_date": "20050601"}
+            ).to_parquet(reference / "stock_basic.parquet", index=False)
+            manifest = {"status": "complete", "raw_fingerprint": "raw-fixture", "files": files}
+            manifest["fingerprint"] = stable_hash(manifest)
+            atomic_write_json(reference / "manifest.json", manifest)
+
+            engine = create_factor_engine(root / "cache", FactorBuildConfig(factor_set="china_chars"))
+            self.assertIsInstance(engine, KunQuantFactorEngine)
+            engine.compile = lambda: self.module  # type: ignore[method-assign]
+            engine.compile_statements = lambda: self.statements  # type: ignore[method-assign]
+            result = engine.build_from_canonical(canonical, root / "factors")
+            self.assertEqual(109, result["columns"])
+            self.assertEqual(manifest["fingerprint"], result["reference_inputs"]["china_chars_reference"])
+            stored = pd.read_parquet(root / "factors" / "china_chars" / "year=2014" / "factors.parquet")
+            self.assertEqual(["datetime", "instrument", *get_catalog().canonical_names("china_chars")],
+                             list(stored.columns))
+            direct = calculate(inputs)
+            stored = stored.set_index(["datetime", "instrument"])
+            for canonical_name, name in (("cnc_001", "size"), ("cnc_015", "idvc"), ("cnc_041", "roe"),
+                                         ("cnc_061", "bm"), ("cnc_095", "age")):
+                values = stored[canonical_name].unstack()
+                expected = direct[name].loc[values.index, values.columns]
+                np.testing.assert_allclose(values.to_numpy(), expected.to_numpy(), rtol=1e-9, equal_nan=True,
+                                           err_msg=name)
+
+            with (reference / "manifest.json").open("r", encoding="utf-8") as handle:
+                tampered = json.load(handle)
+            tampered["files"]["fundamentals.parquet"] = "0" * 64
+            tampered.pop("fingerprint")
+            tampered["fingerprint"] = stable_hash(tampered)
+            atomic_write_json(reference / "manifest.json", tampered)
+            with self.assertRaisesRegex(Exception, "differs from its manifest"):
+                engine.build_from_canonical(canonical, root / "factors")
 
 
 class QuarterGridTests(unittest.TestCase):
@@ -282,76 +407,6 @@ class RollingRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(coefficients[1:].sum(), fit["slopes"][59, 0])
         self.assertAlmostEqual(np.sqrt((residuals**2).sum() / (keep.sum() - 3)), fit["resid_std"][59, 0])
         self.assertTrue(np.isnan(fit["beta"][28, 0]))
-
-
-class ChinaCharsEngineTests(unittest.TestCase):
-    def test_engine_reads_audited_reference_files(self) -> None:
-        inputs = synthetic_inputs(days=300, stocks=4)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            canonical = root / "canonical"
-            reference = canonical / "reference"
-            dates = inputs["close"].index
-            records = []
-            for field in ("close", "amount", "cap", "sector"):
-                stacked = inputs[field].stack(future_stack=True).rename(field)
-                records.append(stacked)
-            bars = pd.concat(records, axis=1).reset_index()
-            bars["in_csi300"] = True
-            year = reference.parent / "bars" / "year=2014" / "bars.parquet"
-            year.parent.mkdir(parents=True)
-            bars.to_parquet(year, index=False)
-            atomic_write_json(canonical / "manifest.json", {"status": "complete", "fingerprint": "canonical-fixture",
-                                                            "raw_fingerprint": "raw-fixture"})
-            files = {}
-            daily = pd.concat(
-                [
-                    inputs["basic_turnover_rate"].stack().rename("turnover_rate") * 100.0,
-                    (inputs["basic_circ_mv"].stack() / 10_000.0).rename("circ_mv"),
-                    inputs["basic_close"].stack().rename("close"),
-                ],
-                axis=1,
-            ).reset_index()
-            for year_value, frame in daily.groupby(daily["datetime"].dt.year):
-                path = reference / "daily_basic" / f"year={year_value}" / "data.parquet"
-                path.parent.mkdir(parents=True)
-                frame.to_parquet(path, index=False)
-                files[f"daily_basic/year={year_value}/data.parquet"] = sha256_file(path)
-            pd.DataFrame(
-                {"datetime": dates, "mkt": inputs["mkt"].to_numpy(), "smb": inputs["smb"].to_numpy(),
-                 "hml": inputs["hml"].to_numpy(), "stocks": 200}
-            ).to_parquet(reference / "market_factors.parquet", index=False)
-            files["market_factors.parquet"] = sha256_file(reference / "market_factors.parquet")
-            inputs["fundamentals"].to_parquet(reference / "fundamentals.parquet", index=False)
-            files["fundamentals.parquet"] = sha256_file(reference / "fundamentals.parquet")
-            pd.DataFrame(
-                {"ts_code": [f"60000{i}.SH" for i in range(4)], "list_date": "20050601"}
-            ).to_parquet(reference / "stock_basic.parquet", index=False)
-            manifest = {"status": "complete", "raw_fingerprint": "raw-fixture", "files": files}
-            manifest["fingerprint"] = stable_hash(manifest)
-            atomic_write_json(reference / "manifest.json", manifest)
-
-            engine = create_factor_engine(root / "cache", FactorBuildConfig(factor_set="china_chars"))
-            self.assertIsInstance(engine, PanelFactorEngine)
-            result = engine.build_from_canonical(canonical, root / "factors")
-            self.assertEqual(109, result["columns"])
-            self.assertEqual(manifest["fingerprint"], result["reference_inputs"]["china_chars_reference"])
-            stored = pd.read_parquet(root / "factors" / "china_chars" / "year=2014" / "factors.parquet")
-            self.assertEqual(["datetime", "instrument", *get_catalog().canonical_names("china_chars")],
-                             list(stored.columns))
-            direct = ChinaCharsLibrary().calculate(inputs)
-            size = stored.set_index(["datetime", "instrument"])["cnc_001"].unstack()
-            expected = direct["size"].loc[size.index, size.columns]
-            np.testing.assert_allclose(size.to_numpy(), expected.to_numpy(), rtol=1e-12, equal_nan=True)
-
-            with (reference / "manifest.json").open("r", encoding="utf-8") as handle:
-                tampered = json.load(handle)
-            tampered["files"]["fundamentals.parquet"] = "0" * 64
-            tampered.pop("fingerprint")
-            tampered["fingerprint"] = stable_hash(tampered)
-            atomic_write_json(reference / "manifest.json", tampered)
-            with self.assertRaisesRegex(Exception, "differs from its manifest"):
-                engine.build_from_canonical(canonical, root / "factors")
 
 
 def direct_regression(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -83,6 +84,28 @@ class FactorLibrary(ABC):
     backend = "kunquant"
     family: FactorFamily
     required_inputs: tuple[str, ...]
+    # Inputs beyond the canonical bars, loaded by ``load_reference_inputs`` and aligned to the dates x instruments grid.
+    reference_inputs: tuple[str, ...] = ()
+    # KunQuant libraries ported from a pandas reference compile without fused multiply-adds to round like NumPy.
+    strict_float = False
+    # Fields that make a row one of a stock's own trading days. When set, the engine moves every stock's rows where
+    # all of them are present to the top of the time axis before the graph runs and puts the outputs back on their
+    # dates, so time-series operators run over consecutive quotes across suspensions.
+    quote_fields: tuple[str, ...] = ()
+    # C++ source (helper functions the graph's kernels call) placed before every generated KunQuant source file.
+    cpp_prelude = ""
+    # Bound the number of generated stages per C++ translation unit for large libraries.
+    compile_split_source = 0
+    # A statement graph (``build_statements``) runs over fiscal quarters x instruments of the first-reported statements
+    # in the reference input ``fundamentals``, reading ``statement_fields`` and ``fiscal_quarter`` (0 for Q1). The
+    # engine publishes each result named in ``statement_outputs`` as a daily input of ``build``: ``q_`` results from
+    # the latest quarter known on the day, ``y_`` results from the latest known fiscal year
+    # (``rquant.factors.statements``). Results the daily graph reads are listed in ``reference_inputs`` too; a factor
+    # published unchanged from a result is mapped to it in ``statement_factors`` (source name to result) instead and
+    # left out of ``build``, so the engine writes it without holding the result as a daily input.
+    statement_fields: tuple[str, ...] = ()
+    statement_outputs: tuple[str, ...] = ()
+    statement_factors: Mapping[str, str] = {}
 
     @property
     @abstractmethod
@@ -93,17 +116,42 @@ class FactorLibrary(ABC):
         """Build source-name to KunQuant expression mappings."""
         raise NotImplementedError(f"{self.family} does not implement the KunQuant backend")
 
+    def build_statements(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Build ``statement_outputs`` to KunQuant expressions over fiscal quarters x instruments."""
+        raise NotImplementedError(f"{self.family} has no statement graph")
+
+    def prepare_statements(self, fundamentals: Any) -> Any:
+        """The first-reported statements the statement graph reads (``fundamentals`` unchanged by default)."""
+        return fundamentals
+
+    def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
+        """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""
+        return {}, {}
+
+    def validate_inputs(self, inputs: Mapping[str, Any]) -> None:  # noqa: B027 - optional hook
+        """Raise when the aligned input arrays cannot produce trustworthy factors."""
+
     @property
     def implementation_fingerprint(self) -> str:
         """Fingerprint the complete defining module, not only the provider class."""
         module = importlib.import_module(self.__class__.__module__)
-        return stable_hash(
-            {
-                "family": self.family,
-                "required_inputs": self.required_inputs,
-                "source": inspect.getsource(module),
-            }
+        payload: dict[str, Any] = {
+            "family": self.family,
+            "required_inputs": self.required_inputs,
+            "source": inspect.getsource(module),
+        }
+        # Operator modules imported whole (``from rquant.factors.extensions import kunquant_panel``) define formula
+        # semantics too, so their source is part of the fingerprint.
+        extensions = sorted(
+            value.__name__
+            for value in vars(module).values()
+            if inspect.ismodule(value) and value.__name__.startswith("rquant.factors.extensions.")
         )
+        if extensions:
+            payload["extensions"] = {name: inspect.getsource(sys.modules[name]) for name in extensions}
+        if self.reference_inputs:
+            payload["reference_inputs"] = self.reference_inputs
+        return stable_hash(payload)
 
 
 class PanelFactorLibrary(FactorLibrary):
@@ -114,10 +162,6 @@ class PanelFactorLibrary(FactorLibrary):
     @abstractmethod
     def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         """Return source-name to aligned panel mappings."""
-
-    def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
-        """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""
-        return {}, {}
 
     def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
         outputs = self.calculate(inputs)

@@ -10,10 +10,10 @@ Daily adaptation
 * Rows are trading dates and columns are instruments. Price and volume indicators run on each stock's own trading
   days (suspended days are removed first and stay missing), so a gap does not reset an EMA or shorten a window.
 * Financial statements are the first-reported values of ``reference/fundamentals.parquet``, usable from the first
-  trading day after every earlier quarter is also out (``china_chars.QuarterGrid``). ``_ttm`` items are trailing
-  twelve-month sums of single quarters; items without ``_ttm`` that JoinQuant reports per period use the latest single
-  quarter; balance-sheet items are the latest quarter end. "Average" balances are the mean of the latest quarter and
-  the same quarter a year earlier. Year-on-year growth divides by the absolute value of the base.
+  trading day after every earlier quarter is also out (``rquant.factors.statements.QuarterGrid``). ``_ttm`` items are
+  trailing twelve-month sums of single quarters; items without ``_ttm`` that JoinQuant reports per period use the latest
+  single quarter; balance-sheet items are the latest quarter end. "Average" balances are the mean of the latest quarter
+  and the same quarter a year earlier. Year-on-year growth divides by the absolute value of the base.
 * Prices are RQuant's backward-adjusted canonical prices, whose level is arbitrary per stock. JoinQuant already
   publishes moving averages, Bollinger bands and MACD over the close; indicators it leaves in price units (ATR, bull
   and bear power) are divided by the close here as well. ``price_no_fq`` is the unadjusted close from daily_basic.
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,9 +41,11 @@ import pandas as pd
 
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS
 from rquant.errors import DataContractError
-from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.libraries.china_chars import QuarterGrid, lag, nan_mean, ratio
-from rquant.factors.panel_operators import replace_inf
+from rquant.factors.extensions import kunquant_jq240 as j
+from rquant.factors.extensions import kunquant_panel as k
+from rquant.factors.extensions.kunquant import kunquant_symbols
+from rquant.factors.extensions.kunquant_jq240 import Value, lag, ratio, replace_inf
+from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 from rquant.io import sha256_file, stable_hash
 
 Panel = pd.DataFrame
@@ -57,15 +59,49 @@ JQ240_DAILY_BASIC = {"close": 1.0, "turnover_rate": 1.0, "circ_mv": 10_000.0, "t
 # the statement was published for that quarter.
 ZERO_FILL = {
     "revenue": (
-        "sell_exp", "admin_exp", "fin_exp", "biz_tax_surchg", "assets_impair_loss", "fv_value_chg_gain",
-        "invest_income", "ass_invest_income", "non_oper_income", "non_oper_exp",
+        "sell_exp",
+        "admin_exp",
+        "fin_exp",
+        "biz_tax_surchg",
+        "assets_impair_loss",
+        "fv_value_chg_gain",
+        "invest_income",
+        "ass_invest_income",
+        "non_oper_income",
+        "non_oper_exp",
     ),
     "total_assets": (
-        "money_cap", "trad_asset", "notes_receiv", "accounts_receiv", "oth_receiv", "prepayment", "int_receiv",
-        "div_receiv", "inventories", "fa_avail_for_sale", "htm_invest", "fix_assets", "cip", "const_materials",
-        "intan_assets", "r_and_d", "goodwill", "lt_amor_exp", "st_borr", "trading_fl", "notes_payable",
-        "acct_payable", "adv_receipts", "int_payable", "div_payable", "non_cur_liab_due_1y", "lt_borr",
-        "bond_payable", "cap_rese", "surplus_rese", "undistr_porfit",
+        "money_cap",
+        "trad_asset",
+        "notes_receiv",
+        "accounts_receiv",
+        "oth_receiv",
+        "prepayment",
+        "int_receiv",
+        "div_receiv",
+        "inventories",
+        "fa_avail_for_sale",
+        "htm_invest",
+        "fix_assets",
+        "cip",
+        "const_materials",
+        "intan_assets",
+        "r_and_d",
+        "goodwill",
+        "lt_amor_exp",
+        "st_borr",
+        "trading_fl",
+        "notes_payable",
+        "acct_payable",
+        "adv_receipts",
+        "int_payable",
+        "div_payable",
+        "non_cur_liab_due_1y",
+        "lt_borr",
+        "bond_payable",
+        "cap_rese",
+        "surplus_rese",
+        "undistr_porfit",
     ),
     "n_cashflow_act": ("depr_fa_coga_dpba", "amort_intang_assets", "lt_amort_deferred_exp"),
 }
@@ -494,7 +530,7 @@ JQ240_FORMULAS = {entry[0]: entry[4] for entry in JQ240}
 JQ240_CATEGORIES = tuple(dict.fromkeys(entry[1] for entry in JQ240))
 
 
-class JQ240Library(PanelFactorLibrary):
+class JQ240Library(FactorLibrary):
     """JoinQuant factor-library definitions re-implemented on Tushare data."""
 
     family = "jq240"
@@ -519,11 +555,11 @@ class JQ240Library(PanelFactorLibrary):
     @property
     def implementation_fingerprint(self) -> str:
         """Also pin the shared statement grid and the statement fields, which live in other modules."""
-        shared = importlib.import_module("rquant.factors.libraries.china_chars")
         return stable_hash(
             {
                 "module": super().implementation_fingerprint,
-                "quarter_grid": inspect.getsource(shared),
+                "quarter_grid": inspect.getsource(importlib.import_module("rquant.factors.statements")),
+                "panel_operators": inspect.getsource(importlib.import_module("rquant.factors.panel_operators")),
                 "statement_fields": {name: list(fields) for name, fields in FUNDAMENTAL_ENDPOINT_FIELDS.items()},
             }
         )
@@ -574,21 +610,6 @@ class JQ240Library(PanelFactorLibrary):
         inputs["mkt"] = factors["mkt"].reindex(dates)
         inputs["fundamentals"] = fundamentals[fundamentals["instrument"].isin(set(instruments))]
 
-        # Cross-sectional operations use the point-in-time index members of each day.
-        bar_files = sorted((canonical_root / "bars").glob("year=*/*.parquet"))
-        bar_files = [path for path in bar_files if int(path.parent.name.split("=")[1]) in years]
-        if not bar_files:
-            raise DataContractError(f"Canonical bars do not exist under {canonical_root / 'bars'}")
-        members = pd.concat(
-            [
-                pd.read_parquet(path, columns=["datetime", "instrument", "in_csi300"], filters=wanted)
-                for path in bar_files
-            ],
-            ignore_index=True,
-        )
-        members["datetime"] = pd.to_datetime(members["datetime"])
-        membership = members.pivot(index="datetime", columns="instrument", values="in_csi300")
-        inputs["universe"] = membership.reindex(index=dates, columns=instruments).eq(True)
         hashes = {
             "jq240_reference": manifest["fingerprint"],
             "jq240_daily_basic": stable_hash({name: files[name] for name in daily_files}),
@@ -597,174 +618,165 @@ class JQ240Library(PanelFactorLibrary):
         }
         return inputs, hashes
 
-    def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
-        calculator = JQFactors(inputs)
-        return {name: calculator.calculate(name) for name in JQ240_NAMES}
+    strict_float = True
 
-    def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
-        calculator = JQFactors(inputs)
-        for spec in self.specs:
-            output_buffers[spec.canonical_name][...] = calculator.calculate(spec.source_name).to_numpy(dtype=float)
+    @property
+    def statement_fields(self):
+        return tuple(
+            dict.fromkeys(
+                f
+                for fields in FUNDAMENTAL_ENDPOINT_FIELDS.values()
+                for f in fields
+                if f
+                not in {
+                    "ts_code",
+                    "ann_date",
+                    "f_ann_date",
+                    "end_date",
+                    "report_type",
+                    "comp_type",
+                    "end_type",
+                    "update_flag",
+                }
+            )
+        )
+
+    @property
+    def statement_outputs(self):
+        return STATEMENT_OUTPUTS
+
+    @property
+    def reference_inputs(self):
+        return (*DAILY_INPUTS, *self.statement_outputs)
+
+    def build_statements(self, inputs):
+        return _graphs(inputs)[1]
+
+    def build(self, inputs):
+        return _graphs(inputs)[0]
 
 
-def prepare_fundamentals(fundamentals: pd.DataFrame) -> pd.DataFrame:
-    """Zero-fill lines a published statement leaves blank and combine the other-receivables lines."""
-    frame = fundamentals.copy()
-    for anchor, fields in ZERO_FILL.items():
-        published = frame[anchor].notna() if anchor in frame.columns else pd.Series(False, index=frame.index)
-        for field in fields:
-            if field not in frame.columns:
-                frame[field] = np.nan
-            frame[field] = frame[field].where(frame[field].notna() | ~published, 0.0)
-    combined = frame["oth_receiv"] + frame["int_receiv"] + frame["div_receiv"]
-    total = frame["oth_rcv_total"] if "oth_rcv_total" in frame.columns else combined * np.nan
-    frame["jq_other_receivables"] = total.where(total.notna(), combined)
-    return frame
+DAILY_INPUTS = (
+    "basic_close",
+    "basic_turnover_rate",
+    "basic_circ_mv",
+    "basic_total_share",
+    "basic_pe_ttm",
+    "mkt",
+    "universe",
+)
 
 
-class Packer:
-    """Move each stock's trading days to consecutive rows and back.
-
-    Packed row ``k`` of a column is that stock's ``k``-th trading day, so rolling windows and EMAs count quotes, not
-    calendar days; rows after a stock's last quote are missing.
-    """
-
-    def __init__(self, trading: np.ndarray, index: pd.Index, columns: pd.Index) -> None:
-        self.index = index
-        self.columns = columns
-        self.rows, self.cols = np.nonzero(trading)
-        self.position = (np.cumsum(trading, axis=0) - 1)[self.rows, self.cols]
-        self.length = int(trading.sum(axis=0).max()) if trading.size else 0
-
-    def pack(self, panel: Panel) -> Panel:
-        values = np.full((self.length, len(self.columns)), np.nan)
-        values[self.position, self.cols] = np.asarray(panel, dtype=float)[self.rows, self.cols]
-        return Panel(values, columns=self.columns)
-
-    def unpack(self, packed: Panel | np.ndarray) -> Panel:
-        values = np.full((len(self.index), len(self.columns)), np.nan)
-        values[self.rows, self.cols] = np.asarray(packed, dtype=float)[self.position, self.cols]
-        return Panel(values, index=self.index, columns=self.columns)
+# Stable graph interface: metadata inspection must work even when KunQuant is unavailable.
+STATEMENT_OUTPUTS = tuple(("y_" if i in (129, 130) else "q_") + f"jq_{i}" for i in range(134))
 
 
 class JQFactors:
-    """Calculator with shared intermediates; ``calculate`` returns one factor panel on the calendar grid."""
+    """Symbolic formulas; every operation emits a KunQuant node."""
 
-    def __init__(self, inputs: Mapping[str, Any]) -> None:
-        self.inputs = inputs
-        close = inputs["close"]
-        self.dates = pd.DatetimeIndex(close.index)
-        self.instruments = pd.Index(close.columns)
-        self.trading = close.notna()
-        self.packer = Packer(self.trading.to_numpy(), self.dates, self.instruments)
-        self._packed: dict[str, Panel] = {}
-        self._cache: dict[str, Any] = {}
-        self._grid: QuarterGrid | None = None
-        self.cap = self._panel("cap").where(self._panel("cap") > 0)
-        self.shares = self._panel("basic_total_share").where(self._panel("basic_total_share") > 0)
-        self.universe = (
-            self._panel("universe").reindex(index=self.dates, columns=self.instruments).eq(True)
-        )
+    def __init__(self, inputs):
+        self.Input = kunquant_symbols("Input")["Input"]
+        self.raw = inputs
+        self.inputs = {
+            name: Value(inputs.get(name) if name in inputs else self.Input(name))
+            for name in (*JQ240Library.required_inputs, *DAILY_INPUTS)
+        }
+        self.trading = self.inputs["close"].notna()
+        self.universe = self.inputs["universe"] == 1
+        self.cap = self.inputs["cap"].where(self.inputs["cap"] > 0)
+        self.shares = self.inputs["basic_total_share"].where(self.inputs["basic_total_share"] > 0)
+        self._cache = {}
+        self.statements = {}
+        self.g = self
+        for short, name in (
+            ("o", "open"),
+            ("h", "high"),
+            ("l", "low"),
+            ("c", "close"),
+            ("v", "volume"),
+            ("amt", "amount"),
+            ("turn", "basic_turnover_rate"),
+        ):
+            setattr(self, short, Value(self.inputs[name].node, self.inputs["close"].node))
+        self.ret = self.c / self.c.shift(1) - 1
 
-    def calculate(self, name: str) -> Panel:
-        result = JQ240_FORMULAS[name](self)
-        if isinstance(result, np.ndarray):
-            result = Panel(result, index=self.dates, columns=self.instruments)
-        result = replace_inf(result.reindex(index=self.dates, columns=self.instruments).astype(float))
-        return result.where(self.trading)
+    def _panel(self, key):
+        return self.inputs[key]
 
-    def calc(self, name: str) -> Panel:
-        """A published factor, cached for factors defined from it."""
-        key = f"factor:{name}"
-        if key not in self._cache:
-            self._cache[key] = self.calculate(name)
-        return self._cache[key]
+    def out(self, value):
+        return Value(value.node)
 
-    def _panel(self, key: str) -> Any:
-        value = self.inputs.get(key)
-        if value is None:
-            raise DataContractError(f"jq240 input is missing: {key}")
-        return value
+    def calculate(self, name):
+        return replace_inf(JQ240_FORMULAS[name](self)).where(self.trading)
 
-    # ------------------------------------------------------------------ packed price and volume inputs
-    def _pk(self, key: str, build: Callable[[], Panel]) -> Panel:
-        if key not in self._packed:
-            self._packed[key] = self.packer.pack(build())
-        return self._packed[key]
+    def calc(self, name):
+        if name not in self._cache:
+            self._cache[name] = self.calculate(name)
+        return self._cache[name]
 
-    @property
-    def o(self) -> Panel:
-        return self._pk("open", lambda: self._panel("open"))
+    ratio_p = staticmethod(ratio)
+    mean = staticmethod(lambda value, window: value.rolling(window).mean())
+    sum = staticmethod(lambda value, window: value.rolling(window).sum())
+    std = staticmethod(lambda value, window: value.rolling(window).std())
+    ema = staticmethod(j.ema)
 
-    @property
-    def h(self) -> Panel:
-        return self._pk("high", lambda: self._panel("high"))
+    def p(self, value, *, annual=False):
+        name = ("y_" if annual else "q_") + "jq_" + str(len(self.statements))
+        self.statements[name] = value.node
+        return Value(self.raw[name] if name in self.raw else self.Input(name))
 
-    @property
-    def l(self) -> Panel:  # noqa: E743 - the conventional name of the low price
-        return self._pk("low", lambda: self._panel("low"))
+    panel = p
 
-    @property
-    def c(self) -> Panel:
-        return self._pk("close", lambda: self._panel("close"))
+    def value(self, name):
+        if name == "jq_other_receivables":
+            return self.b("oth_rcv_total").fillna(self.b("oth_receiv") + self.b("int_receiv") + self.b("div_receiv"))
+        node = Value(self.raw[name] if name in self.raw else self.Input(name))
+        for anchor, fields in ZERO_FILL.items():
+            if name in fields:
+                node = node.where(node.notna() | ~self.value(anchor).notna(), 0)
+        return node
 
-    @property
-    def v(self) -> Panel:
-        return self._pk("volume", lambda: self._panel("volume"))
+    b = value
 
-    @property
-    def amt(self) -> Panel:
-        return self._pk("amount", lambda: self._panel("amount"))
+    def single(self, name):
+        value = self.value(name)
+        quarter = Value(self.raw["fiscal_quarter"] if "fiscal_quarter" in self.raw else self.Input("fiscal_quarter"))
+        return value.where(quarter == 0, value - value.shift(1))
 
-    @property
-    def turn(self) -> Panel:
-        return self._pk("turnover", lambda: self._panel("basic_turnover_rate"))
+    def ttm(self, name):
+        value = self.single(name)
+        return value + value.shift(1) + value.shift(2) + value.shift(3)
 
-    @property
-    def ret(self) -> Panel:
-        """Return between consecutive quotes of a stock."""
-        if "ret" not in self._packed:
-            self._packed["ret"] = self.c / self.c.shift(1) - 1.0
-        return self._packed["ret"]
-
-    def out(self, packed: Panel) -> Panel:
-        return self.packer.unpack(packed)
+    def annual(self, name):
+        quarter = Value(self.raw["fiscal_quarter"] if "fiscal_quarter" in self.raw else self.Input("fiscal_quarter"))
+        return self.value(name).where(quarter == 3)
 
     @staticmethod
-    def ratio_p(numerator: Panel, denominator: Panel) -> Panel:
-        return replace_inf(numerator / denominator.mask(denominator.abs() < 1e-12))
+    def average(value):
+        return Value(k.nan_mean(value.node, value.shift(4).node))
 
     @staticmethod
-    def mean(panel: Panel, window: int) -> Panel:
-        return panel.rolling(window, min_periods=window).mean()
+    def yoy(value):
+        return ratio(value - value.shift(4), value.shift(4).abs())
 
     @staticmethod
-    def sum(panel: Panel, window: int) -> Panel:
-        return panel.rolling(window, min_periods=window).sum()
+    def index_yoy(value):
+        return ratio(value, value.shift(4))
 
     @staticmethod
-    def std(panel: Panel, window: int) -> Panel:
-        return panel.rolling(window, min_periods=window).std()
-
-    @staticmethod
-    def ema(panel: Panel, span: int) -> Panel:
-        """Chinese-software EMA: weight 2 / (span + 1), seeded with the first quote, published after ``span``."""
-        return panel.ewm(span=span, adjust=False, min_periods=span).mean()
-
-    def _window(self, panel: Panel, window: int, reduce: Callable[[np.ndarray], np.ndarray]) -> Panel:
-        """Apply ``reduce`` to every full trailing window (rows x columns x window), in column blocks."""
-        values = panel.to_numpy(dtype=float)
-        result = np.full(values.shape, np.nan)
-        if len(values) < window:
-            return Panel(result, columns=panel.columns)
-        for first in range(0, values.shape[1], COLUMN_BLOCK):
-            block = values[:, first : first + COLUMN_BLOCK]
-            windows = np.lib.stride_tricks.sliding_window_view(block, window, axis=0)
-            complete = np.isfinite(windows).all(axis=2)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                reduced = reduce(np.where(np.isfinite(windows), windows, 0.0))
-            result[window - 1 :, first : first + COLUMN_BLOCK] = np.where(complete, reduced, np.nan)
-        return Panel(result, columns=panel.columns)
+    def yearly(value, statistic, years=8, minimum=4):
+        values = [value.shift(4 * i) for i in range(years)]
+        count = sum(v.notna() for v in values)
+        mean = sum(v.fillna(0) for v in values) / count
+        if statistic == "mean":
+            result = mean
+        elif statistic == "max":
+            result = values[0].fillna(-np.inf)
+            for v in values[1:]:
+                result = np.maximum(result, v.fillna(-np.inf))
+        else:
+            result = ratio(mean, np.sqrt(sum(((v - mean) ** 2).fillna(0) for v in values) / (count - 1)))
+        return result.where(count >= minimum)
 
     def atr(self, window: int) -> Panel:
         previous = self.c.shift(1)
@@ -805,27 +817,17 @@ class JQFactors:
         negative = self.sum(flow.where(change < 0, 0.0).where(change.notna()), window)
         return 100.0 * self.ratio_p(positive, positive + negative)
 
-    def aroon(self, panel: Panel, window: int, *, low: bool) -> Panel:
-        def since_extreme(windows: np.ndarray) -> np.ndarray:
-            # Searching the reversed window finds the most recent extreme and counts the days since it.
-            flipped = windows[..., ::-1]
-            days = np.argmin(flipped, axis=2) if low else np.argmax(flipped, axis=2)
-            return (window - days) / window
-
-        return self._window(panel, window, since_extreme)
+    def aroon(self, panel, window, *, low):
+        test = "<=" if low else ">="
+        return panel.rolling(window).reduce(
+            f"int at=0;for(int i=1;i<count;++i)if(s.v[i]{test}s.v[at])at=i;y=(at+1.0)/count;"
+        )
 
     def bias(self, window: int) -> Panel:
         return 100.0 * (self.c / self.mean(self.c, window) - 1.0)
 
-    def cci(self, window: int) -> Panel:
-        typical = (self.h + self.l + self.c) / 3.0
-
-        def statistic(windows: np.ndarray) -> np.ndarray:
-            mean = windows.mean(axis=2)
-            deviation = np.abs(windows - mean[..., None]).mean(axis=2)
-            return (windows[..., -1] - mean) / np.where(deviation > 0, 0.015 * deviation, np.nan)
-
-        return self._window(typical, window, statistic)
+    def cci(self, window):
+        return ((self.h + self.l + self.c) / 3).rolling(window).reduce("if(ad>0)y=(s.v.back()-mean)/(0.015*ad/count);")
 
     def cr(self, window: int) -> Panel:
         previous = ((self.h + self.l + self.c) / 3.0).shift(1)
@@ -833,15 +835,8 @@ class JQFactors:
         weak = self.sum((previous - self.l).clip(lower=0.0), window)
         return 100.0 * self.ratio_p(strong, weak)
 
-    def plrc(self, window: int) -> Panel:
-        days = np.arange(1, window + 1, dtype=float)
-        weights = (days - days.mean()) / ((days - days.mean()) ** 2).sum()
-
-        def slope(windows: np.ndarray) -> np.ndarray:
-            mean = windows.mean(axis=2)
-            return (windows @ weights) / np.where(mean != 0, mean, np.nan)
-
-        return self._window(self.c, window, slope)
+    def plrc(self, window):
+        return self.c.rolling(window).reduce("if(mean!=0)y=slope/(count*(count*count-1.0)/12)/mean;")
 
     def roc(self, window: int) -> Panel:
         return 100.0 * (self.ratio_p(self.c, self.c.shift(window)) - 1.0)
@@ -849,59 +844,6 @@ class JQFactors:
     def trix(self, window: int) -> Panel:
         triple = self.ema(self.ema(self.ema(self.c, window), window), window)
         return 100.0 * (self.ratio_p(triple, triple.shift(1)) - 1.0)
-
-    # ------------------------------------------------------------------ statements
-    @property
-    def g(self) -> QuarterGrid:
-        if self._grid is None:
-            self._grid = QuarterGrid(prepare_fundamentals(self._panel("fundamentals")), self.dates, self.instruments)
-        return self._grid
-
-    def p(self, values: np.ndarray) -> Panel:
-        return self.g.panel(values)
-
-    def b(self, name: str) -> np.ndarray:
-        """Latest quarter-end balance (or period-end) value."""
-        return self.g.value(name)
-
-    def ttm(self, name: str) -> np.ndarray:
-        key = f"ttm:{name}"
-        if key not in self._cache:
-            self._cache[key] = self.g.ttm(name)
-        return self._cache[key]
-
-    @staticmethod
-    def average(values: np.ndarray) -> np.ndarray:
-        """Mean of the latest quarter and the same quarter a year earlier, or the latest alone."""
-        return nan_mean(np.stack([values, lag(values, 4)], axis=2), 2)[0]
-
-    @staticmethod
-    def yoy(values: np.ndarray) -> np.ndarray:
-        previous = lag(values, 4)
-        return ratio(values - previous, np.abs(previous))
-
-    @staticmethod
-    def index_yoy(values: np.ndarray) -> np.ndarray:
-        return ratio(values, lag(values, 4))
-
-    @staticmethod
-    def yearly(values: np.ndarray, statistic: str, years: int = 8, minimum: int = 4) -> np.ndarray:
-        """Statistic over the latest quarter and the same quarter in each of the previous ``years - 1`` years."""
-        stacked = np.stack([lag(values, 4 * k) for k in range(years)], axis=2)
-        finite = np.isfinite(stacked)
-        count = finite.sum(axis=2)
-        enough = count >= minimum
-        with np.errstate(invalid="ignore", divide="ignore"):
-            if statistic == "max":
-                result = np.where(finite, stacked, -np.inf).max(axis=2)
-            else:
-                mean, _ = nan_mean(stacked, 2)
-                if statistic == "mean":
-                    result = mean
-                else:
-                    squares = np.where(finite, (stacked - mean[..., None]) ** 2, 0.0).sum(axis=2)
-                    result = ratio(mean, np.sqrt(squares / np.maximum(count - 1, 1)))
-        return np.where(enough, result, np.nan)
 
     def gross_margin(self) -> np.ndarray:
         if "gross_margin" not in self._cache:
@@ -939,12 +881,27 @@ class JQFactors:
         return self.interest_carry_current() + self.b("lt_borr") + self.b("bond_payable") - self.b("money_cap")
 
     def financial_assets(self) -> np.ndarray:
-        return (self.b("money_cap") + self.b("trad_asset") + self.b("notes_receiv") + self.b("int_receiv")
-                + self.b("div_receiv") + self.b("fa_avail_for_sale") + self.b("htm_invest"))
+        return (
+            self.b("money_cap")
+            + self.b("trad_asset")
+            + self.b("notes_receiv")
+            + self.b("int_receiv")
+            + self.b("div_receiv")
+            + self.b("fa_avail_for_sale")
+            + self.b("htm_invest")
+        )
 
     def financial_liability(self) -> np.ndarray:
-        return (self.b("trading_fl") + self.b("st_borr") + self.b("notes_payable") + self.b("int_payable")
-                + self.b("div_payable") + self.b("non_cur_liab_due_1y") + self.b("lt_borr") + self.b("bond_payable"))
+        return (
+            self.b("trading_fl")
+            + self.b("st_borr")
+            + self.b("notes_payable")
+            + self.b("int_payable")
+            + self.b("div_payable")
+            + self.b("non_cur_liab_due_1y")
+            + self.b("lt_borr")
+            + self.b("bond_payable")
+        )
 
     def operating_assets(self) -> np.ndarray:
         return self.b("total_assets") - self.financial_assets()
@@ -965,188 +922,157 @@ class JQFactors:
         equity = self.b("total_hldr_eqy_exc_min_int")
         return ratio(equity + self.b("total_ncl"), equity)
 
-    # ------------------------------------------------------------------ cross sections (index members only)
-    def cs_z(self, panel: Panel, *, clip: float = 3.0) -> Panel:
-        """Standardise every date over that day's index members, truncated at ``clip`` standard deviations."""
-        values = panel.where(self.trading)
-        members = values.where(self.universe)
-        mean = members.mean(axis=1)
-        spread = members.std(axis=1)
-        z = values.sub(mean, axis=0).div(spread.where(spread > 0), axis=0)
-        return z.clip(-clip, clip)
+    def cs_z(self, value, *, clip=3.0):
+        value = value.where(self.trading)
+        return Value(j.cross_class("z")([value.node, self.universe.node]))
 
-    def cs_rank(self, panel: Panel) -> Panel:
-        return panel.where(self.universe & self.trading).rank(axis=1, method="average", pct=True)
+    def cs_rank(self, value):
+        return Value(kunquant_symbols("Rank")["Rank"](value.where(self.universe & self.trading).node))
 
-    def cs_residual(self, panel: Panel, *regressors: Panel) -> Panel:
-        """Residual of a daily cross-sectional OLS on a constant and ``regressors``, fitted on index members."""
-        y = panel.to_numpy(dtype=float)
-        xs = np.stack([regressor.to_numpy(dtype=float) for regressor in regressors], axis=2)
-        member = self.universe.to_numpy()
-        result = np.full(y.shape, np.nan)
-        for row in range(len(y)):
-            usable = np.isfinite(y[row]) & np.isfinite(xs[row]).all(axis=1)
-            fit = usable & member[row]
-            if fit.sum() <= xs.shape[2] + 2:
-                continue
-            design = np.column_stack([np.ones(fit.sum()), xs[row, fit]])
-            coefficients, *_ = np.linalg.lstsq(design, y[row, fit], rcond=None)
-            full = np.column_stack([np.ones(usable.sum()), xs[row, usable]])
-            result[row, usable] = y[row, usable] - full @ coefficients
-        return Panel(result, index=self.dates, columns=self.instruments)
+    def cs_residual(self, value, *regressors):
+        return Value(
+            j.cross_class("residual", len(regressors))([value.node, self.universe.node, *[v.node for v in regressors]])
+        )
 
-    def combine(self, *terms: tuple[float, Panel]) -> Panel:
-        """Weighted sum of standardised descriptors, re-weighted over the descriptors a stock has (Barra)."""
-        total = Panel(0.0, index=self.dates, columns=self.instruments)
-        weight = Panel(0.0, index=self.dates, columns=self.instruments)
+    def combine(self, *terms):
+        total = Value(k.const(0))
+        weight = Value(k.const(0))
         for share, descriptor in terms:
             z = self.cs_z(descriptor)
-            total = total + share * z.fillna(0.0)
+            total = total + share * z.fillna(0)
             weight = weight + share * z.notna()
         return total / weight.where(weight > 0)
 
-    # ------------------------------------------------------------------ Barra CNE5 style factors
-    def _calendar_returns(self) -> np.ndarray:
-        close = self._panel("close")
-        return (close / close.shift(1) - 1.0).to_numpy(dtype=float)
+    def _calendar_returns(self):
+        close = self.inputs["close"]
+        return close / close.shift(1) - 1
 
-    def _ew_regression(self) -> dict[str, np.ndarray]:
-        """252-day exponentially weighted market regression (half-life 63) of every stock's daily return."""
+    def _ew_regression(self):
         if "ew_regression" in self._cache:
             return self._cache["ew_regression"]
         y = self._calendar_returns()
-        market = np.asarray(pd.Series(self._panel("mkt")).reindex(self.dates), dtype=float)
-        x = np.repeat(market[:, None], y.shape[1], axis=1)
-        mask = np.isfinite(y) & np.isfinite(x)
-        y0 = np.where(mask, y, 0.0)
-        x0 = np.where(mask, x, 0.0)
-        w = mask.astype(float)
-        sums = ew_window_sums({"w": w, "x": x0, "y": y0, "xx": x0 * x0, "xy": x0 * y0, "yy": y0 * y0}, YEAR, 63)
-        n = ew_window_sums({"n": w}, YEAR, None)["n"]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            mx, my = sums["x"] / sums["w"], sums["y"] / sums["w"]
-            vx = sums["xx"] / sums["w"] - mx**2
-            cov = sums["xy"] / sums["w"] - mx * my
-            beta = cov / vx
-            alpha = my - beta * mx
-            resid = (sums["yy"] - 2 * alpha * sums["y"] - 2 * beta * sums["xy"] + alpha**2 * sums["w"]
-                     + 2 * alpha * beta * sums["x"] + beta**2 * sums["xx"]) / sums["w"]
+        x = self.inputs["mkt"]
+        mask = y.notna() & x.notna()
+        y0 = y.where(mask, 0)
+        x0 = x.where(mask, 0)
+        sums = ew_window_sums({"w": mask, "x": x0, "y": y0, "xx": x0 * x0, "xy": x0 * y0, "yy": y0 * y0}, YEAR, 63)
+        n = ew_window_sums({"n": mask}, YEAR, None)["n"]
+        mx = sums["x"] / sums["w"]
+        my = sums["y"] / sums["w"]
+        vx = sums["xx"] / sums["w"] - mx**2
+        beta = (sums["xy"] / sums["w"] - mx * my) / vx
+        alpha = my - beta * mx
+        resid = (
+            sums["yy"]
+            - 2 * alpha * sums["y"]
+            - 2 * beta * sums["xy"]
+            + alpha**2 * sums["w"]
+            + 2 * alpha * beta * sums["x"]
+            + beta**2 * sums["xx"]
+        ) / sums["w"]
         valid = (n >= 63) & (vx > 0)
-        result = {
-            "beta": np.where(valid, beta, np.nan),
-            "hsigma": np.where(valid & (resid > 0), np.sqrt(np.maximum(resid, 0.0)), np.nan),
-        }
+        result = {"beta": beta.where(valid), "hsigma": np.sqrt(resid.clip(lower=0)).where(valid & (resid > 0))}
         self._cache["ew_regression"] = result
         return result
 
-    def _size(self) -> Panel:
+    def _size(self):
         return self.cs_z(np.log(self.cap))
 
-    def style_size(self) -> Panel:
+    def style_size(self):
         return self._size()
 
-    def style_beta(self) -> Panel:
-        return self.cs_z(Panel(self._ew_regression()["beta"], index=self.dates, columns=self.instruments))
+    def style_beta(self):
+        return self.cs_z(self._ew_regression()["beta"])
 
-    def style_momentum(self) -> Panel:
-        log_returns = np.log1p(self._calendar_returns())
-        lagged = np.full(log_returns.shape, np.nan)
-        lagged[21:] = log_returns[:-21]
-        mask = np.isfinite(lagged)
-        sums = ew_window_sums({"x": np.where(mask, lagged, 0.0)}, 504, 126)
-        count = ew_window_sums({"n": mask.astype(float)}, 504, None)["n"]
-        rstr = np.where(count >= 252, sums["x"], np.nan)
-        return self.cs_z(Panel(rstr, index=self.dates, columns=self.instruments))
+    def style_momentum(self):
+        lagged = np.log1p(self._calendar_returns()).shift(21)
+        mask = lagged.notna()
+        sums = ew_window_sums({"x": lagged.fillna(0)}, 504, 126)
+        count = ew_window_sums({"n": mask}, 504, None)["n"]
+        return self.cs_z(sums["x"].where(count >= 252))
 
-    def style_residual_volatility(self) -> Panel:
+    def style_residual_volatility(self):
         returns = self._calendar_returns()
-        mask = np.isfinite(returns)
-        r0 = np.where(mask, returns, 0.0)
-        sums = ew_window_sums({"w": mask.astype(float), "r": r0, "rr": r0 * r0}, YEAR, 42)
-        count = ew_window_sums({"n": mask.astype(float)}, YEAR, None)["n"]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            mean = sums["r"] / sums["w"]
-            dastd = np.sqrt(np.maximum(sums["rr"] / sums["w"] - mean**2, 0.0))
-        dastd = np.where(count >= 63, dastd, np.nan)
-        log_returns = Panel(np.log1p(returns), index=self.dates, columns=self.instruments)
-        cumulative = np.stack(
-            [log_returns.rolling(21 * months, min_periods=int(21 * months * 0.8)).sum().to_numpy()
-             for months in range(1, 13)],
-            axis=2,
-        )
-        with np.errstate(invalid="ignore"):
-            cmra = np.log1p(cumulative.max(axis=2)) - np.log1p(cumulative.min(axis=2))
-        combined = self.combine(
-            (0.74, Panel(dastd, index=self.dates, columns=self.instruments)),
-            (0.16, Panel(cmra, index=self.dates, columns=self.instruments)),
-            (0.10, Panel(self._ew_regression()["hsigma"], index=self.dates, columns=self.instruments)),
-        )
+        mask = returns.notna()
+        r0 = returns.fillna(0)
+        sums = ew_window_sums({"w": mask, "r": r0, "rr": r0 * r0}, YEAR, 42)
+        count = ew_window_sums({"n": mask}, YEAR, None)["n"]
+        mean = sums["r"] / sums["w"]
+        dastd = np.sqrt((sums["rr"] / sums["w"] - mean**2).clip(lower=0)).where(count >= 63)
+        lr = np.log1p(returns)
+        cumulative = [lr.rolling(21 * m, min_periods=int(21 * m * 0.8)).sum() for m in range(1, 13)]
+        hi = lo = cumulative[0]
+        for value in cumulative[1:]:
+            hi = np.maximum(hi, value)
+            lo = np.minimum(lo, value)
+        cmra = np.log1p(hi) - np.log1p(lo)
+        combined = self.combine((0.74, dastd), (0.16, cmra), (0.10, self._ew_regression()["hsigma"]))
         return self.cs_z(self.cs_residual(combined, self.style_beta(), self._size()))
 
-    def style_non_linear_size(self) -> Panel:
+    def style_non_linear_size(self):
         size = self._size()
         return self.cs_z(self.cs_residual(size**3, size))
 
-    def style_liquidity(self) -> Panel:
-        turnover = self._panel("basic_turnover_rate") / 100.0
-        turnover = turnover.where(self.trading)
+    def style_liquidity(self):
+        turn = (self.inputs["basic_turnover_rate"] / 100).where(self.trading)
 
-        def share_turnover(window: int, months: int) -> Panel:
-            total = turnover.rolling(window, min_periods=window // 2).sum() / months
+        def share(window, months):
+            total = turn.rolling(window, min_periods=window // 2).sum() / months
             return np.log(total.where(total > 0))
 
-        combined = self.combine(
-            (0.35, share_turnover(21, 1)), (0.35, share_turnover(63, 3)), (0.30, share_turnover(YEAR, 12))
-        )
+        combined = self.combine((0.35, share(21, 1)), (0.35, share(63, 3)), (0.30, share(YEAR, 12)))
         return self.cs_z(self.cs_residual(combined, self._size()))
 
-    def style_earnings_yield(self) -> Panel:
-        etop = self.p(self.ttm("n_income_attr_p")) / self.cap
-        cetop = self.p(self.ttm("n_cashflow_act")) / self.cap
-        return self.cs_z(self.combine((0.21, etop), (0.11, cetop)))
+    def style_earnings_yield(self):
+        return self.cs_z(
+            self.combine(
+                (0.21, self.p(self.ttm("n_income_attr_p")) / self.cap),
+                (0.11, self.p(self.ttm("n_cashflow_act")) / self.cap),
+            )
+        )
 
-    def style_growth(self) -> Panel:
+    def style_growth(self):
         shares = self.b("total_share")
-        egro = annual_trend(ratio(self.g.annual("n_income_attr_p"), shares))
-        sgro = annual_trend(ratio(self.g.annual("revenue"), shares))
-        egro_panel = self.g.panel(egro, annual=True)
-        sgro_panel = self.g.panel(sgro, annual=True)
-        return self.cs_z(self.combine((0.24, egro_panel), (0.47, sgro_panel)))
+        egro = self.p(annual_trend(ratio(self.annual("n_income_attr_p"), shares)), annual=True)
+        sgro = self.p(annual_trend(ratio(self.annual("revenue"), shares)), annual=True)
+        return self.cs_z(self.combine((0.24, egro), (0.47, sgro)))
 
-    def style_leverage(self) -> Panel:
+    def style_leverage(self):
         mlev = (self.cap + self.p(self.b("total_ncl"))) / self.cap
         dtoa = self.p(ratio(self.b("total_liab"), self.b("total_assets")))
         blev = self.p(self.blev())
         return self.cs_z(self.combine((0.38, mlev), (0.35, dtoa), (0.27, blev)))
 
 
-def ew_window_sums(series: Mapping[str, np.ndarray], window: int, half_life: float | None) -> dict[str, np.ndarray]:
-    """Exponentially weighted sums over the trailing ``window`` rows; the newest row has weight 1.
-
-    ``half_life=None`` gives plain window sums. Inputs must already have missing values set to zero.
-    """
+def ew_window_sums(series, window, half_life):
     decay = 1.0 if half_life is None else 0.5 ** (1.0 / half_life)
     tail = decay**window
-    result = {}
-    for name, values in series.items():
-        out = np.empty(values.shape)
-        running = np.zeros(values.shape[1:])
-        for row in range(len(values)):
-            running = decay * running + values[row]
-            if row >= window:
-                running = running - tail * values[row - window]
-            out[row] = running
-        result[name] = out
-    return result
+    return {
+        name: Value(
+            k.cpp_state(
+                [value.node],
+                f"""
+        s.total={decay!r}*s.total+x0;s.v.push_back(x0);
+        if(s.v.size()>{window}){{s.total-={tail!r}*s.v.front();s.v.erase(s.v.begin());}}
+        y=s.total;""",
+                members="double total;std::vector<double> v;",
+                init="s.total=0;",
+            )
+        )
+        for name, value in series.items()
+    }
 
 
-def annual_trend(values: np.ndarray, years: int = 5) -> np.ndarray:
-    """Slope of the latest ``years`` fiscal-year values on time, over their mean absolute value (Barra EGRO/SGRO)."""
-    stacked = np.stack([lag(values, 4 * k) for k in range(years - 1, -1, -1)], axis=2)
-    complete = np.isfinite(stacked).all(axis=2)
-    t = np.arange(years, dtype=float)
-    weights = (t - t.mean()) / ((t - t.mean()) ** 2).sum()
-    filled = np.where(np.isfinite(stacked), stacked, 0.0)
-    slope = filled @ weights
-    scale = np.abs(filled).mean(axis=2)
-    return np.where(complete, ratio(slope, scale), np.nan)
+def annual_trend(value, years=5):
+    values = [value.shift(4 * i) for i in range(years - 1, -1, -1)]
+    mean = (years - 1) / 2
+    denom = sum((i - mean) ** 2 for i in range(years))
+    slope = sum(v * ((i - mean) / denom) for i, v in enumerate(values))
+    scale = sum(v.abs() for v in values) / years
+    return ratio(slope, scale)
+
+
+def _graphs(inputs):
+    c = JQFactors(inputs)
+    outputs = {name: c.calculate(name).node for name in JQ240_NAMES}
+    return outputs, c.statements

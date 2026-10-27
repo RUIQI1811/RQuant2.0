@@ -40,15 +40,8 @@ import pandas as pd
 
 from rquant.errors import DataContractError
 from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.libraries.china_chars import (
-    QuarterGrid,
-    lag,
-    nan_mean,
-    ratio,
-    rolling_quarter_std,
-    rolling_regression,
-)
-from rquant.factors.panel_operators import replace_inf, safe_div
+from rquant.factors.panel_operators import replace_inf, rolling_regression, safe_div
+from rquant.factors.statements import QuarterGrid, lag, nan_mean, ratio, rolling_quarter_std
 from rquant.io import sha256_file, stable_hash
 
 Panel = pd.DataFrame

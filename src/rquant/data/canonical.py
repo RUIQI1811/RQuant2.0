@@ -31,6 +31,8 @@ class CanonicalBuilder:
         stock_basic = self._read_endpoint("stock_basic")
         industry = self._read_industry_membership(raw_manifest.get("industry_snapshot"))
         index_weight = self._read_endpoint("index_weight")
+        trade_cal = self._read_endpoint("trade_cal")
+        namechange = self._read_namechange(raw_manifest.get("namechange_snapshot"))
 
         bars = self._read_daily_bars()
         bars = bars.sort_values(["datetime", "instrument"]).reset_index(drop=True)
@@ -64,6 +66,8 @@ class CanonicalBuilder:
 
         bars = self._attach_index_membership(bars, index_weight)
         bars = self._attach_industry(bars, industry)
+        bars = self._attach_listing_age(bars, stock_basic, trade_cal)
+        bars = self._attach_st(bars, namechange)
         invalid_ohlc = self._invalid_ohlc_mask(bars)
         invalid_research_rows = invalid_ohlc & bars["in_csi300"]
         if invalid_research_rows.any():
@@ -104,7 +108,9 @@ class CanonicalBuilder:
         stock_basic.to_parquet(reference_root / "stock_basic.parquet", index=False)
         industry.to_parquet(reference_root / "industry_membership.parquet", index=False)
         index_weight.to_parquet(reference_root / "csi300_snapshots.parquet", index=False)
-        self._read_endpoint("trade_cal").to_parquet(reference_root / "trade_cal.parquet", index=False)
+        trade_cal.to_parquet(reference_root / "trade_cal.parquet", index=False)
+        if namechange is not None:
+            namechange.to_parquet(reference_root / "namechange.parquet", index=False)
         self._build_index_daily(reference_root)
 
         quality_root = self.canonical_root / "quality"
@@ -128,6 +134,7 @@ class CanonicalBuilder:
             "start": kept_dates.min().date().isoformat(),
             "end": kept_dates.max().date().isoformat(),
             "columns": list(CANONICAL_BAR_COLUMNS),
+            "st_history": namechange is not None,
             "quality": quality,
             "fingerprint": stable_hash(
                 {
@@ -272,6 +279,85 @@ class CanonicalBuilder:
         row_snapshot = bars["datetime"].map(date_map.set_index("datetime")["snapshot_date"])
         members = pd.MultiIndex.from_frame(membership[["snapshot_date", "instrument"]])
         bars["in_csi300"] = pd.MultiIndex.from_arrays([row_snapshot, bars["instrument"]]).isin(members)
+        return bars
+
+    def _read_namechange(self, snapshot: str | None) -> Any | None:
+        """Read the stock name history named by the sync manifest; None when the sync predates namechange."""
+        pd, _ = _dependencies()
+        if not snapshot:
+            return None
+        snapshot_root = self.raw_root / "namechange" / f"snapshot={snapshot.replace('-', '')}"
+        # One partition per stock; older paged partitions in the same snapshot are incomplete and ignored.
+        paths = sorted(snapshot_root.glob("ts_code=*/data.parquet"))
+        if not paths:
+            raise DataContractError(f"Name-change snapshot from sync manifest does not exist: {snapshot_root}")
+        frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True, sort=False)
+        missing = {"ts_code", "name", "start_date"} - set(frame.columns)
+        if missing:
+            raise DataContractError(f"namechange is missing fields: {sorted(missing)}")
+        if frame.empty:
+            raise DataContractError("namechange history is empty")
+        return frame.drop_duplicates().reset_index(drop=True)
+
+    @staticmethod
+    def _attach_listing_age(bars: Any, stock_basic: Any, trade_cal: Any) -> Any:
+        """Add ``listed_days``: open trading days from the listing date through each bar's date, inclusive.
+
+        Listings before the first synced calendar day are aged with weekday counts for the part before the calendar.
+        A stock without a usable listing date is aged from its first canonical bar.
+        """
+        pd, np = _dependencies()
+        open_days = trade_cal.loc[trade_cal["is_open"].astype(int).eq(1), "cal_date"].astype(str).drop_duplicates()
+        calendar = np.sort(pd.to_datetime(open_days, format="%Y%m%d").to_numpy(dtype="datetime64[D]"))
+        if not len(calendar):
+            raise DataContractError("Trade calendar has no open days")
+        listing = pd.Series(dtype="datetime64[ns]")
+        if {"ts_code", "list_date"}.issubset(stock_basic.columns):
+            stocks = stock_basic[["ts_code", "list_date"]].dropna().drop_duplicates("ts_code", keep="last")
+            listing = pd.Series(
+                pd.to_datetime(stocks["list_date"].astype(str), format="%Y%m%d", errors="coerce").to_numpy(),
+                index=stocks["ts_code"].map(ts_code_to_qlib).to_numpy(),
+            ).dropna()
+        first_bar = bars.groupby("instrument", sort=False)["datetime"].min()
+        listed = first_bar.index.to_series().map(listing).fillna(first_bar)
+        listed = listed.to_numpy(dtype="datetime64[D]")
+        list_position = np.searchsorted(calendar, listed, side="left")
+        before_calendar = np.busday_count(np.minimum(listed, calendar[0]), calendar[0])
+        offsets = pd.Series(list_position - before_calendar, index=first_bar.index)
+        bar_position = np.searchsorted(calendar, bars["datetime"].to_numpy(dtype="datetime64[D]"), side="left")
+        bars["listed_days"] = (bar_position - bars["instrument"].map(offsets).to_numpy() + 1).astype("int32")
+        return bars
+
+    @staticmethod
+    def _attach_st(bars: Any, namechange: Any | None) -> Any:
+        """Add ``is_st`` from the name in force on each bar's date: ST, *ST, PT and delisting (退) names count."""
+        pd, _ = _dependencies()
+        if namechange is None:
+            bars["is_st"] = pd.Series(pd.NA, index=bars.index, dtype="boolean")
+            return bars
+        names = namechange[["ts_code", "name", "start_date", *(["ann_date"] if "ann_date" in namechange else [])]]
+        names = names[names["ts_code"].astype(str).str.upper().str.endswith((".SH", ".SZ", ".BJ"))]
+        names = names.assign(
+            instrument=names["ts_code"].map(ts_code_to_qlib),
+            start=pd.to_datetime(names["start_date"].astype(str), format="%Y%m%d", errors="coerce"),
+        ).dropna(subset=["start"])
+        # A later announcement for the same effective date corrects the earlier one.
+        sort_keys = ["instrument", "start", *(["ann_date"] if "ann_date" in names else [])]
+        names = names.sort_values(sort_keys).drop_duplicates(["instrument", "start"], keep="last")
+        flagged = names["name"].astype(str).str.upper().str.contains(r"ST|^PT|退", regex=True)
+        names = pd.DataFrame({"instrument": names["instrument"], "start": names["start"], "is_st": flagged.to_numpy()})
+        rows = bars[["instrument", "datetime"]].reset_index().sort_values("datetime")
+        matched = pd.merge_asof(
+            rows,
+            names.sort_values("start"),
+            left_on="datetime",
+            right_on="start",
+            by="instrument",
+            direction="backward",
+        )
+        bars["is_st"] = pd.Series(matched["is_st"].fillna(False).to_numpy(dtype=bool), index=matched["index"]).astype(
+            "boolean"
+        )
         return bars
 
     def _attach_industry(self, bars: Any, industry: Any) -> Any:

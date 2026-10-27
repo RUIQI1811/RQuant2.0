@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,14 +11,19 @@ import pandas as pd
 
 from rquant.data.ch4_factors import CH4_FACTORS, CH4FactorBuilder
 from rquant.factors.catalog import get_catalog
-from rquant.factors.engine import FactorBuildConfig, PanelFactorEngine, create_factor_engine
-from rquant.factors.libraries.size_value_china import (
-    SIZE_VALUE_CHINA_NAMES,
-    SizeValueChina,
-    SizeValueChinaLibrary,
-    rolling_ols,
-)
+from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine, cpp_compiler_available, create_factor_engine
+from rquant.factors.libraries.size_value_china import SIZE_VALUE_CHINA_NAMES, SizeValueChinaLibrary
 from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from panel_reference.size_value_china import SizeValueChina, rolling_ols  # noqa: E402
+
+KUNQUANT_READY = importlib.util.find_spec("KunQuant") is not None and cpp_compiler_available()
+
+
+def reference(inputs: dict[str, object]) -> dict[str, pd.DataFrame]:
+    calculator = SizeValueChina(inputs)
+    return {name: calculator.calculate(name) for name in SIZE_VALUE_CHINA_NAMES}
 
 
 def synthetic_inputs(days: int = 700, stocks: int = 5, seed: int = 3) -> dict[str, object]:
@@ -58,18 +65,50 @@ class SizeValueChinaCatalogTests(unittest.TestCase):
         self.assertEqual(21, len(names))
         self.assertEqual(("svc_001", "svc_021"), (names[0], names[-1]))
         self.assertEqual(len(set(SIZE_VALUE_CHINA_NAMES)), len(SIZE_VALUE_CHINA_NAMES))
-        self.assertEqual(1554, len(catalog.specs))
+        self.assertEqual(1696, len(catalog.specs))
 
     def test_every_characteristic_has_a_calculator(self) -> None:
         for name in ("size", "ep", "abturn"):
             self.assertTrue(hasattr(SizeValueChina, f"_char_{name}"), name)
 
 
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class SizeValueChinaCalculationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        cls.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.engine = KunQuantFactorEngine(
+            cls.temporary.name, FactorBuildConfig(factor_set="size_value_china", workers=2)
+        )
+        cls.module = cls.engine.compile()
         cls.inputs = synthetic_inputs()
-        cls.outputs = SizeValueChinaLibrary().calculate(cls.inputs)
+        cls.outputs = cls.calculate(cls.inputs)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    @classmethod
+    def calculate(cls, inputs: dict[str, object]) -> dict[str, pd.DataFrame]:
+        """KunQuant outputs by source name, as panels shaped like the close panel."""
+        close = inputs["close"]
+        arrays = {
+            name: np.repeat(np.asarray(value)[:, None], close.shape[1], axis=1) if np.ndim(value) == 1
+            else np.asarray(value, dtype=float)
+            for name, value in inputs.items()
+        }
+        output = cls.engine.run(arrays, module=cls.module)
+        return {
+            spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
+            for spec in SizeValueChinaLibrary().specs
+        }
+
+    def test_every_output_matches_the_pandas_reference(self) -> None:
+        expected = reference(self.inputs)
+        for name in SIZE_VALUE_CHINA_NAMES:
+            np.testing.assert_allclose(self.outputs[name].to_numpy(), expected[name].to_numpy(), rtol=1e-9,
+                                       atol=1e-12, equal_nan=True, err_msg=name)
 
     def test_all_outputs_are_aligned_and_populated(self) -> None:
         close = self.inputs["close"]
@@ -85,7 +124,7 @@ class SizeValueChinaCalculationTests(unittest.TestCase):
         dates = self.inputs["close"].index
         for cut in (300, 520):
             last = dates[cut]
-            past = SizeValueChinaLibrary().calculate(truncated(self.inputs, last))
+            past = self.calculate(truncated(self.inputs, last))
             for name in SIZE_VALUE_CHINA_NAMES:
                 expected = self.outputs[name].loc[:last].to_numpy()
                 np.testing.assert_allclose(past[name].to_numpy(), expected, rtol=1e-9, atol=1e-12, equal_nan=True,
@@ -256,13 +295,15 @@ class CH4FactorBuilderTests(unittest.TestCase):
         self.assertTrue(groups.loc[losers, "value"].eq("G").all())
 
 
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class SizeValueChinaEngineTests(unittest.TestCase):
     def test_engine_reads_audited_reference_files(self) -> None:
         inputs = synthetic_inputs(days=300, stocks=4)
-        with tempfile.TemporaryDirectory() as temporary:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             canonical = root / "canonical"
-            reference = canonical / "reference"
+            audited = canonical / "reference"
             dates = inputs["close"].index
             bars = inputs["close"].stack(future_stack=True).rename("close").reset_index()
             bars["in_csi300"] = True
@@ -277,32 +318,32 @@ class SizeValueChinaEngineTests(unittest.TestCase):
                 axis=1,
             ).reset_index()
             for year_value, frame in daily.groupby(daily["datetime"].dt.year):
-                destination = reference / "daily_basic" / f"year={year_value}" / "data.parquet"
+                destination = audited / "daily_basic" / f"year={year_value}" / "data.parquet"
                 destination.parent.mkdir(parents=True)
                 frame.to_parquet(destination, index=False)
                 files[f"daily_basic/year={year_value}/data.parquet"] = sha256_file(destination)
             pd.DataFrame({"datetime": dates, **{name: inputs[f"ch4_{name}"].to_numpy() for name in CH4_FACTORS},
-                          "stocks": 300}).to_parquet(reference / "ch4_factors.parquet", index=False)
-            files["ch4_factors.parquet"] = sha256_file(reference / "ch4_factors.parquet")
+                          "stocks": 300}).to_parquet(audited / "ch4_factors.parquet", index=False)
+            files["ch4_factors.parquet"] = sha256_file(audited / "ch4_factors.parquet")
             manifest = {"status": "complete", "raw_fingerprint": "raw-fixture", "files": files}
             manifest["fingerprint"] = stable_hash(manifest)
-            atomic_write_json(reference / "manifest.json", manifest)
+            atomic_write_json(audited / "manifest.json", manifest)
 
             engine = create_factor_engine(root / "cache", FactorBuildConfig(factor_set="size_value_china"))
-            self.assertIsInstance(engine, PanelFactorEngine)
+            self.assertIsInstance(engine, KunQuantFactorEngine)
             result = engine.build_from_canonical(canonical, root / "factors")
             self.assertEqual(21, result["columns"])
             self.assertEqual(manifest["fingerprint"], result["reference_inputs"]["size_value_china_reference"])
             store = root / "factors" / "size_value_china"
             stored = pd.concat([pd.read_parquet(path) for path in sorted(store.glob("year=*/*.parquet"))])
             stored = stored.set_index(["datetime", "instrument"])
-            direct = SizeValueChinaLibrary().calculate(inputs)
+            direct = reference(inputs)
             for canonical_name, name in (("svc_001", "size"), ("svc_008", "ch4_beta_mkt")):
                 values = stored[canonical_name].unstack()
                 expected = direct[name].loc[values.index, values.columns]
-                np.testing.assert_allclose(values.to_numpy(), expected.to_numpy(), rtol=1e-12, equal_nan=True)
+                np.testing.assert_allclose(values.to_numpy(), expected.to_numpy(), rtol=1e-9, equal_nan=True)
 
-            (reference / "ch4_factors.parquet").write_bytes(b"tampered")
+            (audited / "ch4_factors.parquet").write_bytes(b"tampered")
             with self.assertRaisesRegex(Exception, "differs from its manifest"):
                 engine.build_from_canonical(canonical, root / "factors")
 

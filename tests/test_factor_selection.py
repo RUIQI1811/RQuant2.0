@@ -135,7 +135,7 @@ class FactorSelectionRegistryTests(unittest.TestCase):
 
         self.assertIs(HQUALITY_SELECTION, selection)
         self.assertEqual(HQUALITY_SELECTION.canonical_names, catalog.canonical_names("Hquality"))
-        self.assertEqual(1554, len(catalog.specs))
+        self.assertEqual(1696, len(catalog.specs))
         for name in selection.canonical_names:
             self.assertIn(registry.source_factor_set(selection, name), ("qlib_alpha158", "wq_alpha101", "gtja191"))
         self.assertNotIn("gtja_030", selection.canonical_names)
@@ -151,7 +151,7 @@ class FactorSelectionRegistryTests(unittest.TestCase):
         self.assertEqual(96, len(selection.canonical_names))
         sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
         self.assertEqual(set(selection.source_factor_sets), sources)
-        self.assertEqual({"kunquant", "panel"}, {library.backend for library in registry.select("recent")})
+        self.assertEqual({"kunquant"}, {library.backend for library in registry.select("recent")})
 
 
 class SelectionFactorEngineTests(unittest.TestCase):

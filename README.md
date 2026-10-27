@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算 Alpha158、Alpha101 与 Alpha360 因子；审计过的 Pandas 面板后端计算 GTJA191。
+- KunQuant 编译并计算全部九个公式因子集；Hquality 和 recent 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -37,11 +37,12 @@ rquant factors build --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
 rquant factors build --factor-set Hquality
 rquant factors validate --factor-set Hquality
-rquant data sync-fundamentals --through 2026-08-04   # china_chars、jq240、barra_cne6、jkp153 需要
+rquant data sync-fundamentals --through 2026-08-04   # china_chars、jq240、oap、barra_cne6、jkp153 需要
 rquant data build-reference
 rquant factors build --factor-set china_chars
 rquant factors build --factor-set size_value_china    # 只需 build-reference，不需要财报
 rquant factors build --factor-set jq240
+rquant factors build --factor-set oap
 rquant factors build --factor-set barra_cne6
 rquant factors build --factor-set tushare_tech        # 只用 OHLCV
 rquant factors build --factor-set jkp153
@@ -120,7 +121,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 1554 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、
+- 1696 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
   barra_cne6、tushare_tech、jkp153）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
@@ -142,19 +143,21 @@ rquant doctor --skip-permission-check
 | `data.formal_start`              | `2010-01-01` | 正式研究起点                 |
 | `data.warmup_trading_days`       |        `300` | 正式研究前预热交易日数       |
 | `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
-| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）或 `all` |
+| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）、`main`（沪深主板，见下文）、`sh_main`（沪市主板）或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `data.fundamentals_start_year`   |       `2004` | `data sync-fundamentals` 抓取财报的最早公告年份 |
 | `data.fundamentals_window_years` |          `6` | 财报按公告日分窗抓取的年数；已结束的窗口会缓存复用 |
 | `factors.factor_set`             |   `Hquality` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
+| `factors.graph_outputs`          |         `20` | 每个 KunQuant 图最多编译的因子数；每个中间结果都要一块“日期 × 股票”的缓冲区，分图计算可大幅降低内存，结果逐位不变；只作用于严格浮点的因子集（qlib_alpha158/360、wq_alpha101 始终一张图）；`0` 表示整个因子集一张图 |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |
 | `workflow.validation_months`     |          `6` | 训练窗口最后几个月用于选择迭代数 |
 | `workflow.first_prediction_year` |       `2013` | 第一个样本外预测年           |
 | `backtest.initial_capital`       |    `1000000` | 初始资金，人民币             |
 | `backtest.topk`                  |         `50` | 目标持股数量                 |
-| `backtest.n_drop`                |          `5` | 每期最多换出数量             |
+| `backtest.n_drop`                |         `50` | 每次调仓最多换出数量；等于 `topk` 时全量调整到最新前 `topk` 名 |
+| `backtest.rebalance_days`        |          `5` | 每隔多少个交易日调仓一次（从第一个预测日起算），其余交易日不下单 |
 | `backtest.impact_cost`           |        `0.0` | Qlib 二次冲击成本系数，按成交额占当日成交额比例的平方计费 |
 
 如需使用其他配置文件，所有命令都可以在主命令前指定：
@@ -177,6 +180,8 @@ rquant data sync --through 2026-08-04
 
 - 为 2010 年正式研究期自动准备 300 个交易日的预热历史；
 - 获取全 A 股日线及所需参考数据，同时保留历史时点沪深 300 成分信息；
+- 按 `through` 日期逐只留存全部股票的历史名称（`namechange`，用于逐日判断 ST）。全市场一次性分页查询的排序不稳定、会漏行，
+  所以每只股票单独请求，约 6000 次，按默认限流约 30 分钟；
 - 按 `through` 日期留存申万行业快照，分页获取历史已失效记录（`is_new=N`）和当前有效记录（`is_new=Y`）；标准数据只使用最新完整快照，以保持行业时点覆盖并避免当前记录被永久缓存；
 - 每个分区都带有内容哈希和清单；
 - 已完成且哈希有效的分区会作为缓存复用；
@@ -236,6 +241,7 @@ rquant data build-qlib
 - 原始价格、复权价格、成交量与复权因子；
 - 停牌缺口、开盘涨跌停限制；
 - 历史时点沪深 300 成分；
+- 历史时点 ST 状态（`is_st`，没有 `namechange` 历史时为空）与上市交易日数（`listed_days`）；
 - 历史时点行业分类和市值。
 
 如果 Tushare 返回的 OHLC 违反 `low <= open/close <= high`，属于当日历史沪深 300
@@ -271,6 +277,32 @@ python -m json.tool data/qlib/manifest.json
   `ann_date` 为三张表都已公告的日期；
 - `manifest.json`：上述文件的哈希、所依据的原始同步指纹和财报同步指纹。
 
+### 研究股票池
+
+| 股票池   | 每个交易日的成员 |
+| -------- | ---------------- |
+| `csi300` | 当日可知的沪深 300 成分股 |
+| `main`   | 沪市 60 开头、深市 00 开头的主板 A 股（含原中小板 002/003），剔除创业板 30、科创板 68、北交所和 B 股；当日名称为 ST、\*ST 或“退”（退市整理）的股票，以及上市后前 60 个交易日的次新股，当日也不在池内 |
+| `sh_main` | `main` 中只保留沪市 60 开头的股票，ST 与次新股剔除规则相同 |
+| `all`    | 全部 A 股 |
+
+ST 状态按 Tushare `namechange` 的历史名称逐日判断（生效日即 `start_date`），上市天数按交易日历从 `list_date` 起数。
+规则定义在 `src/rquant/universe.py`。股票池逐日决定因子库发布哪些行，因此只影响训练样本与可买入的股票；
+时间序列指标仍使用每只股票进池前的历史。
+
+除 `csi300` 外，每个股票池的因子库写在各自目录（`main` 为 `data/factors-main/`，`sh_main` 为 `data/factors-sh_main/`），与沪深 300 的
+`data/factors/` 并存。临时切换股票池用全局参数 `--universe`，它覆盖 `data.universe`：
+
+```bash
+rquant --universe main factors build --factor-set qlib_alpha158
+rquant --universe main walk-forward --model lgb --horizon 1d --factor-set qlib_alpha158 --through 2026-10-23
+rquant report RUN_ID   # 自动按该滚动训练的股票池回测
+```
+
+`walk-forward` 会检查因子库的股票池与当前股票池一致；`report` 从滚动训练清单读取股票池，与配置无关。
+`main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
+`rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
+
 财报需要单独同步（按股票、按公告日窗口请求单股接口，不需要 `*_vip` 批量接口权限）：
 
 ```bash
@@ -278,7 +310,7 @@ rquant data sync-fundamentals --through 2026-08-04
 rquant data build-reference
 ```
 
-`sync-fundamentals` 只抓取股票池可能包含的股票（`csi300` 为全部历史成分，`all` 为全部 A 股），结果清单写在
+`sync-fundamentals` 只抓取股票池可能包含的股票（`csi300` 为全部历史成分，`main` 为全部主板股票，`all` 为全部 A 股），结果清单写在
 `data/raw/fundamentals_manifest.json`，不改动 `data sync` 的清单。已结束的公告日窗口不会再变，再次同步只重抓
 截至 `--through` 的最后一个窗口。某个窗口返回达到 100 行时，Tushare 可能截断了结果，会自动按年拆分重抓。
 `build-reference` 只重建参考数据，要求原始同步与标准数据一致；原始数据变化后应改跑 `build-qlib`。
@@ -324,6 +356,8 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
+- `oap`：`oap_001` 至 `oap_142`，共 142 列，Open Source Asset Pricing（Chen-Zimmermann）212 个预测信号中能用 Tushare
+  构造的部分，见下文“Open Source Asset Pricing 因子集 oap”。
 - `barra_cne6`：`cne6_001` 至 `cne6_038`，共 38 列，按 MSCI Barra CNE6 公开定义重写的风格描述子（descriptor），
   见下文“Barra CNE6 因子集 barra_cne6”。
 - `tushare_tech`：`tst_001` 至 `tst_075`，共 75 列，Tushare `stk_factor_pro` 接口的技术指标按通达信公式与 Tushare 参数重算，
@@ -338,14 +372,22 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 
 ### 因子库代码结构
 
-所有可研究的因子公式由 RQuant 自己维护。Alpha158/Alpha101/Alpha360 使用 KunQuant 后端，GTJA191 使用
-Pandas 宽表后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约：
+所有可研究的因子公式由 RQuant 自己维护。Alpha158、Alpha101、Alpha360、GTJA191、china_chars、
+size_value_china、talib、jq240 与 oap 全部使用 KunQuant 后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约。
+原 Pandas 实现保留在 `tests/panel_reference/` 中作为独立数值对照。barra_cne6、tushare_tech 与 jkp153 暂用 Pandas 面板后端。Python 负责读取、排列数据和按公告日发布财报结果；
+财报公式在季度图中计算，日频公式在交易日图中计算，缺失的窗口、递推、回归和行业截面能力由 C++ 扩展算子提供：
 
 ```text
 src/rquant/factors/
 ├── extensions/
-│   └── kunquant.py                      # KunQuant 缺失能力的最小扩展与适配
-├── panel_operators.py                   # 公共 Pandas 面板算子
+│   ├── kunquant.py                      # KunQuant 缺失能力的最小扩展与适配
+│   ├── kunquant_panel.py                # 与 Pandas 面板语义一致的窗口、递归和逐股 C++ 算子
+│   ├── kunquant_jq240.py                # jq240 的停牌窗口与截面运算
+│   ├── kunquant_oap.py                  # oap 的季度、月度和行业截面运算
+│   ├── kunquant_oap_regression.py       # oap 奇异回归窗口的伪逆回退
+│   └── ta_lib/ta_lib.hpp                # 编译到 KunQuant 图中的 TA-Lib C 函数
+├── panel_operators.py                   # 独立数值参考及研究流程使用的 Pandas 算子
+├── statements.py                        # 首次披露财报季度网格与公告日对齐
 ├── catalog.py                           # 动态目录、稳定命名和实现指纹
 ├── engine.py                            # 后端选择、执行和标准分区写入
 ├── selection.py                         # 按年度稳定性、覆盖率与相关性筛选因子
@@ -355,16 +397,17 @@ src/rquant/factors/
     ├── alpha158.py                      # 158 条本地 Alpha158 公式
     ├── alpha101.py                      # 101 条本地 Alpha101 公式
     ├── alpha360.py                      # 6 个归一化字段各 60 个滞后期的 Alpha360 图
-    ├── gtja191.py                       # 完整 GTJA191 提供者与公式语义说明
+    ├── gtja191.py                       # 190 条 GTJA191 KunQuant 公式与语义说明
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
     ├── recent.py                        # recent（2022 年以后仍有效）选择型因子集的锁定成员与方向
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
     ├── jq240.py                         # 233 个按聚宽因子库定义重写的日频因子
-    ├── barra_cne6.py                    # 38 个 Barra CNE6 风格描述子
-    ├── tushare_tech.py                  # 75 个 Tushare stk_factor_pro 技术指标
-    ├── jkp153.py                        # 144 个 JKP 全球因子特征的日频版本
+    ├── oap.py                           # 142 个按 Open Source Asset Pricing 定义重写的日频信号
+    ├── barra_cne6.py                    # 38 个 Barra CNE6 风格描述子（Pandas 面板后端）
+    ├── tushare_tech.py                  # 75 个 Tushare stk_factor_pro 技术指标（Pandas 面板后端）
+    ├── jkp153.py                        # 144 个 JKP 全球因子特征的日频版本（Pandas 面板后端）
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -375,10 +418,13 @@ Alpha360 的迁入公式基于 Qlib 0.9.7 的 MIT 源码。两项来源与许可
 `THIRD_PARTY_NOTICES.md`。
 
 因子公式优先直接组合 KunQuant 公共算子。只有 KunQuant 0.1.11 无法表达的能力才放入
-`extensions/kunquant.py`；当前仅包含 Alpha101 行业中性化所需的横截面扩展和轻量符号适配，不复制
+`extensions/`；扩展覆盖行业截面、窗口、递推和逐股 C++ 计算，不复制
 `OpBase`、优化 pass、代码生成器或运行时。
 
 ### 添加自己的因子库
+
+迁移会改变各因子集的实现指纹，旧因子库需要按正式构建命令重建，再重建依赖它们的 Hquality 和 recent。
+截断数据的数值对照测试使用临时目录，不替换已有因子库；完整历史数据上的性能和结果须另行验证。
 
 在 `src/rquant/factors/libraries/` 中新建独立模块。小型因子库可直接使用 `CustomFactorLibrary`：
 
@@ -428,7 +474,8 @@ GTJA191 当前构建 190 条公式：186 条只依赖标准 OHLCV、成交额和
 
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 使用标准数据中的沪深 300 日线；构建器自动从
   `data/canonical/reference/index_daily.parquet` 选择 `000300.SH`，缺失时兼容 `399300.SZ`；
-- `gtja_030` 的公式仍保留在源码中，但因当前缺少可审计的逐日 `mkt`、`smb`、`hml` 风格收益，暂时不注册到构建目录。
+- `gtja_030` 的公式只保留在 Pandas 参考实现 `tests/panel_reference/gtja191.py` 中，因当前缺少可审计的逐日
+  `mkt`、`smb`、`hml` 风格收益，暂时不注册到构建目录。
 
 构建命令：
 
@@ -444,6 +491,11 @@ rquant factors validate --factor-set gtja191
 附录为基准。原报告中
 `Alpha159` 的 `HGIH` 按 `HIGH` 修正并保留其原始加权式；`Alpha181` 的分母 `SUM` 缺少窗口参数，
 实现采用与分子一致的 20 日窗口，并在源码 `GTJA191_FORMULA_NOTES` 中固定这些解释。
+
+GTJA191 由 KunQuant 编译执行，首次构建需要本机 C++ 编译器，编译耗时取决于平台与图规模。原 Pandas
+实现保留在 `tests/panel_reference/gtja191.py`，测试逐格比对全部 190 条公式。为保证跨编译器、跨 CPU 结果一致：
+截面 `rank` 和时序 `ts_rank` 先把输入保留 40 位有效二进制位并把绝对值小于 1e-12 的值置 0，使理论上相等的值
+严格并列；该库编译时关闭 FMA 合并（GCC/Clang 的 `-ffp-contract=off`，MSVC 默认不合并）。
 
 ### 构建因子
 
@@ -603,8 +655,8 @@ rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
 
 ### TA-Lib 因子集 talib
 
-`talib` 逐只股票调用 TA-Lib C 库（`TA-Lib==0.8.2` Python 包，自带 Windows/macOS/Linux 预编译 wheel，无需另装 C 库），
-定义锁定在 `src/rquant/factors/libraries/talib_indicators.py`：
+`talib` 将仓库内的 TA-Lib 0.8.1 C 函数编译到 KunQuant 图中，逐只股票计算；
+`TA-Lib==0.8.2` Python 包用于独立对照测试。定义锁定在 `src/rquant/factors/libraries/talib_indicators.py`：
 
 - 只用 OHLCV，不需要参考数据；每只股票先去掉停牌和上市前的空行，再按自身连续交易日计算，所以 EMA、Wilder 平滑、
   希尔伯特变换等递归指标不会被停牌缺口重置；每只股票最初 `lookback` 个交易日（TA-Lib 无值，K 线形态会给占位 0）为空；
@@ -618,7 +670,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set size_value_china
   也未纳入；
 - 61 个 K 线形态输出为 TA-Lib 原值：形态完成当天看涨 +100 / 看跌 -100（少数形态为 ±200），否则为 0。
 
-因子清单的实现指纹包含 TA-Lib Python 包与 C 库版本，升级 TA-Lib 会使旧的 `data/factors/talib` 失效。
+因子清单的实现指纹包含公式模块和仓库内的 TA-Lib C 源码，修改这些实现会使旧的 `data/factors/talib` 失效。
 
 ```bash
 rquant factors build --factor-set talib
@@ -639,7 +691,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set talib
   均线、EMA、布林带、MACD 按聚宽口径除以收盘价，ATR 与多空力道也除以收盘价，`price_no_fq` 是 daily_basic 的不复权收盘价；
   成交量是标准数据的复权成交量，成交额为元，换手率为 daily_basic 的流通股换手率（%）；
 - 风格因子按聚宽文档的 Barra CNE5 描述子计算（beta 半衰期 63、RSTR 504 日滞后 21 日、DASTD/CMRA/HSIGMA 等），
-  截面标准化、排序和正交化只用当日的沪深 300 成分股，市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
+  截面标准化、排序和正交化只用当日的研究股票池成员（默认沪深 300），市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
 - 未实现：`non_recurring_gain_loss` 与 `adjusted_profit_to_total_profit`（需要 `fina_indicator` 的扣非净利润），
   以及风格因子中依赖分析师预期的 EPIBS、EGRLF、EGRSF（其权重按比例分给其余描述子）。
 
@@ -653,6 +705,43 @@ rquant data build-reference
 rquant factors build --factor-set jq240
 rquant factors validate --factor-set jq240
 rquant walk-forward --model lgb --horizon 1d --factor-set jq240
+```
+
+### Open Source Asset Pricing 因子集 oap
+
+`oap` 按 Open Source Asset Pricing（Chen and Zimmermann, “Open Source Cross-Sectional Asset Pricing”，openassetpricing.com）
+`SignalDoc` 中 212 个 Predictor 信号的公开定义独立重写，不使用其代码或数据，只用 Tushare，定义锁定在
+`src/rquant/factors/libraries/oap.py`，来源名就是 OAP 简称（如 `Mom12m`、`AssetGrowth`、`IdioVol3F`）。114 个 Placebo
+信号不在其中。142 个已实现：价格 36、交易 11、会计 84（估值、盈利、投资与应计、R&D）、其他 4、事件 7（含
+AnnouncementReturn）。
+
+- 月度定义改为日频：一个月 21 个交易日，一年 252 个；需要月收益序列的信号（Beta、Coskewness、std_turn、VolumeTrend、
+  ResidualMomentum、BetaTailRisk、VarCF 等）在以当日结尾、互不重叠的 21 日块上计算，因此每天更新；
+- 财报沿用 `china_chars` 的季度网格（首次披露值、公告日后且更早报告期均已公告才可用）：Compustat 年度流量改为最近四个
+  单季之和，资产负债项取最近报告期，“一年前”为四个季度前；Compustat 科目与 Tushare 字段的对应见 `ITEMS`；
+- 市值为日度总市值；股利为 daily_basic 的 `dv_ttm` 乘总市值，过去 12 个月股利总额变化超过 5% 的日子视为一次派息变动，
+  DivSeason/DivYieldST 以 11–12 个月前是否有变动判断下月是否派息；需要剔除送转的股数（ShareIss1Y/5Y、PS）用
+  总股本 × 不复权价 / 复权价；
+- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日研究股票池成员（默认沪深 300），行业为申万一级；
+- 美股样本过滤（股价低于 5 美元、交易所、股票代码、SIC 金融业剔除等）不再使用；定义本身的限制保留（FirmAgeMom 只取最年轻
+  五分之一，MomVol 只取换手率最高三分之一）；美国特有常数换成 A 股口径（法定税率 2008 年前 33%、之后 25%；ShareVol
+  用沪深 300 换手率三分位代替美股 5%/10% 阈值）。
+
+未实现的 70 个及原因记录在 `OAP_SKIPPED`：分析师预期与评级 20 个（IBES）、13F 机构持仓 8 个、个股期权 9 个，以及
+专利、广告费、员工数、订单储备、养老金、分部数据、信用评级、融券余额、PIN、股份回购、递延收入（2018–2020 年预收款项
+改为合同负债）、需要 8 年 R&D 的 RDAbility（Tushare 研发费用 2018 年起才单列）、11 年以上的季节性（行情从 2008 年开始）等。
+R&D 类信号（RD、RDcap、SurpriseRD、RDIPO）在 2018 年以前为空。
+
+`oap` 用到的现金流量表字段（吸收投资、取得借款、发行债券、偿还债务收到/支付的现金）和资产负债表字段（应交税费、递延所得税
+负债）与 `jkp153` 相同，新增字段后需重新 `data sync-fundamentals` 与 `data build-reference`，已构建的
+`china_chars`、`jq240` 也要重建。`tests/test_oap.py` 用截断数据重算、直接公式、派息事件与截面成分股回归验证。
+
+```bash
+rquant data sync-fundamentals --through 2026-08-04
+rquant data build-reference
+rquant factors build --factor-set oap
+rquant factors validate --factor-set oap
+rquant walk-forward --model lgb --horizon 1d --factor-set oap
 ```
 
 ### Barra CNE6 因子集 barra_cne6
@@ -712,7 +801,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set tushare_tech
 - 未实现 9 个：员工数相关的 `emp_gr1`、`sale_emp_gr1`，q 因子模型的 `ivol_hxz4_21d`、`iskew_hxz4_21d`，
   数据起点之前的 `seas_11_15*`、`seas_16_20*`，以及没有回购时与 `div12m_me` 相同的 `eqpo_me`；共 144 列 `jkp_001` 至 `jkp_144`。
 
-`jkp153` 在 jq240 的财报字段之外还需要 `FUNDAMENTAL_ENDPOINT_FIELDS` 中标注为 jkp153 的 6 个字段（`taxes_payable`、
+`jkp153` 在 jq240 的财报字段之外还需要 `FUNDAMENTAL_ENDPOINT_FIELDS` 中标注为 jkp153 的 6 个字段（oap 也使用）（`taxes_payable`、
 `defer_tax_liab`、`c_recp_cap_contrib`、`c_recp_borrow`、`proc_issue_bonds`、`c_prepay_amt_borr`），新增后资产负债表与
 现金流量表分区需要重新同步（利润表分区可复用），并重建参考数据与 `china_chars`、`jq240`、`barra_cne6`。
 `tests/test_jkp153.py` 用截断数据重算、直接公式与截面排序回归验证。
@@ -724,6 +813,8 @@ rquant factors build --factor-set jkp153
 rquant factors validate --factor-set jkp153
 rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 ```
+
+`barra_cne6`、`tushare_tech` 与 `jkp153` 暂时仍使用 Pandas 面板后端（`PanelFactorLibrary`），尚未迁移到 KunQuant；它们只能单独构建，不能与 KunQuant 库组合进同一个因子集。
 
 ### 验证因子
 
@@ -770,6 +861,17 @@ annual_effectiveness.csv
 `insufficient_data`；`dominant_side` 表示两端均有效时贡献更大的一端。`factor_daily.parquet` 的
 `pocket` 列记录每日轮值口袋，汇总文件中的 `pocket_count` 与 `required_pockets` 用于核对口袋覆盖。
 多空端结果只用于因子诊断，最终交易结论仍以包含 A 股交易约束的 long-only 组合回测为准。
+
+### 用 RD-Agent 自动挖因子
+
+`rquant rdagent export` 把截至挖掘期末（默认 2021-12-31）的沪深 300 历史成分日线导出给微软 RD-Agent 的 `fin_factor`
+循环，并附带把它的回测改成次日开盘口径的准备脚本。RD-Agent 用自己 test 段的结果挑因子，所以挖掘期之后的年份
+只留给 walk-forward 做样本外检验。RD-Agent 只支持 Linux，需要在 WSL2 里单独安装，并准备 LLM API key；完整步骤见
+[docs/rdagent.md](docs/rdagent.md)。
+
+```bash
+rquant rdagent export --mining-end 2021-12-31
+```
 
 ## 7. 执行滚动训练与样本外预测
 
@@ -855,7 +957,8 @@ rquant report RUN_ID
 报告命令使用该运行的样本外预测执行 A 股约束下的 long-only TopkDropout 回测：
 
 - 初始资金 100 万元；
-- 目标持股 50 只，每期最多换出 5 只；
+- 目标持股 50 只，每 5 个交易日调仓一次：按调仓日的最新预测把持仓换成前 50 名，其余交易日不交易；
+  调仓日未能卖出的持仓（停牌、开盘跌停）保留到下一次调仓；
 - 等权、多头；
 - 信号后的下一可用开盘成交；
 - 买入按 100 股整数单位；
@@ -864,6 +967,25 @@ rquant report RUN_ID
 - 按方向执行开盘涨停不可买、开盘跌停不可卖；
 - 佣金、最低佣金、印花税和可选的冲击成本（`backtest.impact_cost`）来自 `config/default.yaml`；
 - 最后一个可用开盘尝试在相同约束下清仓，无法卖出的证券会明确保留在清单中。
+
+组合参数可以在命令行临时覆盖配置，例如复现旧的每日最多换 5 只：
+
+```bash
+rquant report RUN_ID --n-drop 5 --rebalance-days 1
+```
+
+两种口径的 LGB walk-forward 对比（2013-2026，净收益，换手为年化双边成交额 / 账户市值）：
+
+| 因子集 | 标签 | 组合 | 年化 | 夏普 | 最大回撤 | 年换手 | 年成本 | run |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| Alpha158 | 1d | 每日最多换 5 只 | 19.5% | 0.86 | -48.5% | 51 | 3.8% | `20261023T094024Z-2c596001` |
+| Alpha158 | 1d | 每 5 日全量换 top50 | 18.8% | 0.83 | -48.6% | 72 | 5.4% | `20261023T094024Z-2c596001-top50-every5` |
+| Alpha158 | 5d | 每 5 日全量换 top50 | 14.8% | 0.71 | -49.3% | 59 | 4.4% | `20261024T200621Z-88ba61b4` |
+| Hquality | 1d | 每日最多换 5 只 | 19.1% | 0.83 | -45.1% | 52 | 3.8% | `20261023T085832Z-73d29b01` |
+| Hquality | 1d | 每 5 日全量换 top50 | 13.2% | 0.63 | -49.9% | 73 | 5.4% | `20261023T085832Z-73d29b01-top50-every5` |
+| Hquality | 5d | 每 5 日全量换 top50 | 17.2% | 0.80 | -45.3% | 61 | 4.6% | `20261024T203527Z-283c0442` |
+
+`-top50-every5` 目录只复制了原 1d 运行的预测，用新组合重新回测。
 
 `report` 自身也会创建 `runs/report/<report-run-id>/run.json`，记录所用的组合参数、预测文件哈希和 Qlib
 指纹；失败时状态为 `failed`。回测产物仍写回滚动训练的运行目录，同一 `RUN_ID` 重跑会覆盖上一次的回测产物，
@@ -968,10 +1090,10 @@ python -m ruff check src tests
 - 原始历史：2010 年前保留足够覆盖 300 个交易日预热的数据；
 - 正式研究期：从 2010 年开始；
 - 数据范围：保留全部 A 股日线；
-- 研究股票池：历史时点可知的沪深 300；
+- 研究股票池：历史时点可知的沪深 300（可切换为沪深主板 `main` 或全部 A 股 `all`）；
 - 标签：下一开盘到再下一开盘的 1 日收益，或下一开盘到第六个开盘的 5 日收益；
 - 滚动评估：前三个完整自然年训练，下一年样本外测试；
-- 组合：long-only TopkDropout，持股 50，只换出 5；
+- 组合：long-only TopkDropout，持股 50，每 5 个交易日全量调整到最新前 50 名；
 - 初始资金：人民币 1,000,000 元；
 - 执行：下一开盘、100 股买入单位、T+1、停牌与开盘涨跌停限制；
 - 期末：在最后可用开盘尝试受约束清仓，未能卖出的持仓不会被静默当作已卖出。

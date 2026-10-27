@@ -29,6 +29,7 @@ class CliTests(unittest.TestCase):
             ["factors", "evaluate", "--factor-set", "Hquality", "--horizon", "20d"],
             ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "Hquality"],
             ["report", "run-id"],
+            ["rdagent", "export", "--mining-end", "2021-12-31"],
         ]
         for argv in cases:
             with self.subTest(argv=argv):
@@ -131,8 +132,36 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual("csi300", _universe({}))
         self.assertEqual("all", _universe({"data": {"universe": "all"}}))
+        self.assertEqual("main", _universe({"data": {"universe": "main"}}))
         with self.assertRaisesRegex(ValueError, "data.universe"):
             _universe({"data": {"universe": "csi500"}})
+
+    def test_universe_flag_overrides_config_and_separates_factor_stores(self) -> None:
+        import json
+
+        from rquant.cli import _config, _require_factor_universe, _walk_forward_universe, build_parser
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config").mkdir()
+            (root / "config" / "default.yaml").write_text("data:\n  universe: csi300\n", encoding="utf-8")
+            args = build_parser().parse_args(["--root", temporary, "--universe", "main", "doctor"])
+            config, paths = _config(args)
+            self.assertEqual("main", config["data"]["universe"])
+            self.assertEqual(root / "data" / "factors-main", paths.factors)
+
+            manifest = root / "factors" / "manifest.json"
+            manifest.parent.mkdir()
+            manifest.write_text(json.dumps({"universe": "csi300"}), encoding="utf-8")
+            _require_factor_universe(manifest, "csi300")
+            with self.assertRaisesRegex(DataContractError, "built for universe 'csi300', not 'main'"):
+                _require_factor_universe(manifest, "main")
+
+            run = root / "run"
+            run.mkdir()
+            self.assertEqual("csi300", _walk_forward_universe(run, {}))
+            (run / "walk_forward.json").write_text(json.dumps({"universe": "main"}), encoding="utf-8")
+            self.assertEqual("main", _walk_forward_universe(run, {}))
 
     def test_catalog_json_is_machine_readable(self) -> None:
         output = io.StringIO()
@@ -175,7 +204,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual("ok", payload["status"])
         self.assertTrue(factor_catalog["ok"])
-        self.assertEqual(1554, factor_catalog["detail"]["columns"])
+        self.assertEqual(1696, factor_catalog["detail"]["columns"])
 
     def test_doctor_reports_missing_clang_instead_of_crashing(self) -> None:
         output = io.StringIO()

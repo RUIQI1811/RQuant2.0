@@ -26,6 +26,8 @@ class FactorLibraryRegistry:
         unknown_inputs = sorted(set(library.required_inputs) - set(CANONICAL_INPUT_FIELDS))
         if unknown_inputs:
             raise FactorContractError(f"Factor library {family} requires unknown inputs: {unknown_inputs}")
+        if set(library.reference_inputs) & set(CANONICAL_INPUT_FIELDS):
+            raise FactorContractError(f"Factor library {family} declares canonical fields as reference inputs")
         if not library.specs:
             raise FactorContractError(f"Factor library is empty: {family}")
         if any(spec.family != family for spec in library.specs):
@@ -107,6 +109,11 @@ class FactorLibraryRegistry:
         required = {field for library in self.select(factor_set) for field in library.required_inputs}
         return tuple(field for field in CANONICAL_INPUT_FIELDS if field in required)
 
+    def reference_inputs(self, factor_set: FactorSet) -> tuple[str, ...]:
+        """Non-canonical inputs of the factor set's libraries, in library declaration order."""
+        names = (name for library in self.select(factor_set) for name in library.reference_inputs)
+        return tuple(dict.fromkeys(names))
+
     def implementation_fingerprint(self, factor_set: FactorSet) -> str:
         libraries = [
             {"family": library.family, "fingerprint": library.implementation_fingerprint}
@@ -128,6 +135,7 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.hquality import HQUALITY_SELECTION
     from rquant.factors.libraries.jkp153 import JKP153Library
     from rquant.factors.libraries.jq240 import JQ240Library
+    from rquant.factors.libraries.oap import OAPLibrary
     from rquant.factors.libraries.recent import RECENT_SELECTION
     from rquant.factors.libraries.size_value_china import SizeValueChinaLibrary
     from rquant.factors.libraries.talib_indicators import TALibLibrary
@@ -144,6 +152,7 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(TALibLibrary())
     registry.register_factor_selection(RECENT_SELECTION)
     registry.register_library(JQ240Library())
+    registry.register_library(OAPLibrary())
     registry.register_library(BarraCNE6Library())
     registry.register_library(TushareTechLibrary())
     registry.register_library(JKP153Library())

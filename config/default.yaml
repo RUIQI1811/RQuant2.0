@@ -7,6 +7,9 @@ data:
   formal_start: 2010-01-01
   warmup_trading_days: 300
   through: null
+  # csi300 (point-in-time CSI300 members), main (Shanghai/Shenzhen main board without ChiNext, STAR, Beijing, ST names
+  # or the first 60 trading days after listing), sh_main (the Shanghai 60xxxx part of main) or all.
+  # `rquant --universe sh_main ...` overrides it for one command.
   universe: csi300
   benchmark: SH000300
   tushare_index_code: 399300.SZ
@@ -32,7 +35,10 @@ workflow:
 backtest:
   initial_capital: 1000000
   topk: 50
-  n_drop: 5
+  # n_drop == topk with rebalance_days 5: every 5 trading days the book is reset to the latest top 50.
+  # The earlier daily TopkDropout (drop at most 5 per day) is n_drop 5, rebalance_days 1.
+  n_drop: 50
+  rebalance_days: 5
   trade_unit: 100
   commission_rate: 0.0003
   minimum_commission: 5.0

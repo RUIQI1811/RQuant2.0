@@ -139,3 +139,86 @@ class UniverseMembershipTests(unittest.TestCase):
         self.assertEqual(20 + 20 - late_entry, manifest["rows"])
         self.assertEqual(2, stored["instruments"])
         self.assertEqual("csi300", stored["universe"])
+
+    def test_main_universe_publishes_seasoned_non_st_main_board_rows_and_shares_membership(self) -> None:
+        import numpy as np
+        import pandas as pd
+
+        from rquant.factors.engine import FactorBuildConfig, create_factor_engine
+        from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
+        from rquant.factors.libraries.registry import FactorLibraryRegistry
+        from rquant.io import atomic_write_json
+
+        seen: dict[str, object] = {}
+
+        class Close(PanelFactorLibrary):
+            family = "close_test"
+            required_inputs = ("close",)
+
+            @property
+            def specs(self) -> tuple[FactorSpec, ...]:
+                return (
+                    FactorSpec(
+                        canonical_name="close_001",
+                        source_name="CLOSE",
+                        family=self.family,
+                        ordinal=1,
+                        formula="close",
+                        max_lookback=1,
+                        implementation="test",
+                        catalog_version=1,
+                    ),
+                )
+
+            def calculate(self, inputs):  # type: ignore[no-untyped-def]
+                seen["universe"] = inputs["universe"].copy()
+                return {"CLOSE": inputs["close"]}
+
+        registry = FactorLibraryRegistry()
+        registry.register_library(Close())
+        dates = pd.bdate_range("2021-01-04", periods=4)
+        frames = []
+        for instrument, is_st, listed_days in (
+            ("SH600000", [False, False, True, False], [100, 101, 102, 103]),
+            ("SZ000002", [False] * 4, [59, 60, 61, 62]),
+            ("SZ300750", [False] * 4, [500] * 4),
+            ("SH688001", [False] * 4, [500] * 4),
+        ):
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "datetime": dates,
+                        "instrument": instrument,
+                        "close": np.arange(4.0) + 1,
+                        "in_csi300": False,
+                        "is_st": pd.array(is_st, dtype="boolean"),
+                        "listed_days": np.asarray(listed_days, dtype="int32"),
+                    }
+                )
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / "canonical"
+            (canonical / "bars").mkdir(parents=True)
+            pd.concat(frames, ignore_index=True).to_parquet(canonical / "bars" / "part.parquet", index=False)
+            atomic_write_json(canonical / "manifest.json", {"status": "complete", "fingerprint": "test"})
+            engine = create_factor_engine(
+                root / "cache", FactorBuildConfig(factor_set="close_test", universe="main"), registry=registry
+            )
+            manifest = engine.build_from_canonical(canonical, root / "factors")
+            frame = pd.read_parquet(next((root / "factors" / "close_test").glob("year=*/factors.parquet")))
+
+        published = sorted(zip(frame["instrument"], frame["datetime"].dt.strftime("%m-%d"), strict=True))
+        self.assertEqual(
+            [
+                ("SH600000", "01-04"),
+                ("SH600000", "01-05"),
+                ("SH600000", "01-07"),
+                ("SZ000002", "01-06"),
+                ("SZ000002", "01-07"),
+            ],
+            published,
+        )
+        self.assertEqual("main", manifest["universe"])
+        self.assertEqual(["SH600000", "SZ000002"], list(seen["universe"].columns))
+        self.assertEqual(5, int(seen["universe"].to_numpy().sum()))
