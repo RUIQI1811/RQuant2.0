@@ -44,6 +44,7 @@ def _kq() -> SimpleNamespace:
     symbols = {name: getattr(ops, name) for name in dir(ops) if not name.startswith("_")}
     symbols.update({name: getattr(Op, name) for name in dir(Op) if not name.startswith("_")})
     symbols["CppStateOp"] = _cpp_state_op_class(Op)
+    symbols["SeriesKernelOp"] = _series_kernel_op_class(Op)
     return SimpleNamespace(**symbols)
 
 
@@ -91,6 +92,50 @@ def _cpp_state_op_class(op_module: Any) -> type:
 
     CppStateOp.__name__ = "RQuantCppStateOp"
     return CppStateOp
+
+
+def _series_kernel_op_class(op_module: Any) -> type:
+    class SeriesKernelOp(op_module.OpBase, op_module.GloablStatefulOpTrait, op_module.MayRequireWholeTime):
+        """A C++ kernel that reads each stock's whole input series at once and writes its whole output series.
+
+        The inputs must be graph inputs (their buffers hold every time step before the stage runs). ``kernel`` is a
+        C++ block that sees ``n`` (the number of time steps), the stock's inputs as ``const T *x0, *x1, ...`` and
+        fills ``T *out``, which starts all missing; the node then publishes ``out`` step by step.
+        """
+
+        def __init__(self, inputs: list[Any], kernel: str) -> None:
+            for value in inputs:
+                if not isinstance(value, op_module.Input):
+                    raise TypeError("SeriesKernelOp reads whole input buffers and only accepts graph inputs")
+            super().__init__(list(inputs), [("kernel", kernel)])
+
+        def generate_init_code(
+            self, idx: str, elem_type: str, simd_lanes: int, inputs: list[str], aligned: bool
+        ) -> str:
+            buffers = [f"buf_{value.attrs['name']}" for value in self.inputs]
+            declare = " ".join(f"std::vector<T> rq_x{k}(__length);" for k in range(len(buffers)))
+            gather = " ".join(
+                f"rq_x{k}[t] = {buffer}.getPtr(t)[lane];" for k, buffer in enumerate(buffers)
+            )
+            pointers = " ".join(f"const T *x{k} = rq_x{k}.data();" for k in range(len(buffers)))
+            return (
+                f"std::vector<{elem_type}> rq_series_{idx}(__length * {simd_lanes}); "
+                f"{{ using T = {elem_type}; {declare} std::vector<T> rq_out(__length); "
+                f"for (int lane = 0; lane < {simd_lanes}; ++lane) {{ "
+                f"for (size_t t = 0; t < __length; ++t) {{ {gather} }} "
+                "std::fill(rq_out.begin(), rq_out.end(), std::numeric_limits<T>::quiet_NaN()); "
+                f"{{ const int n = (int)__length; {pointers} T *out = rq_out.data(); (void)n; "
+                f"{self.attrs['kernel']} }} "
+                f"for (size_t t = 0; t < __length; ++t) rq_series_{idx}[t * {simd_lanes} + lane] = rq_out[t]; }} }} "
+                f"auto rq_series_at_{idx} = [&rq_series_{idx}](size_t t) {{ "
+                f"return kun_simd::vec<{elem_type}, {simd_lanes}>::load(rq_series_{idx}.data() + t * {simd_lanes}); }};"
+            )
+
+        def generate_step_code(self, idx: str, time_idx: str, inputs: list[str], **kwargs: Any) -> str:
+            return f"auto v{idx} = rq_series_at_{idx}({time_idx});"
+
+    SeriesKernelOp.__name__ = "RQuantSeriesKernelOp"
+    return SeriesKernelOp
 
 
 # ---------------------------------------------------------------------------------------------------- basics
@@ -238,6 +283,11 @@ def sqrt(value: Node) -> Node:
 def cpp_state(inputs: list[Node], step: str, *, members: str = "", init: str = "") -> Node:
     """A per-stock C++ step function; see ``CppStateOp``."""
     return _kq().CppStateOp(inputs, members, init, step)
+
+
+def series_kernel(inputs: list[Node], kernel: str) -> Node:
+    """A C++ kernel over each stock's whole series of graph inputs; see ``SeriesKernelOp``."""
+    return _kq().SeriesKernelOp(list(inputs), kernel)
 
 
 def scalar_map(expression: str, *inputs: Operand) -> Node:

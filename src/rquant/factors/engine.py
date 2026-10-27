@@ -134,6 +134,12 @@ class KunQuantFactorEngine:
         self.input_fields = self.canonical_fields + self.reference_fields
         if any(library.backend != "kunquant" for library in self.libraries):
             raise FactorContractError(f"Factor set {self.config.factor_set} is not a KunQuant-only factor set")
+        quote_fields = {library.quote_fields for library in self.libraries}
+        if len(quote_fields) > 1:
+            raise FactorContractError(
+                f"Factor set {self.config.factor_set} mixes libraries on calendar days and on their own quotes"
+            )
+        self.quote_fields: tuple[str, ...] = next(iter(quote_fields), ())
 
     @property
     def strict_float(self) -> bool:
@@ -146,7 +152,15 @@ class KunQuantFactorEngine:
         # GCC and Clang fuse a * b + c into one FMA instruction by default, which rounds differently from the
         # pandas reference; MSVC does not contract under its default /fp:precise.
         flags = ("-ffp-contract=off",) if self.strict_float and sys.platform != "win32" else ()
-        return cfake.CppCompilerConfig(other_flags=flags)
+        preludes = list(dict.fromkeys(library.cpp_prelude for library in self.libraries if library.cpp_prelude))
+        if not preludes:
+            return cfake.CppCompilerConfig(other_flags=flags)
+        prelude = "#include <algorithm>\n#include <limits>\n#include <vector>\n" + "\n".join(preludes) + "\n"
+
+        def compile_with_prelude(sources: list[tuple[str, str]], compile_one: Any) -> Any:
+            return cfake.multi_thread_compile([(name, prelude + source) for name, source in sources], compile_one)
+
+        return cfake.CppCompilerConfig(other_flags=flags, for_each=compile_with_prelude)
 
     def compilation_fingerprint(self) -> str:
         try:
@@ -277,6 +291,10 @@ class KunQuantFactorEngine:
         for library in self.libraries:
             library.validate_inputs(normalized)
         time_count, stock_count = shape
+        packing = _QuotePacking(np, normalized, self.quote_fields) if self.quote_fields else None
+        if packing is not None:
+            normalized = {name: packing.pack(values) for name, values in normalized.items()}
+        run_length = packing.length if packing is not None else time_count
         module = module or self.compile()
         blocking_len = int(module.blocking_len)
         pad_stocks = (-stock_count) % blocking_len
@@ -293,7 +311,13 @@ class KunQuantFactorEngine:
         if output_buffers is not None and set(output_buffers) != set(expected):
             raise DataContractError("KunQuant output buffers do not match the locked catalog")
         executor = kr.createMultiThreadExecutor(self.config.workers)
-        output = kr.runGraph(executor, module, normalized, 0, time_count, output_buffers or {})
+        run_buffers = {name: values[:run_length] for name, values in (output_buffers or {}).items()}
+        output = kr.runGraph(executor, module, normalized, 0, run_length, run_buffers)
+        if packing is not None:
+            output = {
+                name: packing.unpack(values, output_buffers[name] if output_buffers else None, time_count)
+                for name, values in output.items()
+            }
         if pad_stocks and trim_outputs:
             output = {name: np.ascontiguousarray(values[:, :stock_count]) for name, values in output.items()}
         if tuple(output) != expected:
@@ -954,6 +978,31 @@ def _aligned_matrix(np: Any, value: Any, dates: Any, instruments: Any, dtype: An
     if hasattr(value, "reindex"):
         value = value.reindex(index=dates, columns=instruments)
     return np.ascontiguousarray(np.asarray(value, dtype=dtype))
+
+
+class _QuotePacking:
+    """Moves each stock's quoted rows to the top of the time axis and puts results back on their dates."""
+
+    def __init__(self, np: Any, inputs: dict[str, Any], fields: tuple[str, ...]) -> None:
+        self.np = np
+        quoted = np.logical_and.reduce([np.isfinite(inputs[field]) for field in fields])
+        self.times, self.stocks = np.nonzero(quoted)
+        self.slots = (np.cumsum(quoted, axis=0) - 1)[self.times, self.stocks]
+        self.length = max(int(quoted.sum(axis=0).max(initial=0)), 1)
+
+    def pack(self, values: Any) -> Any:
+        packed = self.np.full((self.length, values.shape[1]), self.np.nan, dtype=values.dtype)
+        packed[self.slots, self.stocks] = values[self.times, self.stocks]
+        return packed
+
+    def unpack(self, packed: Any, target: Any | None, time_count: int) -> Any:
+        """Scatter packed rows to their dates; ``target`` may share memory with ``packed``."""
+        values = packed[self.slots, self.stocks]
+        if target is None:
+            target = self.np.empty((time_count, packed.shape[1]), dtype=packed.dtype)
+        target[...] = self.np.nan
+        target[self.times, self.stocks] = values
+        return target
 
 
 def _load_panel_references(

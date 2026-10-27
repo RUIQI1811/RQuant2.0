@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,9 +12,14 @@ import talib
 from talib import abstract
 
 from rquant.factors.catalog import get_catalog
-from rquant.factors.engine import FactorBuildConfig, PanelFactorEngine, create_factor_engine
-from rquant.factors.libraries.talib_indicators import TALIB_INDICATORS, TALIB_NAMES, TALibLibrary
+from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine, cpp_compiler_available, create_factor_engine
+from rquant.factors.libraries.talib_indicators import TA_LIB_HEADER, TALIB_INDICATORS, TALIB_NAMES, TALibLibrary
 from rquant.io import atomic_write_json
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from panel_reference.talib_indicators import TALibReference  # noqa: E402
+
+KUNQUANT_READY = importlib.util.find_spec("KunQuant") is not None and cpp_compiler_available()
 
 
 def synthetic_bars(days: int = 400, stocks: int = 5, seed: int = 5) -> dict[str, pd.DataFrame]:
@@ -55,16 +62,44 @@ class TALibCatalogTests(unittest.TestCase):
             self.assertEqual(lookback, indicator.lookback, name)
             self.assertLess(position, len(indicator.output_names), name)
 
-    def test_fingerprint_pins_the_talib_version(self) -> None:
+    def test_vendored_c_source_is_the_reference_wrappers_c_library(self) -> None:
         self.assertEqual(TALibLibrary().implementation_fingerprint, TALibLibrary().implementation_fingerprint)
         self.assertEqual("0.8.2", talib.__version__)
+        version = talib.__ta_version__.decode() if isinstance(talib.__ta_version__, bytes) else talib.__ta_version__
+        self.assertEqual("0.8.1", version.split()[0])
+        self.assertIn("from TA-Lib 0.8.1 ", TA_LIB_HEADER.read_text(encoding="utf-8").splitlines()[0])
 
 
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class TALibCalculationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        cls.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.engine = KunQuantFactorEngine(cls.temporary.name, FactorBuildConfig(factor_set="talib", workers=2))
+        cls.module = cls.engine.compile()
         cls.inputs = synthetic_bars()
-        cls.outputs = TALibLibrary().calculate(cls.inputs)
+        cls.outputs = cls.calculate(cls.inputs)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    @classmethod
+    def calculate(cls, inputs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """KunQuant outputs by source name, as panels shaped like the inputs."""
+        output = cls.engine.run({field: panel.to_numpy() for field, panel in inputs.items()}, module=cls.module)
+        close = inputs["close"]
+        return {
+            spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
+            for spec in TALibLibrary().specs
+        }
+
+    def test_every_indicator_matches_the_ta_lib_python_wrapper(self) -> None:
+        expected = TALibReference().calculate(self.inputs)
+        for name in TALIB_NAMES:
+            np.testing.assert_allclose(self.outputs[name].to_numpy(), expected[name].to_numpy(), rtol=1e-9,
+                                       atol=1e-12, equal_nan=True, err_msg=name)
 
     def test_all_outputs_are_aligned_and_missing_without_a_quote(self) -> None:
         close = self.inputs["close"]
@@ -85,7 +120,7 @@ class TALibCalculationTests(unittest.TestCase):
         dates = self.inputs["close"].index
         for cut in (130, 310):
             last = dates[cut]
-            past = TALibLibrary().calculate({field: panel.loc[:last] for field, panel in self.inputs.items()})
+            past = self.calculate({field: panel.loc[:last] for field, panel in self.inputs.items()})
             for name in TALIB_NAMES:
                 np.testing.assert_allclose(past[name].to_numpy(), self.outputs[name].loc[:last].to_numpy(),
                                            rtol=1e-9, atol=1e-12, equal_nan=True, err_msg=name)
@@ -124,13 +159,12 @@ class TALibCalculationTests(unittest.TestCase):
         for field in ("open", "high", "low", "close"):
             scaled[field] = scaled[field] * 7.0
         scaled["volume"] = scaled["volume"] / 7.0
-        outputs = TALibLibrary().calculate(scaled)
+        outputs = self.calculate(scaled)
         for name in TALIB_NAMES:
             np.testing.assert_allclose(outputs[name].to_numpy(), self.outputs[name].to_numpy(), rtol=1e-6, atol=1e-8,
                                        equal_nan=True, err_msg=name)
 
 
-class TALibEngineTests(unittest.TestCase):
     def test_engine_publishes_the_library_outputs(self) -> None:
         inputs = synthetic_bars(days=200, stocks=3)
         with tempfile.TemporaryDirectory() as temporary:
@@ -147,13 +181,14 @@ class TALibEngineTests(unittest.TestCase):
             atomic_write_json(canonical / "manifest.json", {"status": "complete", "fingerprint": "canonical-fixture"})
 
             engine = create_factor_engine(root / "cache", FactorBuildConfig(factor_set="talib"))
-            self.assertIsInstance(engine, PanelFactorEngine)
+            self.assertIsInstance(engine, KunQuantFactorEngine)
+            engine.compile = lambda: self.module  # type: ignore[method-assign]
             result = engine.build_from_canonical(canonical, root / "factors")
             self.assertEqual(125, result["columns"])
             store = root / "factors" / "talib"
             stored = pd.concat([pd.read_parquet(path) for path in sorted(store.glob("year=*/*.parquet"))])
             stored = stored.set_index(["datetime", "instrument"])
-            direct = TALibLibrary().calculate(inputs)
+            direct = TALibReference().calculate(inputs)
             for canonical_name, name in (("ta_019", "rsi"), ("ta_045", "ad"), ("ta_083", "engulfing")):
                 expected = direct[name].stack(future_stack=True).reindex(stored.index)
                 np.testing.assert_allclose(stored[canonical_name].to_numpy(), expected.to_numpy(), rtol=1e-6,

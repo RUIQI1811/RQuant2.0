@@ -88,6 +88,12 @@ class FactorLibrary(ABC):
     reference_inputs: tuple[str, ...] = ()
     # KunQuant libraries ported from a pandas reference compile without fused multiply-adds to round like NumPy.
     strict_float = False
+    # Fields that make a row one of a stock's own trading days. When set, the engine moves every stock's rows where
+    # all of them are present to the top of the time axis before the graph runs and puts the outputs back on their
+    # dates, so time-series operators run over consecutive quotes across suspensions.
+    quote_fields: tuple[str, ...] = ()
+    # C++ source (helper functions the graph's kernels call) placed before every generated KunQuant source file.
+    cpp_prelude = ""
 
     @property
     @abstractmethod

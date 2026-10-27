@@ -1,12 +1,15 @@
-"""Classic TA-Lib technical indicators and candlestick patterns as a daily panel factor set.
+"""Classic TA-Lib technical indicators and candlestick patterns as a daily KunQuant factor set.
 
-Every factor calls one function of the TA-Lib C library through the ``TA-Lib`` Python wrapper on a single stock's
-own trading days: rows where the stock has no complete open, high, low, close and volume quote (suspensions, days
-before listing) are removed before the call and stay missing afterwards, so recursive indicators (EMA, Wilder
-smoothing, Hilbert transform) run over consecutive quotes instead of being reset by a gap. Prices are RQuant's
-backward-adjusted canonical prices, whose level is arbitrary per stock, so indicators measured in price units are
-published scale-free (see ``TRANSFORMS``). The first ``lookback`` quotes of every stock, for which TA-Lib has no
-value or returns a placeholder 0 for candlestick patterns, are missing.
+Every factor runs one function of the TA-Lib C library on a single stock's own trading days. The functions are
+TA-Lib 0.8.1's own C code, vendored into ``rquant/factors/extensions/ta_lib/ta_lib.hpp`` by
+``scripts/vendor_ta_lib.py`` and compiled into the KunQuant graph; each graph node reads a stock's whole series, calls
+the function once and publishes its output. The engine first moves every stock's quotes (rows with a complete open,
+high, low, close and volume) to the top of the time axis and puts the outputs back on their dates afterwards, so
+suspensions and days before listing stay missing and recursive indicators (EMA, Wilder smoothing, Hilbert transform)
+run over consecutive quotes instead of being reset by a gap. Prices are RQuant's backward-adjusted canonical prices,
+whose level is arbitrary per stock, so indicators measured in price units are published scale-free (see
+``TRANSFORMS``). The first ``lookback`` quotes of every stock, for which TA-Lib has no value or returns a placeholder 0
+for candlestick patterns, are missing.
 
 The set is the TA-Lib function list of the classic 0.4 C library (TA-Lib 0.6+ adds indicators that are not used
 here) without the math operators and transforms, and without outputs that are an exact affine function of another
@@ -17,20 +20,19 @@ LINEARREG_ANGLE and BETA are left out: the first depends on the price scale and 
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Mapping
+from functools import cache, lru_cache
+from pathlib import Path
 from typing import Any
 
-import numpy as np
-import pandas as pd
-
-from rquant.errors import DependencyError
-from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
+from rquant.factors.extensions import kunquant_panel as k
+from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 from rquant.io import stable_hash
 
-Panel = pd.DataFrame
+TA_LIB_HEADER = Path(__file__).resolve().parents[1] / "extensions" / "ta_lib" / "ta_lib.hpp"
 FLOW_DAYS = 20
 ADOSC_VOLUME_DAYS = 10
-INSTRUMENT_BLOCK = 64
 FIELDS = ("open", "high", "low", "close", "volume")
 OHLC = ("open", "high", "low", "close")
 HLC = ("high", "low", "close")
@@ -39,30 +41,28 @@ HLCV = ("high", "low", "close", "volume")
 C = ("close",)
 CV = ("close", "volume")
 
-# Published value from the selected TA-Lib output ``x``, all outputs of the call ``out`` and the stock's inputs ``a``.
-Transform = Callable[[np.ndarray, tuple[np.ndarray, ...], Mapping[str, np.ndarray]], np.ndarray]
-TRANSFORMS: dict[str, tuple[str, Transform, int]] = {
-    # name: (description, transform, extra lookback beyond TA-Lib's)
-    "level": ("TA-Lib output", lambda x, out, a: x, 0),
-    "price": ("output / close - 1", lambda x, out, a: x / a["close"] - 1.0, 0),
-    "spread": ("output / close", lambda x, out, a: x / a["close"], 0),
+# name: (description, C++ expression of the published value at quote ``t``, extra lookback beyond TA-Lib's). The
+# expression sees the selected TA-Lib output ``x``, all outputs ``o0, o1, ...``, the stock's quotes ``in_<field>`` and
+# ``volume_sum(t, days)``, the volume of the ``days`` quotes ending at ``t``.
+TRANSFORMS: dict[str, tuple[str, str, int]] = {
+    "level": ("TA-Lib output", "x[t]", 0),
+    "price": ("output / close - 1", "x[t] / in_close[t] - 1.0", 0),
+    "spread": ("output / close", "x[t] / in_close[t]", 0),
     "flow": (
         f"{FLOW_DAYS}-day change of the cumulative line over the volume of those days",
-        lambda x, out, a: _flow(x, a["volume"]),
+        f"t < {FLOW_DAYS} ? nan : (x[t] - x[t - {FLOW_DAYS}]) / volume_sum(t, {FLOW_DAYS})",
         FLOW_DAYS,
     ),
     "per_volume": (
         f"output over the {ADOSC_VOLUME_DAYS}-day mean volume",
-        lambda x, out, a: x / _trailing_mean(a["volume"], ADOSC_VOLUME_DAYS),
+        f"t < {ADOSC_VOLUME_DAYS - 1} ? nan : x[t] / (volume_sum(t, {ADOSC_VOLUME_DAYS}) / {ADOSC_VOLUME_DAYS}.0)",
         ADOSC_VOLUME_DAYS - 1,
     ),
-    "bb_pctb": (
-        "(close - lower band) / (upper - lower band)",
-        lambda x, out, a: (a["close"] - out[2]) / (out[0] - out[2]),
-        0,
-    ),
-    "bb_width": ("(upper - lower band) / middle band", lambda x, out, a: (out[0] - out[2]) / out[1], 0),
+    "bb_pctb": ("(close - lower band) / (upper - lower band)", "(in_close[t] - o2[t]) / (o0[t] - o2[t])", 0),
+    "bb_width": ("(upper - lower band) / middle band", "(o0[t] - o2[t]) / o1[t]", 0),
 }
+TRANSFORM_FIELDS = {"price": ("close",), "spread": ("close",), "flow": ("volume",), "per_volume": ("volume",),
+                    "bb_pctb": ("close",)}
 
 # (source name, TA-Lib function, inputs, parameters, output position, transform, TA-Lib lookback).
 # The lookback is TA-Lib's own count of leading quotes without output; tests check it against the installed library.
@@ -175,38 +175,99 @@ def _call(function: str, inputs: tuple[str, ...], parameters: Mapping[str, Any])
     return f"{function}({', '.join(arguments)})"
 
 
-def _trailing_mean(values: np.ndarray, days: int) -> np.ndarray:
-    prefix = np.concatenate([[0.0], np.cumsum(values)])
-    out = np.full(len(values), np.nan)
-    if len(values) >= days:
-        out[days - 1 :] = (prefix[days:] - prefix[:-days]) / days
-    return out
+@lru_cache(maxsize=1)
+def _header() -> str:
+    return TA_LIB_HEADER.read_text(encoding="utf-8")
 
 
-def _flow(line: np.ndarray, volume: np.ndarray) -> np.ndarray:
-    """Change of a cumulative volume line over ``FLOW_DAYS`` quotes, per unit of volume traded in those quotes."""
-    out = np.full(len(line), np.nan)
-    if len(line) > FLOW_DAYS:
-        prefix = np.concatenate([[0.0], np.cumsum(volume)])
-        traded = prefix[FLOW_DAYS + 1 :] - prefix[1:-FLOW_DAYS]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            out[FLOW_DAYS:] = (line[FLOW_DAYS:] - line[:-FLOW_DAYS]) / traded
-    return out
+@cache
+def _signature(function: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The optional parameters and outputs of a vendored TA-Lib batch function, as (C type, name) in call order."""
+    match = re.search(rf"static inline TA_RetCode TA_{function}\((.*?)\);", _header(), flags=re.S)
+    if match is None:
+        raise KeyError(f"TA-Lib function {function} is not vendored")
+    parameters: list[tuple[str, str]] = []
+    outputs: list[tuple[str, str]] = []
+    for argument in (part.strip() for part in match.group(1).split(",")):
+        kind, name = argument.rsplit(None, 1)
+        if name.startswith("optIn"):
+            parameters.append((kind, name))
+        elif name.startswith("out") and name.endswith("[]"):
+            outputs.append((kind, name[:-2]))
+    return parameters, outputs
 
 
-def _talib() -> Any:
-    try:
-        import talib
-    except ImportError as exc:
-        raise DependencyError("The talib factor set needs the TA-Lib package: pip install TA-Lib==0.8.2") from exc
-    return talib
+def _normalized(name: str) -> str:
+    return name.removeprefix("optIn").replace("_", "").lower()
 
 
-class TALibLibrary(PanelFactorLibrary):
-    """TA-Lib indicators and candlestick patterns, evaluated per stock over its own trading days."""
+def _kernel(
+    function: str, inputs: tuple[str, ...], parameters: Mapping[str, Any], position: int, transform: str, cut: int
+) -> tuple[tuple[str, ...], str]:
+    """The kernel fields and C++ body publishing one indicator for a stock's quotes."""
+    declared, outputs = _signature(function)
+    given = {_normalized(key): value for key, value in parameters.items()}
+    arguments = []
+    for kind, name in declared:
+        value = given.pop(_normalized(name), None)
+        if value is None:
+            arguments.append("INT_MIN" if kind in {"int", "TA_MAType"} else "-4e+37")
+        else:
+            arguments.append(repr(float(value)) if kind == "double" else str(int(value)))
+    if given:
+        raise KeyError(f"{function} has no parameters {sorted(given)}")
+    fields = tuple(dict.fromkeys((*inputs, *TRANSFORM_FIELDS.get(transform, ()))))
+    pointers = " ".join(f"const double *in_{field} = x{index};" for index, field in enumerate(fields))
+    quoted = " && ".join(f"std::isfinite(in_{field}[m])" for field in fields)
+    buffers = " ".join(
+        f"std::vector<{'int' if kind == 'int' else 'double'}> r{index}(m);" for index, (kind, _) in enumerate(outputs)
+    )
+    aligned = " ".join(f"std::vector<double> o{index}(m, nan);" for index in range(len(outputs)))
+    scatter = " ".join(f"o{index}[beg + j] = (double)r{index}[j];" for index in range(len(outputs)))
+    call = ", ".join(
+        [
+            "0, m - 1",
+            *(f"in_{field}" for field in inputs),
+            *arguments,
+            "&beg, &nb",
+            *(f"r{index}.data()" for index in range(len(outputs))),
+        ]
+    )
+    expression = TRANSFORMS[transform][1]
+    volume_sum = ""
+    if "volume_sum" in expression:
+        volume_sum = """
+            std::vector<double> volume_prefix(m + 1, 0.0);
+            for (int i = 0; i < m; ++i) volume_prefix[i + 1] = volume_prefix[i] + in_volume[i];
+            auto volume_sum = [&](int t, int days) { return volume_prefix[t + 1] - volume_prefix[t + 1 - days]; };"""
+    body = f"""
+        {pointers}
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        int m = 0;
+        while (m < n && {quoted}) ++m;
+        if (m > 0) {{
+            {buffers} {aligned}
+            int beg = 0, nb = 0;
+            if (rq_ta_lib::TA_{function}({call}) == rq_ta_lib::TA_SUCCESS) {{
+                for (int j = 0; j < nb; ++j) {{ {scatter} }}
+            }}
+            const std::vector<double> &x = o{position};
+            (void)x;{volume_sum}
+            for (int t = 0; t < m; ++t) {{
+                const double value = {expression};
+                out[t] = t < {cut} || !std::isfinite(value) ? nan : value;
+            }}
+        }}"""
+    return fields, body
+
+
+class TALibLibrary(FactorLibrary):
+    """TA-Lib indicators and candlestick patterns, evaluated in KunQuant over every stock's own trading days."""
 
     family = "talib"
     required_inputs = FIELDS
+    quote_fields = FIELDS
+    strict_float = True
 
     @property
     def specs(self) -> tuple[FactorSpec, ...]:
@@ -219,8 +280,8 @@ class TALibLibrary(PanelFactorLibrary):
                 formula=f"{_call(function, inputs, parameters)}"
                 + ("" if transform == "level" else f"; {TRANSFORMS[transform][0]}"),
                 max_lookback=lookback + TRANSFORMS[transform][2] + 1,
-                implementation=f"talib.{function}",
-                catalog_version=1,
+                implementation=f"rquant.factors.extensions.ta_lib.TA_{function}",
+                catalog_version=2,
             )
             for ordinal, (name, function, inputs, parameters, _, transform, lookback) in enumerate(
                 TALIB_INDICATORS, 1
@@ -228,75 +289,19 @@ class TALibLibrary(PanelFactorLibrary):
         )
 
     @property
+    def cpp_prelude(self) -> str:
+        return _header()
+
+    @property
     def implementation_fingerprint(self) -> str:
-        """Pin the TA-Lib wrapper and C library versions as well as this module's source."""
-        from importlib.metadata import version
+        """Pin the vendored TA-Lib C source as well as this module's source."""
+        return stable_hash({"module": super().implementation_fingerprint, "ta_lib": stable_hash(_header())})
 
-        talib = _talib()
-        return stable_hash(
-            {
-                "module": super().implementation_fingerprint,
-                "ta_lib_python": version("TA-Lib"),
-                "ta_lib_c": str(talib.__ta_version__.decode() if isinstance(talib.__ta_version__, bytes)
-                                else talib.__ta_version__).split()[0],
-            }
-        )
-
-    def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
-        close = inputs["close"]
-        buffers = {name: np.empty(close.shape) for name in TALIB_NAMES}
-        self._calculate_columns(inputs, lambda name, columns, values: buffers[name].__setitem__(
-            (slice(None), columns), values))
-        return {name: Panel(buffers[name], index=close.index, columns=close.columns) for name in TALIB_NAMES}
-
-    def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
-        canonical = {spec.source_name: spec.canonical_name for spec in self.specs}
-
-        def store(name: str, columns: slice, values: np.ndarray) -> None:
-            output_buffers[canonical[name]][:, columns] = values
-
-        self._calculate_columns(inputs, store)
-
-    def _calculate_columns(
-        self, inputs: Mapping[str, Any], store: Callable[[str, slice, np.ndarray], None]
-    ) -> None:
-        """Compute blocks of instruments at a time, so writes to a date-major store stay mostly contiguous."""
-        talib = _talib()
-        panels = {field: np.asarray(inputs[field], dtype=float) for field in FIELDS}
-        dates, stocks = panels["close"].shape
-        for first in range(0, stocks, INSTRUMENT_BLOCK):
-            columns = slice(first, min(first + INSTRUMENT_BLOCK, stocks))
-            width = columns.stop - columns.start
-            block = {name: np.full((dates, width), np.nan) for name in TALIB_NAMES}
-            for offset in range(width):
-                column = first + offset
-                quoted = np.isfinite(np.column_stack([panels[field][:, column] for field in FIELDS])).all(axis=1)
-                rows = np.flatnonzero(quoted)
-                if not len(rows):
-                    continue
-                arrays = {field: np.ascontiguousarray(panels[field][rows, column]) for field in FIELDS}
-                for name, values in _stock_indicators(talib, arrays).items():
-                    block[name][rows, offset] = values
-            for name in TALIB_NAMES:
-                store(name, columns, block[name])
-
-
-def _stock_indicators(talib: Any, arrays: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Every published indicator for one stock's consecutive quotes."""
-    count = len(arrays["close"])
-    calls: dict[tuple[str, str], tuple[np.ndarray, ...]] = {}
-    out: dict[str, np.ndarray] = {}
-    for name, function, inputs, parameters, position, transform, lookback in TALIB_INDICATORS:
-        key = (function, repr(sorted(parameters.items())))
-        if key not in calls:
-            result = getattr(talib, function)(*(arrays[field] for field in inputs), **parameters)
-            result = result if isinstance(result, tuple) else (result,)
-            calls[key] = tuple(np.asarray(value, dtype=float) for value in result)
-        outputs = calls[key]
-        _, formula, extra = TRANSFORMS[transform]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            values = formula(outputs[position], outputs, arrays)
-        values = np.where(np.isfinite(values), values, np.nan)
-        values[: min(count, lookback + extra)] = np.nan
-        out[name] = values
-    return out
+    def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        outputs = {}
+        for name, function, fields, parameters, position, transform, lookback in TALIB_INDICATORS:
+            kernel_fields, body = _kernel(
+                function, fields, parameters, position, transform, lookback + TRANSFORMS[transform][2]
+            )
+            outputs[name] = k.series_kernel([inputs[field] for field in kernel_fields], body)
+        return outputs
