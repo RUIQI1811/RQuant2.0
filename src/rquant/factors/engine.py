@@ -113,8 +113,24 @@ class FactorBuildConfig:
     input_layout: str = "TS"
     output_layout: str = "TS"
     workers: int = 4
+    # Largest number of factors compiled into one KunQuant graph; 0 keeps each factor set in a single graph. KunQuant
+    # gives the intermediate results of a graph full dates x stocks buffers, so smaller graphs need far less memory;
+    # intermediates shared across graphs are recomputed. Results do not depend on it; only strict-float factor sets
+    # are split.
+    graph_outputs: int = 20
     universe: str = "csi300"
     external_inputs: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class GraphGroups:
+    """A factor set compiled as one or more KunQuant graphs; each group is (module, output names, input names)."""
+
+    groups: tuple[tuple[Any, tuple[str, ...], tuple[str, ...]], ...]
+
+    @property
+    def blocking_len(self) -> int:
+        return int(self.groups[0][0].blocking_len)
 
 
 class KunQuantFactorEngine:
@@ -195,7 +211,8 @@ class KunQuantFactorEngine:
             }
         )
 
-    def build_graph(self) -> Any:
+    def build_graph(self, names: tuple[str, ...] | None = None) -> Any:
+        """The daily graph with the outputs ``names`` (default: every graph output); KunQuant drops unused nodes."""
         try:
             from KunQuant.Op import Builder, Input, Output
             from KunQuant.Stage import Function
@@ -228,12 +245,15 @@ class KunQuantFactorEngine:
             expected = self.graph_outputs
             if tuple(outputs) != expected:
                 raise FactorContractError("Factor-library output order differs from the locked catalog")
-            for canonical_name, expression in outputs.items():
-                Output(expression, canonical_name)
+            selected = expected if names is None else names
+            for canonical_name in selected:
+                Output(outputs[canonical_name], canonical_name)
 
-        return Function(builder.ops), self._kun_compiler_config()
+        # KunQuant leaves the module name out of the partition buffers of split sources, so graphs that share a
+        # partition would clash at link time; a graph group is small enough for one source file.
+        return Function(builder.ops), self._kun_compiler_config(split=names is None)
 
-    def _kun_compiler_config(self) -> Any:
+    def _kun_compiler_config(self, *, split: bool = True) -> Any:
         from KunQuant.Driver import KunCompilerConfig
 
         return KunCompilerConfig(
@@ -242,7 +262,7 @@ class KunQuantFactorEngine:
             output_layout=self.config.output_layout,
             # None lets KunQuant select the architecture-safe value (unaligned is unsupported on Apple Silicon).
             allow_unaligned=None,
-            split_source=max(library.compile_split_source for library in self.libraries),
+            split_source=max(library.compile_split_source for library in self.libraries) if split else 0,
             # Prefer deterministic double-precision rolling statistics over the faster incremental approximation.
             options={"no_fast_stat": True},
         )
@@ -252,6 +272,16 @@ class KunQuantFactorEngine:
         """Catalog outputs the daily graph computes, in catalog order."""
         names = self.catalog.canonical_names(self.config.factor_set)
         return tuple(name for name in names if name not in self.statement_factors)
+
+    @property
+    def graph_groups(self) -> tuple[tuple[str, ...], ...]:
+        """The graph outputs split into consecutive groups of at most ``config.graph_outputs`` factors."""
+        names = self.graph_outputs
+        # Without strict float the C++ compiler fuses multiply-adds differently in differently cut graphs, which
+        # would move results by a rounding step, so such factor sets keep one graph.
+        grouped = self.config.graph_outputs > 0 and self.strict_float
+        size = self.config.graph_outputs if grouped else max(len(names), 1)
+        return tuple(names[start : start + size] for start in range(0, len(names), size)) or ((),)
 
     @property
     def statement_libraries(self) -> tuple[Any, ...]:
@@ -286,18 +316,29 @@ class KunQuantFactorEngine:
     def compile(self) -> Any:
         try:
             from KunQuant.jit import cfake
+            from KunQuant.Op import Input
         except ImportError as exc:
             raise DependencyError("KunQuant==0.1.11 is required for factor computation") from exc
 
         expose_msvc_compiler()
         fingerprint = self.compilation_fingerprint()
-        target = self.cache_dir / "kunquant" / fingerprint
+        groups = self.graph_groups
+        # The grouping changes the compiled library but not the results, so it is not part of the fingerprint.
+        suffix = f"_g{len(groups)}" if len(groups) > 1 else ""
+        target = self.cache_dir / "kunquant" / f"{fingerprint}{suffix}"
         target.mkdir(parents=True, exist_ok=True)
-        function, compiler_config = self.build_graph()
-        library_name = f"rquant_{self.config.factor_set}_{fingerprint[:12]}"
+        functions = [
+            (f"rquant_factors{f'_{index}' if suffix else ''}", *self.build_graph(names if suffix else None))
+            for index, names in enumerate(groups)
+        ]
+        # KunQuant drops the inputs a graph does not read; run only prepares the ones each graph keeps.
+        graph_inputs = [
+            tuple(op.attrs["name"] for op in function.ops if isinstance(op, Input)) for _, function, _ in functions
+        ]
+        library_name = f"rquant_{self.config.factor_set}_{fingerprint[:12]}{suffix}"
         with _stdout_to_stderr():
             compiled = cfake.compileit(
-                [("rquant_factors", function, compiler_config)],
+                functions,
                 library_name,
                 self.compiler_config(),
                 tempdir=str(target),
@@ -314,9 +355,11 @@ class KunQuantFactorEngine:
                 "factor_libraries": [library.family for library in self.libraries],
                 "input_fields": list(self.input_fields),
                 "output_names": list(self.catalog.canonical_names(self.config.factor_set)),
+                "graph_groups": [list(names) for names in groups],
             },
         )
-        return library.getModule("rquant_factors")
+        modules = (library.getModule(name) for name, _, _ in functions)
+        return GraphGroups(tuple(zip(modules, groups, graph_inputs, strict=True)))
 
     def compile_statements(self) -> dict[str, Any]:
         """Compile the statement graphs; returns each library family's KunQuant module."""
@@ -391,16 +434,23 @@ class KunQuantFactorEngine:
         except ImportError as exc:
             raise DependencyError("NumPy and KunQuant are required for factor computation") from exc
 
-        absent = sorted(set(self.input_fields) - set(inputs))
+        # Statement-graph results that ``inputs`` leaves out are published per graph group, only while that group
+        # runs, so the daily panels of a statement-heavy factor set are never all in memory at once.
+        deferred = tuple(
+            name for name in self.input_fields if name not in inputs and statements is not None and name in statements
+        )
+        absent = sorted(set(self.input_fields) - set(inputs) - set(deferred))
         if absent:
             raise DataContractError(f"Missing KunQuant inputs: {absent}")
         if self.statement_factors and statements is None:
             raise DataContractError(f"Factor set {self.config.factor_set} needs its statement-graph results")
         numpy_dtype = np.float64 if self.config.dtype == "double" else np.float32
         normalized = {
-            name: np.ascontiguousarray(np.asarray(inputs[name], dtype=numpy_dtype)) for name in self.input_fields
+            name: np.ascontiguousarray(np.asarray(inputs[name], dtype=numpy_dtype))
+            for name in self.input_fields
+            if name not in deferred
         }
-        shapes = {tuple(normalized[name].shape) for name in self.input_fields}
+        shapes = {tuple(values.shape) for values in normalized.values()}
         if len(shapes) != 1:
             raise DataContractError(f"KunQuant input shapes differ: {sorted(shapes)}")
         shape = next(iter(shapes))
@@ -428,9 +478,25 @@ class KunQuantFactorEngine:
         expected = self.catalog.canonical_names(self.config.factor_set)
         if output_buffers is not None and set(output_buffers) != set(expected):
             raise DataContractError("KunQuant output buffers do not match the locked catalog")
+
+        def published(name: str) -> Any:
+            values = np.ascontiguousarray(statements.daily(name), dtype=numpy_dtype)
+            if values.shape != shape:
+                raise DataContractError(f"Statement input {name} has shape {values.shape}, not {shape}")
+            if packing is not None:
+                values = packing.pack(values)
+            return np.pad(values, ((0, 0), (0, pad_stocks)), constant_values=np.nan) if pad_stocks else values
+
         executor = kr.createMultiThreadExecutor(self.config.workers)
-        run_buffers = {name: output_buffers[name][:run_length] for name in self.graph_outputs} if output_buffers else {}
-        output = kr.runGraph(executor, module, normalized, 0, run_length, run_buffers)
+        output = {}
+        groups = (
+            module.groups if isinstance(module, GraphGroups) else ((module, self.graph_outputs, self.input_fields),)
+        )
+        for group_module, names, input_names in groups:
+            arrays = {name: normalized[name] if name in normalized else published(name) for name in input_names}
+            run_buffers = {name: output_buffers[name][:run_length] for name in names} if output_buffers else {}
+            output.update(kr.runGraph(executor, group_module, arrays, 0, run_length, run_buffers))
+            del arrays
         if packing is not None:
             output = {
                 name: packing.unpack(values, output_buffers[name] if output_buffers else None, time_count)
@@ -484,16 +550,19 @@ class KunQuantFactorEngine:
             self.libraries, Path(canonical_root), dates, instruments, dict(self.config.external_inputs), pd
         )
         statements = self.run_statements(external, dates, instruments)
-        external.update({name: statements.daily(name) for name in self.reference_fields if name in statements})
         # Cross-sectional operators use the research universe's members of each day.
         external["universe"] = pd.DataFrame(output_mask, index=dates, columns=instruments)
-        missing_references = sorted(set(self.reference_fields) - set(external))
+        # ``run`` publishes statement-graph inputs itself, one graph group at a time.
+        missing_references = sorted(
+            name for name in self.reference_fields if name not in external and name not in statements
+        )
         if missing_references:
             raise DataContractError(f"Factor libraries did not load their reference inputs: {missing_references}")
         numpy_dtype = np.dtype(np.float64 if self.config.dtype == "double" else np.float32)
         matrices = {field: np.ascontiguousarray(panel.to_numpy(dtype=numpy_dtype)) for field, panel in panels.items()}
         for field in self.reference_fields:
-            matrices[field] = _aligned_matrix(np, external[field], dates, instruments, numpy_dtype)
+            if field in external and field not in statements:
+                matrices[field] = _aligned_matrix(np, external[field], dates, instruments, numpy_dtype)
         del panels, external
 
         output_root = Path(output_root)

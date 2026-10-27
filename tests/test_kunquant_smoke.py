@@ -133,6 +133,8 @@ class KunQuantSmokeTests(unittest.TestCase):
             output_buffers.clear()
             mapped_output.clear()
             output_store._mmap.close()
+            # Libraries without strict float stay in one graph, so the fused multiply-adds do not depend on the split.
+            self.assertEqual(1, len(engine.graph_groups))
         expected = catalog.canonical_names("smoke_alpha")
         self.assertEqual(expected, tuple(output))
         self.assertEqual((rows, columns), output["a158_001"].shape)
@@ -147,6 +149,54 @@ class KunQuantSmokeTests(unittest.TestCase):
         for ordinal in ALPHA101_UPSTREAM_MISSING:
             name = f"a101_{ordinal:03d}"
             self.assertGreater(np.isfinite(output[name]).sum(), 0, f"{name} must produce finite values")
+
+    @unittest.skipUnless(cpp_compiler_available(), "a C++ compiler is required for KunQuant compilation")
+    def test_strict_float_factor_set_split_into_graphs_matches_one_graph(self) -> None:
+        import numpy as np
+
+        from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine
+        from rquant.factors.libraries.alpha101 import WorldQuantAlpha101Library
+        from rquant.factors.libraries.registry import FactorLibraryRegistry
+
+        class StrictAlpha101(WorldQuantAlpha101Library):
+            strict_float = True
+
+        registry = FactorLibraryRegistry()
+        registry.register_library(StrictAlpha101())
+        registry.register_factor_set("strict_alpha101", ("wq_alpha101",))
+        rows, columns = 260, 11
+        rng = np.random.default_rng(7)
+        close = 100.0 + np.cumsum(rng.normal(0.0, 0.5, size=(rows, columns)), axis=0)
+        volume = rng.uniform(1_000.0, 10_000.0, size=(rows, columns))
+        groups = np.broadcast_to(np.arange(columns) % 3, (rows, columns)).astype(np.float64)
+        inputs = {
+            "open": close + rng.normal(0.0, 0.2, size=(rows, columns)),
+            "high": close + rng.uniform(0.2, 1.0, size=(rows, columns)),
+            "low": close - rng.uniform(0.2, 1.0, size=(rows, columns)),
+            "close": close,
+            "volume": volume,
+            "amount": close * volume,
+            "vwap": close + rng.normal(0.0, 0.1, size=(rows, columns)),
+            "cap": close * rng.uniform(1e7, 2e7, size=(rows, columns)),
+            "sector": groups,
+            "industry": groups,
+            "subindustry": groups,
+        }
+        outputs = {}
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+            for graph_outputs in (20, 0):
+                engine = KunQuantFactorEngine(
+                    Path(temporary) / str(graph_outputs),
+                    FactorBuildConfig(factor_set="strict_alpha101", workers=2, graph_outputs=graph_outputs),
+                    registry=registry,
+                )
+                outputs[graph_outputs] = (len(engine.graph_groups), engine.run(inputs))
+        self.assertEqual(6, outputs[20][0])
+        self.assertEqual(1, outputs[0][0])
+        self.assertEqual(tuple(outputs[0][1]), tuple(outputs[20][1]))
+        for name, values in outputs[0][1].items():
+            np.testing.assert_array_equal(values, outputs[20][1][name], err_msg=name)
 
 
 if __name__ == "__main__":
