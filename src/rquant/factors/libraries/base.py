@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -83,6 +84,10 @@ class FactorLibrary(ABC):
     backend = "kunquant"
     family: FactorFamily
     required_inputs: tuple[str, ...]
+    # Inputs beyond the canonical bars, loaded by ``load_reference_inputs`` and aligned to the dates x instruments grid.
+    reference_inputs: tuple[str, ...] = ()
+    # KunQuant libraries ported from a pandas reference compile without fused multiply-adds to round like NumPy.
+    strict_float = False
 
     @property
     @abstractmethod
@@ -93,17 +98,34 @@ class FactorLibrary(ABC):
         """Build source-name to KunQuant expression mappings."""
         raise NotImplementedError(f"{self.family} does not implement the KunQuant backend")
 
+    def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
+        """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""
+        return {}, {}
+
+    def validate_inputs(self, inputs: Mapping[str, Any]) -> None:  # noqa: B027 - optional hook
+        """Raise when the aligned input arrays cannot produce trustworthy factors."""
+
     @property
     def implementation_fingerprint(self) -> str:
         """Fingerprint the complete defining module, not only the provider class."""
         module = importlib.import_module(self.__class__.__module__)
-        return stable_hash(
-            {
-                "family": self.family,
-                "required_inputs": self.required_inputs,
-                "source": inspect.getsource(module),
-            }
+        payload: dict[str, Any] = {
+            "family": self.family,
+            "required_inputs": self.required_inputs,
+            "source": inspect.getsource(module),
+        }
+        # Operator modules imported whole (``from rquant.factors.extensions import kunquant_panel``) define formula
+        # semantics too, so their source is part of the fingerprint.
+        extensions = sorted(
+            value.__name__
+            for value in vars(module).values()
+            if inspect.ismodule(value) and value.__name__.startswith("rquant.factors.extensions.")
         )
+        if extensions:
+            payload["extensions"] = {name: inspect.getsource(sys.modules[name]) for name in extensions}
+        if self.reference_inputs:
+            payload["reference_inputs"] = self.reference_inputs
+        return stable_hash(payload)
 
 
 class PanelFactorLibrary(FactorLibrary):
@@ -114,10 +136,6 @@ class PanelFactorLibrary(FactorLibrary):
     @abstractmethod
     def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         """Return source-name to aligned panel mappings."""
-
-    def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
-        """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""
-        return {}, {}
 
     def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
         outputs = self.calculate(inputs)

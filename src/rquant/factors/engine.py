@@ -129,17 +129,34 @@ class KunQuantFactorEngine:
         self.registry = registry or get_library_registry()
         self.catalog = catalog_from_registry(self.registry)
         self.libraries = self.registry.select(self.config.factor_set)
-        self.input_fields = self.registry.required_inputs(self.config.factor_set)
+        self.canonical_fields = self.registry.required_inputs(self.config.factor_set)
+        self.reference_fields = self.registry.reference_inputs(self.config.factor_set)
+        self.input_fields = self.canonical_fields + self.reference_fields
         if any(library.backend != "kunquant" for library in self.libraries):
             raise FactorContractError(f"Factor set {self.config.factor_set} is not a KunQuant-only factor set")
+
+    @property
+    def strict_float(self) -> bool:
+        """Whether the graph must round every operation like NumPy, without fused multiply-adds."""
+        return any(library.strict_float for library in self.libraries)
+
+    def compiler_config(self) -> Any:
+        from KunQuant.jit import cfake
+
+        # GCC and Clang fuse a * b + c into one FMA instruction by default, which rounds differently from the
+        # pandas reference; MSVC does not contract under its default /fp:precise.
+        flags = ("-ffp-contract=off",) if self.strict_float and sys.platform != "win32" else ()
+        return cfake.CppCompilerConfig(other_flags=flags)
 
     def compilation_fingerprint(self) -> str:
         try:
             version = importlib.metadata.version("KunQuant")
         except importlib.metadata.PackageNotFoundError:
             version = "missing"
+        strict = {"strict_float": True} if self.strict_float else {}
         return stable_hash(
             {
+                **strict,
                 "kunquant": version,
                 "catalog": self.catalog.fingerprint_for(self.config.factor_set),
                 "factor_set": self.config.factor_set,
@@ -211,7 +228,7 @@ class KunQuantFactorEngine:
             compiled = cfake.compileit(
                 [("rquant_factors", function, compiler_config)],
                 library_name,
-                cfake.CppCompilerConfig(),
+                self.compiler_config(),
                 tempdir=str(target),
                 keep_files=True,
                 load=False,
@@ -257,6 +274,8 @@ class KunQuantFactorEngine:
         shape = next(iter(shapes))
         if len(shape) != 2 or min(shape) == 0:
             raise DataContractError(f"KunQuant TS inputs must be non-empty 2D arrays; got {shape}")
+        for library in self.libraries:
+            library.validate_inputs(normalized)
         time_count, stock_count = shape
         module = module or self.compile()
         blocking_len = int(module.blocking_len)
@@ -308,11 +327,21 @@ class KunQuantFactorEngine:
         if not bars_path.exists():
             raise DataContractError(f"Canonical bars do not exist: {bars_path}")
         dates, instruments, panels, output_mask = _load_canonical_panels(
-            pd, bars_path, self.input_fields, self.config.universe, start=start, end=end
+            pd, bars_path, self.canonical_fields, self.config.universe, start=start, end=end
         )
+        external, reference_hashes = _load_panel_references(
+            self.libraries, Path(canonical_root), dates, instruments, dict(self.config.external_inputs), pd
+        )
+        # Cross-sectional operators use the research universe's members of each day.
+        external["universe"] = pd.DataFrame(output_mask, index=dates, columns=instruments)
+        missing_references = sorted(set(self.reference_fields) - set(external))
+        if missing_references:
+            raise DataContractError(f"Factor libraries did not load their reference inputs: {missing_references}")
         numpy_dtype = np.dtype(np.float64 if self.config.dtype == "double" else np.float32)
         matrices = {field: np.ascontiguousarray(panel.to_numpy(dtype=numpy_dtype)) for field, panel in panels.items()}
-        del panels
+        for field in self.reference_fields:
+            matrices[field] = _aligned_matrix(np, external[field], dates, instruments, numpy_dtype)
+        del panels, external
 
         output_root = Path(output_root)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -392,6 +421,7 @@ class KunQuantFactorEngine:
                 "catalog_fingerprint": self.catalog.fingerprint_for(self.config.factor_set),
                 "factor_libraries": [library.family for library in self.libraries],
                 "input_fields": list(self.input_fields),
+                "reference_inputs": reference_hashes,
                 "compilation_fingerprint": self.compilation_fingerprint(),
                 "canonical_fingerprint": canonical_manifest.get("fingerprint"),
                 "start": str(dates[output_mask.any(axis=1)].min()),
@@ -914,6 +944,16 @@ def _write_year_partitions(
     if not total_rows:
         raise DataContractError(f"Factor build for {label} produced no rows inside the research universe")
     return total_rows
+
+
+def _aligned_matrix(np: Any, value: Any, dates: Any, instruments: Any, dtype: Any) -> Any:
+    """A dates x instruments array from a reference panel, or from a daily series repeated for every instrument."""
+    if getattr(value, "ndim", 2) == 1:
+        series = np.asarray(value.reindex(dates) if hasattr(value, "reindex") else value, dtype=dtype)
+        return np.ascontiguousarray(np.repeat(series[:, None], len(instruments), axis=1))
+    if hasattr(value, "reindex"):
+        value = value.reindex(index=dates, columns=instruments)
+    return np.ascontiguousarray(np.asarray(value, dtype=dtype))
 
 
 def _load_panel_references(
