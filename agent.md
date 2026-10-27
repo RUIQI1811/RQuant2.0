@@ -8,7 +8,7 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算 Alpha158、Alpha101、Alpha360 因子；GTJA191、china_chars、size_value_china、talib 与 jq240 使用 Pandas 面板后端；
+- KunQuant 用于编译和计算 Alpha158、Alpha101、Alpha360、GTJA191 因子；china_chars、size_value_china、talib、jq240 与 oap 使用 Pandas 面板后端；
   talib 通过锁定版本的 `TA-Lib` 包调用 TA-Lib C 库；
 - Alpha158、Alpha101、Alpha360 和 GTJA191 的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
   不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；
@@ -68,7 +68,9 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - `src/rquant/`：产品代码；
 - `src/rquant/factors/libraries/`：因子库接口、注册表及本地公式定义；
 - `src/rquant/factors/extensions/`：KunQuant 0.1.11 缺失能力的最小扩展，不是上游运行时副本；
-- `src/rquant/factors/panel_operators.py`：GTJA191 使用的公共 Pandas 面板算子；
+- `src/rquant/factors/panel_operators.py`：Pandas 面板因子库与 GTJA191 参考实现使用的公共算子；
+- `src/rquant/factors/extensions/kunquant_panel.py`：与 Pandas 面板语义一致的 KunQuant 算子（GTJA191 使用）；
+- `tests/panel_reference/`：移植到 KunQuant 的因子集的原 Pandas 实现，只用于逐格对齐测试；
 - `src/rquant/integrations/`：与外部研究工具交换数据的桥接（如 RD-Agent 导出与其模板改写脚本），不在 `rquant` 环境中安装这些工具；
 - `tests/`：快速、确定性的自动化测试；
 - `config/default.yaml`：默认研究和执行参数；

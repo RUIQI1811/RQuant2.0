@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算 Alpha158、Alpha101 与 Alpha360 因子；审计过的 Pandas 面板后端计算 GTJA191。
+- KunQuant 编译并计算 Alpha158、Alpha101、Alpha360 与 GTJA191 因子；其余面板因子集使用 Pandas 面板后端。
 
 完整工作流概览
 
@@ -361,13 +361,14 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 
 ### 因子库代码结构
 
-所有可研究的因子公式由 RQuant 自己维护。Alpha158/Alpha101/Alpha360 使用 KunQuant 后端，GTJA191 使用
-Pandas 宽表后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约：
+所有可研究的因子公式由 RQuant 自己维护。Alpha158/Alpha101/Alpha360/GTJA191 使用 KunQuant 后端，china_chars、
+size_value_china、talib、jq240 与 oap 使用 Pandas 宽表后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约：
 
 ```text
 src/rquant/factors/
 ├── extensions/
-│   └── kunquant.py                      # KunQuant 缺失能力的最小扩展与适配
+│   ├── kunquant.py                      # KunQuant 缺失能力的最小扩展与适配
+│   └── kunquant_panel.py                # 与 Pandas 面板语义一致的 KunQuant 算子（窗口、递归、逐股 C++ 状态）
 ├── panel_operators.py                   # 公共 Pandas 面板算子
 ├── catalog.py                           # 动态目录、稳定命名和实现指纹
 ├── engine.py                            # 后端选择、执行和标准分区写入
@@ -378,7 +379,7 @@ src/rquant/factors/
     ├── alpha158.py                      # 158 条本地 Alpha158 公式
     ├── alpha101.py                      # 101 条本地 Alpha101 公式
     ├── alpha360.py                      # 6 个归一化字段各 60 个滞后期的 Alpha360 图
-    ├── gtja191.py                       # 完整 GTJA191 提供者与公式语义说明
+    ├── gtja191.py                       # 190 条 GTJA191 KunQuant 公式与语义说明
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
     ├── recent.py                        # recent（2022 年以后仍有效）选择型因子集的锁定成员与方向
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
@@ -449,7 +450,8 @@ GTJA191 当前构建 190 条公式：186 条只依赖标准 OHLCV、成交额和
 
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 使用标准数据中的沪深 300 日线；构建器自动从
   `data/canonical/reference/index_daily.parquet` 选择 `000300.SH`，缺失时兼容 `399300.SZ`；
-- `gtja_030` 的公式仍保留在源码中，但因当前缺少可审计的逐日 `mkt`、`smb`、`hml` 风格收益，暂时不注册到构建目录。
+- `gtja_030` 的公式只保留在 Pandas 参考实现 `tests/panel_reference/gtja191.py` 中，因当前缺少可审计的逐日
+  `mkt`、`smb`、`hml` 风格收益，暂时不注册到构建目录。
 
 构建命令：
 
@@ -465,6 +467,11 @@ rquant factors validate --factor-set gtja191
 附录为基准。原报告中
 `Alpha159` 的 `HGIH` 按 `HIGH` 修正并保留其原始加权式；`Alpha181` 的分母 `SUM` 缺少窗口参数，
 实现采用与分子一致的 20 日窗口，并在源码 `GTJA191_FORMULA_NOTES` 中固定这些解释。
+
+GTJA191 由 KunQuant 编译执行（sh_main 规模从 Pandas 单线程 2 小时以上降到分钟级，首次编译约 40 秒）。原 Pandas
+实现保留在 `tests/panel_reference/gtja191.py`，测试逐格比对全部 190 条公式。为保证跨编译器、跨 CPU 结果一致：
+截面 `rank` 和时序 `ts_rank` 先把输入保留 40 位有效二进制位并把绝对值小于 1e-12 的值置 0，使理论上相等的值
+严格并列；该库编译时关闭 FMA 合并（GCC/Clang 的 `-ffp-contract=off`，MSVC 默认不合并）。
 
 ### 构建因子
 
