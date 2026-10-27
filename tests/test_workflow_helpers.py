@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import math
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from rquant.qlib_ext.loader import _partitions_in_range, _single_precision
+from rquant.qlib_ext.processors import ProcessInf
 from rquant.workflow.backtest import PortfolioConfig, _metrics, _rebalance_dates, _rebalance_description
 
 
@@ -57,6 +59,42 @@ class RebalanceScheduleTests(unittest.TestCase):
             "daily, drop at most 5 of the top 50",
             _rebalance_description(PortfolioConfig(topk=50, n_drop=5, rebalance_days=1)),
         )
+
+
+class ProcessInfTests(unittest.TestCase):
+    def _panel(self) -> pd.DataFrame:
+        dates = pd.bdate_range("2024-01-29", periods=6)
+        instruments = ["SH600000", "SH600004", "SH600006", "SH600007"]
+        index = pd.MultiIndex.from_product([dates, instruments], names=["datetime", "instrument"])
+        rng = np.random.default_rng(7)
+        values = rng.normal(size=(len(index), 3)).astype("float32")
+        values[[0, 5, 9], 0] = np.inf
+        values[[2, 13], 1] = -np.inf
+        values[[3, 6], 0] = np.nan
+        values[20:24, 2] = np.inf  # every value of one date is infinite
+        columns = pd.MultiIndex.from_tuples([("feature", "a"), ("feature", "b"), ("label", "LABEL0")])
+        return pd.DataFrame(values, index=index, columns=columns)
+
+    def test_infinities_take_the_same_date_mean_of_finite_values(self) -> None:
+        frame = self._panel()
+        result = ProcessInf()(frame.copy())
+        self.assertFalse(np.isinf(result.to_numpy()).any())
+        day = frame.index.get_level_values("datetime")[0]
+        column = ("feature", "a")
+        finite = frame.loc[day, column].replace(np.inf, np.nan).mean()
+        self.assertAlmostEqual(float(finite), float(result.loc[(day, "SH600000"), column]), places=6)
+        self.assertTrue(np.isnan(result[("feature", "a")].iloc[3]))
+        self.assertTrue(result[("label", "LABEL0")].iloc[20:24].isna().all())
+        untouched = ~np.isinf(frame.to_numpy()) & ~np.isnan(frame.to_numpy())
+        np.testing.assert_array_equal(frame.to_numpy()[untouched], result.to_numpy()[untouched])
+
+    @unittest.skipUnless(importlib.util.find_spec("qlib") is not None, "pyqlib is required")
+    def test_matches_qlib_process_inf(self) -> None:
+        from qlib.data.dataset.processor import ProcessInf as QlibProcessInf
+
+        frame = self._panel()
+        expected = QlibProcessInf()(frame.copy())
+        pd.testing.assert_frame_equal(expected, ProcessInf()(frame.copy()), check_dtype=False)
 
 
 if __name__ == "__main__":

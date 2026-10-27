@@ -189,7 +189,7 @@ class RollingWorkflowRunner:
             end_time=data_end.isoformat(),
             data_loader=loader,
             infer_processors=[
-                {"class": "ProcessInf"},
+                {"class": "ProcessInf", "module_path": "rquant.qlib_ext.processors"},
                 {
                     "class": "ZScoreNorm",
                     "kwargs": {"fit_start_time": fit_start.isoformat(), "fit_end_time": fit_end.isoformat()},
