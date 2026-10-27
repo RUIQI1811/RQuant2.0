@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from rquant.qlib_ext.loader import _partitions_in_range
+from rquant.qlib_ext.loader import _partitions_in_range, _single_precision
 from rquant.workflow.backtest import PortfolioConfig, _metrics, _rebalance_dates, _rebalance_description
 
 
@@ -17,6 +17,15 @@ class LoaderPartitionTests(unittest.TestCase):
         selected = _partitions_in_range(paths, pd, "2012-07-01", "2014-12-31")
         self.assertEqual(["year=2012", "year=2013", "year=2014"], [path.parent.name for path in selected])
         self.assertEqual(paths, _partitions_in_range(paths, pd, None, None))
+
+    def test_factor_columns_are_read_in_single_precision(self) -> None:
+        frame = pd.DataFrame(
+            {"datetime": pd.to_datetime(["2024-01-02"]), "instrument": ["SH600000"], "f1": [1.5], "f2": [np.nan]}
+        )
+        converted = _single_precision(frame)
+        self.assertEqual(["float32", "float32"], [str(converted[name].dtype) for name in ("f1", "f2")])
+        self.assertEqual(frame["instrument"].dtype, converted["instrument"].dtype)
+        self.assertEqual(frame["datetime"].dtype, converted["datetime"].dtype)
 
 
 class BacktestMetricTests(unittest.TestCase):

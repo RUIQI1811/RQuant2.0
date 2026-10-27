@@ -52,7 +52,9 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         )
         if not paths:
             raise DataContractError(f"No factor partitions for {self.factor_set}: {self.factor_root}")
-        frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
+        # Factor stores are written in double precision; models train on single precision, which halves the memory of
+        # every copy DataHandlerLP and LightGBM make of a multi-year sh_main/main panel.
+        frame = pd.concat([_single_precision(pd.read_parquet(path)) for path in paths], ignore_index=True)
         frame["datetime"] = pd.to_datetime(frame["datetime"])
         if start_time is not None:
             frame = frame[frame["datetime"] >= pd.Timestamp(start_time)]
@@ -68,6 +70,7 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
 
         # DataHandlerLP follows QlibDataLoader's canonical <datetime, instrument> index order.
         features = frame.set_index(["datetime", "instrument"])[expected].sort_index()
+        del frame
         query_instruments = sorted(features.index.get_level_values("instrument").unique())
         labels = D.features(
             query_instruments,
@@ -84,6 +87,10 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
             [("feature", column) if column != "LABEL0" else ("label", column) for column in merged.columns]
         )
         return merged.sort_index()
+
+
+def _single_precision(frame: Any) -> Any:
+    return frame.astype({column: "float32" for column in frame.columns if column not in {"datetime", "instrument"}})
 
 
 def _partitions_in_range(paths: list[Path], pd: Any, start_time: Any, end_time: Any) -> list[Path]:

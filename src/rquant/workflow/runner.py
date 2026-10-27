@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import pickle
 from dataclasses import asdict
 from datetime import date
@@ -107,6 +108,9 @@ class RollingWorkflowRunner:
             ):
                 tuning_model.fit(tune_dataset)
             chosen_iterations = _best_iterations(tuning_model)
+            # Release the tuning panel before the refit panel is loaded so the two never sit in memory together.
+            del tune_dataset, tune_handler, tuning_model
+            gc.collect()
 
             final_handler = self._handler(
                 DataHandlerLP,
@@ -153,6 +157,8 @@ class RollingWorkflowRunner:
             atomic_write_json(window_dir / "window.json", window_manifest)
             window_manifests.append(window_manifest)
             all_predictions.append(prediction_frame)
+            del final_dataset, final_handler, final_model, prediction
+            gc.collect()
 
         combined = pd.concat(all_predictions, ignore_index=True).sort_values(["datetime", "instrument"])
         if combined.duplicated(["datetime", "instrument"]).any():
@@ -195,6 +201,8 @@ class RollingWorkflowRunner:
                 {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
             ],
             process_type=DataHandlerLP.PTYPE_A,
+            # Training reads the learn and infer views only; keeping the raw panel too would hold a third copy.
+            drop_raw=True,
         )
 
     def _model(self, *, iterations: int | None = None, refit: bool = False) -> Any:
