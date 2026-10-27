@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         end_time: Any = None,
     ) -> Any:
         try:
+            import numpy as np
             import pandas as pd
             from qlib.data import D
         except ImportError as exc:
@@ -52,26 +55,25 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         )
         if not paths:
             raise DataContractError(f"No factor partitions for {self.factor_set}: {self.factor_root}")
-        # Factor stores are written in double precision; models train on single precision, which halves the memory of
-        # every copy DataHandlerLP and LightGBM make of a multi-year sh_main/main panel.
-        frame = pd.concat([_single_precision(pd.read_parquet(path)) for path in paths], ignore_index=True)
-        frame["datetime"] = pd.to_datetime(frame["datetime"])
-        if start_time is not None:
-            frame = frame[frame["datetime"] >= pd.Timestamp(start_time)]
-        if end_time is not None:
-            frame = frame[frame["datetime"] <= pd.Timestamp(end_time)]
         instrument_list = _resolve_instruments(D, instruments, start_time, end_time)
-        if instrument_list:
-            frame = frame[frame["instrument"].isin(instrument_list)]
+        # Filter each yearly partition as it is read, so at most one year is held twice.
+        with _system_arrow_allocator():
+            frame = pd.concat(
+                [_read_partition(pd, path, start_time, end_time, instrument_list) for path in paths], ignore_index=True
+            )
         expected = list(self.catalog.canonical_names(self.factor_set))
         factor_columns = [column for column in frame.columns if column not in {"datetime", "instrument"}]
         if factor_columns != expected:
             raise DataContractError("Factor store columns do not match the locked catalog")
 
-        # DataHandlerLP follows QlibDataLoader's canonical <datetime, instrument> index order.
-        features = frame.set_index(["datetime", "instrument"])[expected].sort_index()
-        del frame
-        query_instruments = sorted(features.index.get_level_values("instrument").unique())
+        # DataHandlerLP follows QlibDataLoader's canonical <datetime, instrument> index order. Moving the key columns
+        # into the index in place keeps the factor block as it is; set_index and join would each copy it.
+        frame.index = pd.MultiIndex.from_arrays(
+            [frame.pop("datetime"), frame.pop("instrument")], names=["datetime", "instrument"]
+        )
+        if not frame.index.is_monotonic_increasing:
+            frame = frame.sort_index()
+        query_instruments = sorted(frame.index.get_level_values("instrument").unique())
         labels = D.features(
             query_instruments,
             [LABEL_EXPRESSIONS[self.horizon]],
@@ -82,11 +84,42 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         labels.columns = ["LABEL0"]
         labels = labels.swaplevel().sort_index()
         labels.index = labels.index.set_names(["datetime", "instrument"])
-        merged = features.join(labels, how="left")
-        merged.columns = pd.MultiIndex.from_tuples(
-            [("feature", column) if column != "LABEL0" else ("label", column) for column in merged.columns]
-        )
-        return merged.sort_index()
+        # One float32 block for features and label: DataHandlerLP copies the panel for its processors, and copying a
+        # frame of several blocks consolidates them through extra full-size temporaries.
+        panel = np.empty((len(frame), len(expected) + 1), dtype=np.float32, order="F")
+        panel[:, :-1] = frame.to_numpy(dtype=np.float32)
+        panel[:, -1] = labels["LABEL0"].reindex(frame.index).to_numpy(dtype=np.float32)
+        columns = pd.MultiIndex.from_tuples([("feature", column) for column in expected] + [("label", "LABEL0")])
+        return pd.DataFrame(panel, index=frame.index, columns=columns, copy=False)
+
+
+def _read_partition(pd: Any, path: Path, start_time: Any, end_time: Any, instruments: list[str] | None) -> Any:
+    # Factor stores are written in double precision; models train on single precision, which halves the memory of
+    # every copy DataHandlerLP and LightGBM make of a multi-year sh_main/main panel.
+    frame = _single_precision(pd.read_parquet(path))
+    frame["datetime"] = pd.to_datetime(frame["datetime"])
+    keep = pd.Series(True, index=frame.index)
+    if start_time is not None:
+        keep &= frame["datetime"] >= pd.Timestamp(start_time)
+    if end_time is not None:
+        keep &= frame["datetime"] <= pd.Timestamp(end_time)
+    if instruments:
+        keep &= frame["instrument"].isin(instruments)
+    return frame if keep.all() else frame[keep]
+
+
+@contextmanager
+def _system_arrow_allocator() -> Iterator[None]:
+    """Read through the C allocator: Arrow's default mimalloc pool keeps the decoded float64 pages after they are freed
+    (about 1.5 GB per 100 sh_main factor columns), and ``release_unused`` does not return them."""
+    import pyarrow
+
+    previous = pyarrow.default_memory_pool()
+    pyarrow.set_memory_pool(pyarrow.system_memory_pool())
+    try:
+        yield
+    finally:
+        pyarrow.set_memory_pool(previous)
 
 
 def _single_precision(frame: Any) -> Any:

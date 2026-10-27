@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from rquant.qlib_ext.loader import _partitions_in_range, _single_precision
-from rquant.qlib_ext.processors import ProcessInf
+from rquant.qlib_ext.loader import _partitions_in_range, _read_partition, _single_precision
+from rquant.qlib_ext.processors import DropnaLabel, Fillna, ProcessInf, ZScoreNorm
 from rquant.workflow.backtest import PortfolioConfig, _metrics, _rebalance_dates, _rebalance_description
 
 
@@ -61,7 +62,7 @@ class RebalanceScheduleTests(unittest.TestCase):
         )
 
 
-class ProcessInfTests(unittest.TestCase):
+class ProcessorTests(unittest.TestCase):
     def _panel(self) -> pd.DataFrame:
         dates = pd.bdate_range("2024-01-29", periods=6)
         instruments = ["SH600000", "SH600004", "SH600006", "SH600007"]
@@ -73,7 +74,7 @@ class ProcessInfTests(unittest.TestCase):
         values[[3, 6], 0] = np.nan
         values[20:24, 2] = np.inf  # every value of one date is infinite
         columns = pd.MultiIndex.from_tuples([("feature", "a"), ("feature", "b"), ("label", "LABEL0")])
-        return pd.DataFrame(values, index=index, columns=columns)
+        return pd.DataFrame(np.asfortranarray(values), index=index, columns=columns, copy=False)
 
     def test_infinities_take_the_same_date_mean_of_finite_values(self) -> None:
         frame = self._panel()
@@ -95,6 +96,56 @@ class ProcessInfTests(unittest.TestCase):
         frame = self._panel()
         expected = QlibProcessInf()(frame.copy())
         pd.testing.assert_frame_equal(expected, ProcessInf()(frame.copy()), check_dtype=False)
+
+    @unittest.skipUnless(importlib.util.find_spec("qlib") is not None, "pyqlib is required")
+    def test_processor_chain_matches_qlib_and_keeps_one_block(self) -> None:
+        from qlib.data.dataset import processor as qlib_processor
+
+        def run(processors, frame):
+            for processor in processors:
+                processor.fit(frame)
+                frame = processor(frame)
+            return frame
+
+        fit = {"fit_start_time": "2024-01-29", "fit_end_time": "2024-02-02"}
+        frame = self._panel()
+        frame.iloc[7, 2] = np.nan
+        ours = run([ProcessInf(), ZScoreNorm(**fit), Fillna(), DropnaLabel()], frame.copy())
+        expected = run(
+            [
+                qlib_processor.ProcessInf(),
+                qlib_processor.ZScoreNorm(**fit),
+                qlib_processor.Fillna(),
+                qlib_processor.DropnaLabel(),
+            ],
+            frame.copy(),
+        )
+        pd.testing.assert_frame_equal(expected, ours, check_dtype=False, rtol=1e-6)
+        self.assertEqual(1, len(ours._mgr.blocks))
+
+    def test_dropna_label_copies_only_when_a_label_is_missing(self) -> None:
+        frame = self._panel().fillna(0)
+        self.assertIs(frame, DropnaLabel()(frame))
+        frame.iloc[1, 2] = np.nan
+        self.assertEqual(len(frame) - 1, len(DropnaLabel()(frame)))
+
+
+class PartitionReadTests(unittest.TestCase):
+    def test_partition_is_filtered_and_read_in_single_precision(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "factors.parquet"
+        pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(["2024-01-02", "2024-01-02", "2024-01-03", "2024-01-04"]),
+                "instrument": ["SH600000", "SH600004", "SH600000", "SH600000"],
+                "f1": [1.0, 2.0, 3.0, 4.0],
+            }
+        ).to_parquet(path, index=False)
+        frame = _read_partition(pd, path, "2024-01-02", "2024-01-03", ["SH600000"])
+        self.assertEqual([1.0, 3.0], frame["f1"].tolist())
+        self.assertEqual("float32", str(frame["f1"].dtype))
+        self.assertEqual(4, len(_read_partition(pd, path, None, None, None)))
 
 
 if __name__ == "__main__":

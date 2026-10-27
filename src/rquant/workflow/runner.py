@@ -192,12 +192,13 @@ class RollingWorkflowRunner:
                 {"class": "ProcessInf", "module_path": "rquant.qlib_ext.processors"},
                 {
                     "class": "ZScoreNorm",
+                    "module_path": "rquant.qlib_ext.processors",
                     "kwargs": {"fit_start_time": fit_start.isoformat(), "fit_end_time": fit_end.isoformat()},
                 },
-                {"class": "Fillna"},
+                {"class": "Fillna", "module_path": "rquant.qlib_ext.processors"},
             ],
             learn_processors=[
-                {"class": "DropnaLabel"},
+                {"class": "DropnaLabel", "module_path": "rquant.qlib_ext.processors"},
                 {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
             ],
             process_type=DataHandlerLP.PTYPE_A,
