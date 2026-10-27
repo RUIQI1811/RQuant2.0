@@ -40,8 +40,9 @@ def calculate(inputs):
     close = inputs["close"]
     statements = engine.run_statements(inputs, close.index, close.columns, statement_module)
     arrays = {}
-    for name in engine.input_fields:
-        value = statements.daily(name) if name in statements else inputs[name]
+    # Statement-graph inputs are left to ``run``, which publishes them graph group by graph group.
+    for name in (name for name in engine.input_fields if name not in statements):
+        value = inputs[name]
         if isinstance(value, pd.Series):
             value = np.repeat(value.to_numpy()[:, None], len(close.columns), axis=1)
         arrays[name] = np.ascontiguousarray(value, dtype=float)

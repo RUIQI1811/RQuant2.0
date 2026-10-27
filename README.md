@@ -146,6 +146,7 @@ rquant doctor --skip-permission-check
 | `data.fundamentals_window_years` |          `6` | 财报按公告日分窗抓取的年数；已结束的窗口会缓存复用 |
 | `factors.factor_set`             |   `Hquality` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
+| `factors.graph_outputs`          |         `20` | 每个 KunQuant 图最多编译的因子数；每个中间结果都要一块“日期 × 股票”的缓冲区，分图计算可大幅降低内存，结果逐位不变；只作用于严格浮点的因子集（qlib_alpha158/360、wq_alpha101 始终一张图）；`0` 表示整个因子集一张图 |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |
 | `workflow.validation_months`     |          `6` | 训练窗口最后几个月用于选择迭代数 |
 | `workflow.first_prediction_year` |       `2013` | 第一个样本外预测年           |

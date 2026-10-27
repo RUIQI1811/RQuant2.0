@@ -453,6 +453,7 @@ def _factor_build(args: argparse.Namespace) -> int:
                 input_layout=str(factor_config.get("input_layout", "TS")),
                 output_layout=str(factor_config.get("output_layout", "TS")),
                 workers=int(factor_config.get("workers", 4)),
+                graph_outputs=int(factor_config.get("graph_outputs", 20)),
                 universe=_universe(config),
                 external_inputs=external_inputs,
             ),
