@@ -242,6 +242,7 @@ class KunQuantFactorEngine:
             output_layout=self.config.output_layout,
             # None lets KunQuant select the architecture-safe value (unaligned is unsupported on Apple Silicon).
             allow_unaligned=None,
+            split_source=max(library.compile_split_source for library in self.libraries),
             # Prefer deterministic double-precision rolling statistics over the faster incremental approximation.
             options={"no_fast_stat": True},
         )

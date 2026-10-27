@@ -6,8 +6,7 @@ usable. KunQuant statement graphs (``FactorLibrary.build_statements``) run over 
 lays the statement fields out as quarters x instruments, and ``gather`` publishes a quarterly result on every trading
 day on which its quarter is the latest known one.
 
-The NumPy quarter helpers below (``lag``, ``ratio``, ...) serve the pandas libraries that still compute their
-statement formulas in Python (jq240, oap).
+The NumPy quarter helpers below (``lag``, ``ratio``, ...) serve the independent pandas parity references in tests.
 """
 
 from __future__ import annotations

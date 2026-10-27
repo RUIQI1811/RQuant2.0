@@ -94,6 +94,8 @@ class FactorLibrary(ABC):
     quote_fields: tuple[str, ...] = ()
     # C++ source (helper functions the graph's kernels call) placed before every generated KunQuant source file.
     cpp_prelude = ""
+    # Bound the number of generated stages per C++ translation unit for large libraries.
+    compile_split_source = 0
     # A statement graph (``build_statements``) runs over fiscal quarters x instruments of the first-reported statements
     # in the reference input ``fundamentals``, reading ``statement_fields`` and ``fiscal_quarter`` (0 for Q1). The
     # engine publishes each result named in ``statement_outputs`` as a daily input of ``build``: ``q_`` results from

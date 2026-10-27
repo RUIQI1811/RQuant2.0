@@ -311,6 +311,8 @@ DAILY_REFERENCE = (
 )
 
 CPP_PRELUDE = r"""
+#ifndef RQUANT_CHINA_CHARS_CPP_HELPERS
+#define RQUANT_CHINA_CHARS_CPP_HELPERS
 namespace rq_cnc {
 
 static const double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -527,6 +529,7 @@ static inline void rolling_regression(int n, const double *y, const std::vector<
 }
 
 }  // namespace rq_cnc
+#endif
 """
 
 
