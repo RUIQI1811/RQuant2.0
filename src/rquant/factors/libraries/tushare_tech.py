@@ -4,7 +4,8 @@ Tushare publishes, per stock and day, about thirty classic Chinese-terminal indi
 CCI, CR, DMA, DMI, DPO, EMA, EMV, EXPMA, KDJ, KTN, MA, MACD, MASS, MFI, MTM, OBV, PSY, ROC, RSI, TAQ, TRIX, VR, WR,
 XSII) with the parameters listed in its documentation, plus streak counts. The endpoint itself needs more Tushare
 points than this account has, so every indicator is computed here from the standard TongDaXin formula with
-Tushare's parameters. Tushare's values are not used.
+Tushare's parameters. Tushare's values are not used. The indicators run in KunQuant as C++ series kernels
+(``CPP_PRELUDE``); the original pandas implementation is kept as the parity reference in ``tests/panel_reference``.
 
 * Indicators run on each stock's own trading days: rows without a complete open, high, low, close and volume quote
   are removed first and stay missing, so a suspension does not reset an EMA or shorten a window.
@@ -20,19 +21,14 @@ Tushare's parameters. Tushare's values are not used.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
-import numpy as np
-import pandas as pd
+from rquant.factors.extensions import kunquant_panel as k
+from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 
-from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-
-Panel = pd.DataFrame
-Series = pd.Series
 FIELDS = ("open", "high", "low", "close", "volume")
 FLOW_DAYS = 20
-INSTRUMENT_BLOCK = 64
 MOVING_AVERAGES = (5, 10, 20, 30, 60, 90, 250)
 
 # (source name, description, leading quotes left missing). Order is the stable public column order.
@@ -105,11 +101,368 @@ TUSHARE_TECH_NAMES = tuple(name for name, _, _ in TUSHARE_TECH)
 LOOKBACK = {name: lookback for name, _, lookback in TUSHARE_TECH}
 
 
-class TushareTechLibrary(PanelFactorLibrary):
-    """Tushare stk_factor_pro technical indicators, evaluated per stock over its own trading days."""
+# C++ helpers over one stock's consecutive quotes. Every operator keeps the pandas semantics of the reference
+# implementation (tests/panel_reference/tushare_tech.py): rolling windows need ``n`` known values, ``ewm`` is pandas'
+# ``adjust=False`` exponential mean that carries its value over missing rows, comparisons with a missing value are
+# false, and divisions follow IEEE arithmetic until the published value is checked for finiteness.
+CPP_PRELUDE = r"""
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace rq_tst {
+using V = std::vector<double>;
+static const double NaN = std::numeric_limits<double>::quiet_NaN();
+
+inline V filled(size_t n, double value) { return V(n, value); }
+
+template <class F> inline V map1(const V &a, F f) {
+    V r(a.size());
+    for (size_t i = 0; i < a.size(); ++i) r[i] = f(a[i]);
+    return r;
+}
+template <class F> inline V map2(const V &a, const V &b, F f) {
+    V r(a.size());
+    for (size_t i = 0; i < a.size(); ++i) r[i] = f(a[i], b[i]);
+    return r;
+}
+template <class F> inline V map3(const V &a, const V &b, const V &c, F f) {
+    V r(a.size());
+    for (size_t i = 0; i < a.size(); ++i) r[i] = f(a[i], b[i], c[i]);
+    return r;
+}
+inline V add(const V &a, const V &b) { return map2(a, b, [](double x, double y) { return x + y; }); }
+inline V sub(const V &a, const V &b) { return map2(a, b, [](double x, double y) { return x - y; }); }
+inline V mul(const V &a, const V &b) { return map2(a, b, [](double x, double y) { return x * y; }); }
+inline V div(const V &a, const V &b) { return map2(a, b, [](double x, double y) { return x / y; }); }
+inline V scale(const V &a, double k) { return map1(a, [k](double x) { return x * k; }); }
+inline V offset(const V &a, double k) { return map1(a, [k](double x) { return x + k; }); }
+inline V absv(const V &a) { return map1(a, [](double x) { return std::fabs(x); }); }
+inline V clip0(const V &a) { return map1(a, [](double x) { return x != x ? x : (x < 0.0 ? 0.0 : x); }); }
+
+inline V ref(const V &x, int n) {
+    V r(x.size(), NaN);
+    for (size_t i = n; i < x.size(); ++i) r[i] = x[i - n];
+    return r;
+}
+// Rolling sum over a complete window of n known values.
+inline V total(const V &x, int n) {
+    V r(x.size(), NaN);
+    for (size_t i = n - 1; i < x.size() && n > 0; ++i) {
+        double s = 0.0;
+        bool ok = true;
+        for (size_t j = i + 1 - n; j <= i; ++j) {
+            if (x[j] != x[j]) { ok = false; break; }
+            s += x[j];
+        }
+        if (ok) r[i] = s;
+    }
+    return r;
+}
+inline V ma(const V &x, int n) { return scale(total(x, n), 1.0 / n); }
+inline V extreme(const V &x, int n, bool maximum) {
+    V r(x.size(), NaN);
+    for (size_t i = n - 1; i < x.size(); ++i) {
+        double e = x[i + 1 - n];
+        bool ok = e == e;
+        for (size_t j = i + 2 - n; j <= i && ok; ++j) {
+            if (x[j] != x[j]) ok = false;
+            else if (maximum ? x[j] > e : x[j] < e) e = x[j];
+        }
+        if (ok) r[i] = e;
+    }
+    return r;
+}
+inline V hhv(const V &x, int n) { return extreme(x, n, true); }
+inline V llv(const V &x, int n) { return extreme(x, n, false); }
+inline V std0(const V &x, int n) {
+    V r(x.size(), NaN);
+    for (size_t i = n - 1; i < x.size(); ++i) {
+        double s = 0.0;
+        bool ok = true;
+        for (size_t j = i + 1 - n; j <= i; ++j) {
+            if (x[j] != x[j]) { ok = false; break; }
+            s += x[j];
+        }
+        if (!ok) continue;
+        const double m = s / n;
+        double q = 0.0;
+        for (size_t j = i + 1 - n; j <= i; ++j) q += (x[j] - m) * (x[j] - m);
+        r[i] = std::sqrt(q / n);
+    }
+    return r;
+}
+inline V avedev(const V &x, int n) {
+    V r(x.size(), NaN);
+    for (size_t i = n - 1; i < x.size(); ++i) {
+        double s = 0.0;
+        for (size_t j = i + 1 - n; j <= i; ++j) s += x[j];
+        const double m = s / n;
+        double d = 0.0;
+        for (size_t j = i + 1 - n; j <= i; ++j) d += std::fabs(x[j] - m);
+        r[i] = d / n;
+    }
+    return r;
+}
+// pandas ``ewm(alpha=alpha, adjust=False).mean()``: starts at the first known value and carries over missing rows.
+inline V ewm(const V &x, double alpha) {
+    V r(x.size(), NaN);
+    if (x.empty()) return r;
+    double weighted = x[0];
+    double old_wt = 1.0;
+    const double factor = 1.0 - alpha;
+    r[0] = weighted;
+    for (size_t i = 1; i < x.size(); ++i) {
+        const double cur = x[i];
+        const bool observation = cur == cur;
+        if (weighted == weighted) {
+            old_wt *= factor;
+            if (observation) {
+                if (weighted != cur) weighted = (old_wt * weighted + alpha * cur) / (old_wt + alpha);
+                old_wt = 1.0;
+            }
+        } else if (observation) {
+            weighted = cur;
+        }
+        r[i] = weighted;
+    }
+    return r;
+}
+inline V ema(const V &x, int n) { return ewm(x, 2.0 / (n + 1.0)); }
+inline V sma(const V &x, int n, int m) { return ewm(x, (double)m / n); }
+inline V dma(const V &x, const V &weight) {
+    V r(x.size(), NaN);
+    double previous = NaN;
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (std::isfinite(weight[i]) && std::isfinite(x[i])) {
+            const double blended = weight[i] * x[i] + (1.0 - weight[i]) * previous;
+            previous = previous != previous ? x[i] : blended;
+        }
+        r[i] = previous;
+    }
+    return r;
+}
+inline V streak(const V &condition) {
+    V r(condition.size());
+    double run = 0.0;
+    for (size_t i = 0; i < condition.size(); ++i) {
+        run = condition[i] > 0.5 ? run + 1.0 : 0.0;
+        r[i] = run;
+    }
+    return r;
+}
+inline V range_days(const V &x, bool higher) {
+    V r(x.size());
+    std::vector<size_t> stack;
+    for (size_t i = 0; i < x.size(); ++i) {
+        while (!stack.empty() && (higher ? x[stack.back()] <= x[i] : x[stack.back()] >= x[i])) stack.pop_back();
+        r[i] = stack.empty() ? (double)i : (double)(i - stack.back() - 1);
+        stack.push_back(i);
+    }
+    return r;
+}
+inline V true_range(const V &h, const V &l, const V &lc) {
+    return map3(h, l, lc, [](double hi, double lo, double pc) {
+        const double a = hi - lo, b = std::fabs(pc - hi), c = std::fabs(pc - lo);
+        if (a != a || b != b || c != c) return NaN;
+        return std::max(a, std::max(b, c));
+    });
+}
+inline V over_close(const V &x, const V &c) { return div(x, c); }
+inline V rel_close(const V &x, const V &c) { return offset(div(x, c), -1.0); }
+
+// The published series of one indicator for a stock's quotes.
+inline V indicator(const std::string &name, const V &o, const V &h, const V &l, const V &c, const V &v) {
+    const size_t m = c.size();
+    const V lc = ref(c, 1);
+    const V change = sub(c, lc);
+    if (name == "asi" || name == "asit") {
+        const V aa = absv(sub(h, lc)), bb = absv(sub(l, lc));
+        const V cc = absv(sub(h, ref(l, 1))), dd = absv(sub(lc, ref(o, 1)));
+        V si(m, NaN);
+        const V po = ref(o, 1);
+        for (size_t i = 0; i < m; ++i) {
+            const double r = (aa[i] > bb[i] && aa[i] > cc[i]) ? aa[i] + bb[i] / 2 + dd[i] / 4
+                             : ((bb[i] > cc[i] && bb[i] > aa[i]) ? bb[i] + aa[i] / 2 + dd[i] / 4 : cc[i] + dd[i] / 4);
+            const double x = c[i] - lc[i] + (c[i] - o[i]) / 2 + lc[i] - po[i];
+            const double range = r > 0 ? r : NaN;
+            const double larger = (aa[i] != aa[i] || bb[i] != bb[i]) ? NaN : std::max(aa[i], bb[i]);
+            si[i] = 16 * x / range * larger;
+        }
+        const V asi = total(si, 26);
+        return name == "asi" ? over_close(asi, c) : over_close(ma(asi, 10), c);
+    }
+    const V tr = true_range(h, l, lc);
+    if (name == "atr") return over_close(ma(tr, 20), c);
+    if (name == "bbi") return rel_close(scale(add(add(ma(c, 3), ma(c, 6)), add(ma(c, 12), ma(c, 24))), 0.25), c);
+    if (name == "bias1" || name == "bias2" || name == "bias3") {
+        const int n = name == "bias1" ? 6 : (name == "bias2" ? 12 : 24);
+        const V mean = ma(c, n);
+        return scale(div(sub(c, mean), mean), 100.0);
+    }
+    if (name == "boll_upper" || name == "boll_lower") {
+        const V mid = ma(c, 20), spread = std0(c, 20);
+        return rel_close(name == "boll_upper" ? add(mid, scale(spread, 2)) : sub(mid, scale(spread, 2)), c);
+    }
+    if (name == "brar_ar") return scale(div(total(sub(h, o), 26), total(sub(o, l), 26)), 100.0);
+    if (name == "brar_br") return scale(div(total(clip0(sub(h, lc)), 26), total(clip0(sub(lc, l)), 26)), 100.0);
+    const V typical = map3(h, l, c, [](double hi, double lo, double cl) { return (hi + lo + cl) / 3.0; });
+    if (name == "cci") return div(sub(typical, ma(typical, 14)), scale(avedev(typical, 14), 0.015));
+    if (name == "cr") {
+        const V mid = scale(ref(add(h, l), 1), 0.5);
+        return scale(div(total(clip0(sub(h, mid)), 20), total(clip0(sub(mid, l)), 20)), 100.0);
+    }
+    if (name == "dfma_dif" || name == "dfma_difma") {
+        const V dif = sub(ma(c, 10), ma(c, 50));
+        return over_close(name == "dfma_dif" ? dif : ma(dif, 10), c);
+    }
+    if (name.rfind("dmi_", 0) == 0) {
+        const V moving = total(tr, 14);
+        const V up = sub(h, ref(h, 1)), down = sub(ref(l, 1), l);
+        auto directional = [](double a, double b) { return a != a ? NaN : ((a > 0 && a > b) ? a : 0.0); };
+        const V plus = total(map2(up, down, directional), 14);
+        const V minus = total(map2(down, up, directional), 14);
+        const V pdi = div(scale(plus, 100.0), moving), mdi = div(scale(minus, 100.0), moving);
+        if (name == "dmi_pdi") return pdi;
+        if (name == "dmi_mdi") return mdi;
+        const V adx = ma(scale(div(absv(sub(mdi, pdi)), add(mdi, pdi)), 100.0), 6);
+        if (name == "dmi_adx") return adx;
+        return scale(add(adx, ref(adx, 6)), 0.5);
+    }
+    if (name == "dpo" || name == "madpo") {
+        const V dpo = sub(c, ref(ma(c, 20), 10));
+        return over_close(name == "dpo" ? dpo : ma(dpo, 6), c);
+    }
+    if (name.rfind("ema_", 0) == 0) return rel_close(ema(c, std::stoi(name.substr(4))), c);
+    if (name == "emv" || name == "maemv") {
+        const V hl = add(h, l), range = sub(h, l);
+        const V ratio = div(ma(v, 14), v);
+        const V mid = div(scale(sub(hl, ref(hl, 1)), 100.0), hl);
+        const V emv = ma(div(mul(mul(mid, ratio), range), ma(range, 14)), 14);
+        return name == "emv" ? emv : ma(emv, 9);
+    }
+    if (name == "expma_12") return rel_close(ema(c, 12), c);
+    if (name == "expma_50") return rel_close(ema(c, 50), c);
+    if (name == "kdj_k" || name == "kdj_d" || name == "kdj") {
+        const V low = llv(l, 9);
+        const V rsv = scale(div(sub(c, low), sub(hhv(h, 9), low)), 100.0);
+        const V k = sma(rsv, 3, 1);
+        if (name == "kdj_k") return k;
+        const V d = sma(k, 3, 1);
+        if (name == "kdj_d") return d;
+        return sub(scale(k, 3.0), scale(d, 2.0));
+    }
+    if (name.rfind("ktn_", 0) == 0) {
+        const V mid = ema(typical, 20), width = scale(ema(tr, 10), 2.0);
+        if (name == "ktn_mid") return rel_close(mid, c);
+        return rel_close(name == "ktn_upper" ? add(mid, width) : sub(mid, width), c);
+    }
+    if (name.rfind("ma_", 0) == 0 && name != "ma_mass") return rel_close(ma(c, std::stoi(name.substr(3))), c);
+    if (name == "macd_dif" || name == "macd_dea" || name == "macd") {
+        const V dif = sub(ema(c, 12), ema(c, 26));
+        if (name == "macd_dif") return over_close(dif, c);
+        const V dea = ema(dif, 9);
+        if (name == "macd_dea") return over_close(dea, c);
+        return over_close(scale(sub(dif, dea), 2.0), c);
+    }
+    if (name == "mass" || name == "ma_mass") {
+        const V range = ma(sub(h, l), 9);
+        const V mass = total(div(range, ma(range, 9)), 25);
+        return name == "mass" ? mass : ma(mass, 6);
+    }
+    if (name == "mfi") {
+        const V previous = ref(typical, 1);
+        V in(m), out(m);
+        for (size_t i = 0; i < m; ++i) {
+            const double flow = typical[i] * v[i];
+            const bool known = previous[i] == previous[i];
+            in[i] = known ? (typical[i] > previous[i] ? flow : 0.0) : NaN;
+            out[i] = known ? (typical[i] < previous[i] ? flow : 0.0) : NaN;
+        }
+        const V ratio = div(total(in, 14), total(out, 14));
+        return map1(ratio, [](double r) { return 100.0 - 100.0 / (1.0 + r); });
+    }
+    if (name == "mtm" || name == "mtmma") {
+        const V momentum = sub(c, ref(c, 12));
+        return over_close(name == "mtm" ? momentum : ma(momentum, 6), c);
+    }
+    if (name == "obv") {
+        V line(m);
+        double running = 0.0;
+        for (size_t i = 0; i < m; ++i) {
+            const double d = change[i];
+            if (d == d) running += (d > 0 ? 1.0 : (d < 0 ? -1.0 : 0.0)) * v[i];
+            line[i] = running;
+        }
+        return div(sub(line, ref(line, 20)), total(v, 20));
+    }
+    if (name == "psy" || name == "psyma") {
+        const V up = map1(change, [](double d) { return d != d ? NaN : (d > 0 ? 1.0 : 0.0); });
+        const V psy = scale(total(up, 12), 100.0 / 12.0);
+        return name == "psy" ? psy : ma(psy, 6);
+    }
+    if (name == "roc" || name == "maroc") {
+        const V base = ref(c, 12);
+        const V roc = div(scale(sub(c, base), 100.0), base);
+        return name == "roc" ? roc : ma(roc, 6);
+    }
+    if (name.rfind("rsi_", 0) == 0) {
+        const int n = std::stoi(name.substr(4));
+        return scale(div(sma(clip0(change), n, 1), sma(absv(change), n, 1)), 100.0);
+    }
+    if (name.rfind("taq_", 0) == 0) {
+        const V top = hhv(h, 20), bottom = llv(l, 20);
+        if (name == "taq_up") return rel_close(top, c);
+        if (name == "taq_down") return rel_close(bottom, c);
+        return rel_close(scale(add(top, bottom), 0.5), c);
+    }
+    if (name == "trix" || name == "trma") {
+        const V triple = ema(ema(ema(c, 12), 12), 12);
+        const V previous = ref(triple, 1);
+        const V trix = div(scale(sub(triple, previous), 100.0), previous);
+        return name == "trix" ? trix : ma(trix, 20);
+    }
+    if (name == "vr") {
+        auto part = [&](int sign) {
+            return map2(change, v, [sign](double d, double vol) {
+                if (d != d) return NaN;
+                return (sign > 0 ? d > 0 : (sign < 0 ? d < 0 : d == 0)) ? vol : 0.0;
+            });
+        };
+        const V up = total(part(1), 26), down = total(part(-1), 26), flat = total(part(0), 26);
+        return div(scale(add(scale(up, 2.0), flat), 100.0), add(scale(down, 2.0), flat));
+    }
+    if (name == "wr" || name == "wr1") {
+        const int n = name == "wr" ? 10 : 6;
+        const V top = hhv(h, n);
+        return div(scale(sub(top, c), 100.0), sub(top, llv(l, n)));
+    }
+    const V weighted = scale(add(add(scale(c, 2.0), h), l), 0.25);
+    if (name == "xsii_td1") return rel_close(scale(ma(weighted, 5), 102.0 / 100.0), c);
+    if (name == "xsii_td3") {
+        const V ma20 = ma(c, 20);
+        return rel_close(scale(dma(c, div(absv(sub(weighted, ma20)), ma20)), 1.0 + 7.0 / 100.0), c);
+    }
+    if (name == "updays") return streak(map1(change, [](double d) { return d > 0 ? 1.0 : 0.0; }));
+    if (name == "downdays") return streak(map1(change, [](double d) { return d < 0 ? 1.0 : 0.0; }));
+    if (name == "topdays") return range_days(h, true);
+    if (name == "lowdays") return range_days(l, false);
+    return V(m, NaN);
+}
+}  // namespace rq_tst
+"""
+
+
+class TushareTechLibrary(FactorLibrary):
+    """Tushare stk_factor_pro technical indicators, evaluated in KunQuant over every stock's own trading days."""
 
     family = "tushare_tech"
     required_inputs = FIELDS
+    quote_fields = FIELDS
+    strict_float = True
+    cpp_prelude = CPP_PRELUDE
 
     @property
     def specs(self) -> tuple[FactorSpec, ...]:
@@ -121,268 +474,27 @@ class TushareTechLibrary(PanelFactorLibrary):
                 ordinal=ordinal,
                 formula=description,
                 max_lookback=lookback + 1,
-                implementation=f"rquant.factors.libraries.tushare_tech.stock_indicators.{name}",
-                catalog_version=1,
+                implementation=f"rquant.factors.libraries.tushare_tech.CPP_PRELUDE.{name}",
+                catalog_version=2,
             )
             for ordinal, (name, description, lookback) in enumerate(TUSHARE_TECH, 1)
         )
 
-    def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
-        close = inputs["close"]
-        buffers = {name: np.empty(close.shape) for name in TUSHARE_TECH_NAMES}
-        self._calculate_columns(inputs, lambda name, columns, values: buffers[name].__setitem__(
-            (slice(None), columns), values))
-        return {name: Panel(buffers[name], index=close.index, columns=close.columns) for name in TUSHARE_TECH_NAMES}
-
-    def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
-        canonical = {spec.source_name: spec.canonical_name for spec in self.specs}
-
-        def store(name: str, columns: slice, values: np.ndarray) -> None:
-            output_buffers[canonical[name]][:, columns] = values
-
-        self._calculate_columns(inputs, store)
-
-    def _calculate_columns(self, inputs: Mapping[str, Any], store: Callable[[str, slice, np.ndarray], None]) -> None:
-        """Compute blocks of instruments at a time, so writes to a date-major store stay mostly contiguous."""
-        panels = {field: np.asarray(inputs[field], dtype=float) for field in FIELDS}
-        dates, stocks = panels["close"].shape
-        for first in range(0, stocks, INSTRUMENT_BLOCK):
-            columns = slice(first, min(first + INSTRUMENT_BLOCK, stocks))
-            width = columns.stop - columns.start
-            block = {name: np.full((dates, width), np.nan) for name in TUSHARE_TECH_NAMES}
-            for offset in range(width):
-                column = first + offset
-                quoted = np.isfinite(np.column_stack([panels[field][:, column] for field in FIELDS])).all(axis=1)
-                rows = np.flatnonzero(quoted)
-                if not len(rows):
-                    continue
-                arrays = {field: panels[field][rows, column] for field in FIELDS}
-                for name, values in stock_indicators(arrays).items():
-                    block[name][rows, offset] = values
-            for name in TUSHARE_TECH_NAMES:
-                store(name, columns, block[name])
+    def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        fields = [inputs[field] for field in FIELDS]
+        return {name: k.series_kernel(fields, _kernel(name)) for name in TUSHARE_TECH_NAMES}
 
 
-# ---------------------------------------------------------------------------------------------- formula operators
-def ref(x: Series, n: int) -> Series:
-    return x.shift(n)
-
-
-def ma(x: Series, n: int) -> Series:
-    return x.rolling(n, min_periods=n).mean()
-
-
-def total(x: Series, n: int) -> Series:
-    return x.rolling(n, min_periods=n).sum()
-
-
-def hhv(x: Series, n: int) -> Series:
-    return x.rolling(n, min_periods=n).max()
-
-
-def llv(x: Series, n: int) -> Series:
-    return x.rolling(n, min_periods=n).min()
-
-
-def ema(x: Series, n: int) -> Series:
-    return x.ewm(alpha=2.0 / (n + 1.0), adjust=False).mean()
-
-
-def sma(x: Series, n: int, m: int) -> Series:
-    return x.ewm(alpha=m / n, adjust=False).mean()
-
-
-def avedev(x: Series, n: int) -> Series:
-    """Mean absolute deviation from the window mean."""
-    values = x.to_numpy(dtype=float)
-    out = np.full(len(values), np.nan)
-    if len(values) >= n:
-        windows = np.lib.stride_tricks.sliding_window_view(values, n)
-        out[n - 1 :] = np.abs(windows - windows.mean(axis=1, keepdims=True)).mean(axis=1)
-    return Series(out, index=x.index)
-
-
-def dma(x: Series, weight: Series) -> Series:
-    """Dynamic moving average ``Y = A X + (1 - A) Y'`` with a per-row weight; starts at the first known row."""
-    values = x.to_numpy(dtype=float)
-    weights = weight.to_numpy(dtype=float)
-    out = np.full(len(values), np.nan)
-    previous = np.nan
-    for row in range(len(values)):
-        if np.isfinite(weights[row]) and np.isfinite(values[row]):
-            blended = weights[row] * values[row] + (1.0 - weights[row]) * previous
-            previous = values[row] if np.isnan(previous) else blended
-        out[row] = previous
-    return Series(out, index=x.index)
-
-
-def streak(condition: np.ndarray) -> np.ndarray:
-    """Length of the run of true values ending on every row."""
-    out = np.zeros(len(condition))
-    run = 0.0
-    for row, value in enumerate(condition):
-        run = run + 1.0 if value else 0.0
-        out[row] = run
-    return out
-
-
-def range_days(values: np.ndarray, higher: bool) -> np.ndarray:
-    """Quotes back to the last value above (or below) today's, or since the first quote when there is none."""
-    out = np.zeros(len(values))
-    stack: list[int] = []
-    for row, value in enumerate(values):
-        while stack and ((values[stack[-1]] <= value) if higher else (values[stack[-1]] >= value)):
-            stack.pop()
-        out[row] = row - stack[-1] - 1 if stack else row
-        stack.append(row)
-    return out
-
-
-def stock_indicators(arrays: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Every published indicator for one stock's consecutive quotes."""
-    o, h, l, c, v = (Series(arrays[field], dtype=float) for field in FIELDS)  # noqa: E741
-    lc = ref(c, 1)
-    out: dict[str, Series] = {}
-
-    aa = (h - lc).abs()
-    bb = (l - lc).abs()
-    cc = (h - ref(l, 1)).abs()
-    dd = (lc - ref(o, 1)).abs()
-    swing_range = np.where((aa > bb) & (aa > cc), aa + bb / 2 + dd / 4,
-                           np.where((bb > cc) & (bb > aa), bb + aa / 2 + dd / 4, cc + dd / 4))
-    x = c - lc + (c - o) / 2 + lc - ref(o, 1)
-    si = 16 * x / Series(swing_range).where(lambda r: r > 0) * np.maximum(aa, bb)
-    asi = total(si, 26)
-    out["asi"] = asi / c
-    out["asit"] = ma(asi, 10) / c
-
-    true_range = pd.concat([h - l, (lc - h).abs(), (lc - l).abs()], axis=1).max(axis=1, skipna=False)
-    out["atr"] = ma(true_range, 20) / c
-    out["bbi"] = (ma(c, 3) + ma(c, 6) + ma(c, 12) + ma(c, 24)) / 4 / c - 1
-    for name, n in (("bias1", 6), ("bias2", 12), ("bias3", 24)):
-        mean = ma(c, n)
-        out[name] = (c - mean) / mean * 100
-    mid = ma(c, 20)
-    spread = c.rolling(20, min_periods=20).std(ddof=0)
-    out["boll_upper"] = (mid + 2 * spread) / c - 1
-    out["boll_lower"] = (mid - 2 * spread) / c - 1
-    out["brar_ar"] = total(h - o, 26) / total(o - l, 26) * 100
-    out["brar_br"] = total((h - lc).clip(lower=0), 26) / total((lc - l).clip(lower=0), 26) * 100
-
-    typical = (h + l + c) / 3
-    out["cci"] = (typical - ma(typical, 14)) / (0.015 * avedev(typical, 14))
-    prior_mid = ref(h + l, 1) / 2
-    out["cr"] = total((h - prior_mid).clip(lower=0), 20) / total((prior_mid - l).clip(lower=0), 20) * 100
-    dif = ma(c, 10) - ma(c, 50)
-    out["dfma_dif"] = dif / c
-    out["dfma_difma"] = ma(dif, 10) / c
-
-    moving_range = total(true_range, 14)
-    up_move = h - ref(h, 1)
-    down_move = ref(l, 1) - l
-    plus = total(up_move.where((up_move > 0) & (up_move > down_move), 0.0).where(up_move.notna()), 14)
-    minus = total(down_move.where((down_move > 0) & (down_move > up_move), 0.0).where(down_move.notna()), 14)
-    pdi = plus * 100 / moving_range
-    mdi = minus * 100 / moving_range
-    adx = ma((mdi - pdi).abs() / (mdi + pdi) * 100, 6)
-    out["dmi_pdi"] = pdi
-    out["dmi_mdi"] = mdi
-    out["dmi_adx"] = adx
-    out["dmi_adxr"] = (adx + ref(adx, 6)) / 2
-    dpo = c - ref(ma(c, 20), 10)
-    out["dpo"] = dpo / c
-    out["madpo"] = ma(dpo, 6) / c
-    for n in MOVING_AVERAGES:
-        out[f"ema_{n}"] = ema(c, n) / c - 1
-
-    hl = h + l
-    volume_ratio = ma(v, 14) / v
-    mid_move = 100 * (hl - ref(hl, 1)) / hl
-    emv = ma(mid_move * volume_ratio * (h - l) / ma(h - l, 14), 14)
-    out["emv"] = emv
-    out["maemv"] = ma(emv, 9)
-    out["expma_12"] = ema(c, 12) / c - 1
-    out["expma_50"] = ema(c, 50) / c - 1
-
-    rsv = (c - llv(l, 9)) / (hhv(h, 9) - llv(l, 9)) * 100
-    k = sma(rsv, 3, 1)
-    d = sma(k, 3, 1)
-    out["kdj_k"] = k
-    out["kdj_d"] = d
-    out["kdj"] = 3 * k - 2 * d
-    keltner = ema(typical, 20)
-    keltner_range = ema(true_range, 10)
-    out["ktn_upper"] = (keltner + 2 * keltner_range) / c - 1
-    out["ktn_mid"] = keltner / c - 1
-    out["ktn_down"] = (keltner - 2 * keltner_range) / c - 1
-    for n in MOVING_AVERAGES:
-        out[f"ma_{n}"] = ma(c, n) / c - 1
-
-    macd_dif = ema(c, 12) - ema(c, 26)
-    macd_dea = ema(macd_dif, 9)
-    out["macd_dif"] = macd_dif / c
-    out["macd_dea"] = macd_dea / c
-    out["macd"] = 2 * (macd_dif - macd_dea) / c
-    range_ma = ma(h - l, 9)
-    mass = total(range_ma / ma(range_ma, 9), 25)
-    out["mass"] = mass
-    out["ma_mass"] = ma(mass, 6)
-    flow = typical * v
-    rising = typical > ref(typical, 1)
-    falling = typical < ref(typical, 1)
-    known = ref(typical, 1).notna()
-    flow_ratio = total(flow.where(rising, 0.0).where(known), 14) / total(flow.where(falling, 0.0).where(known), 14)
-    out["mfi"] = 100 - 100 / (1 + flow_ratio)
-    momentum = c - ref(c, 12)
-    out["mtm"] = momentum / c
-    out["mtmma"] = ma(momentum, 6) / c
-
-    change = c - lc
-    direction = np.sign(change).where(change.notna())
-    obv = (direction * v).fillna(0.0).cumsum()
-    traded = total(v, FLOW_DAYS)
-    out["obv"] = (obv - ref(obv, FLOW_DAYS)) / traded
-    up_days = (change > 0).astype(float).where(change.notna())
-    psy = total(up_days, 12) / 12 * 100
-    out["psy"] = psy
-    out["psyma"] = ma(psy, 6)
-    roc = 100 * (c - ref(c, 12)) / ref(c, 12)
-    out["roc"] = roc
-    out["maroc"] = ma(roc, 6)
-    for n in (6, 12, 24):
-        out[f"rsi_{n}"] = sma(change.clip(lower=0), n, 1) / sma(change.abs(), n, 1) * 100
-
-    top = hhv(h, 20)
-    bottom = llv(l, 20)
-    out["taq_up"] = top / c - 1
-    out["taq_mid"] = (top + bottom) / 2 / c - 1
-    out["taq_down"] = bottom / c - 1
-    triple = ema(ema(ema(c, 12), 12), 12)
-    trix = (triple - ref(triple, 1)) / ref(triple, 1) * 100
-    out["trix"] = trix
-    out["trma"] = ma(trix, 20)
-    up_volume = total(v.where(change > 0, 0.0).where(change.notna()), 26)
-    down_volume = total(v.where(change < 0, 0.0).where(change.notna()), 26)
-    flat_volume = total(v.where(change == 0, 0.0).where(change.notna()), 26)
-    out["vr"] = 100 * (2 * up_volume + flat_volume) / (2 * down_volume + flat_volume)
-    for name, n in (("wr", 10), ("wr1", 6)):
-        out[name] = 100 * (hhv(h, n) - c) / (hhv(h, n) - llv(l, n))
-
-    weighted = (2 * c + h + l) / 4
-    out["xsii_td1"] = ma(weighted, 5) * 102 / 100 / c - 1
-    ma20 = ma(c, 20)
-    out["xsii_td3"] = (1 + 7 / 100) * dma(c, (weighted - ma20).abs() / ma20) / c - 1
-
-    out["updays"] = Series(streak((change > 0).to_numpy()))
-    out["downdays"] = Series(streak((change < 0).to_numpy()))
-    out["topdays"] = Series(range_days(h.to_numpy(), higher=True))
-    out["lowdays"] = Series(range_days(l.to_numpy(), higher=False))
-
-    count = len(c)
-    result: dict[str, np.ndarray] = {}
-    for name in TUSHARE_TECH_NAMES:
-        values = np.asarray(out[name], dtype=float)
-        values = np.where(np.isfinite(values), values, np.nan)
-        values[: min(count, LOOKBACK[name])] = np.nan
-        result[name] = values
-    return result
+def _kernel(name: str) -> str:
+    """C++ body publishing one indicator over a stock's quotes, which the engine has moved to the top rows."""
+    return f"""
+        int m = 0;
+        while (m < n && std::isfinite(x0[m]) && std::isfinite(x1[m]) && std::isfinite(x2[m]) && std::isfinite(x3[m])
+               && std::isfinite(x4[m])) ++m;
+        if (m > 0) {{
+            const rq_tst::V o(x0, x0 + m), h(x1, x1 + m), l(x2, x2 + m), c(x3, x3 + m), v(x4, x4 + m);
+            const rq_tst::V values = rq_tst::indicator("{name}", o, h, l, c, v);
+            for (int t = 0; t < m; ++t) {{
+                out[t] = t < {LOOKBACK[name]} || !std::isfinite(values[t]) ? rq_tst::NaN : values[t];
+            }}
+        }}"""

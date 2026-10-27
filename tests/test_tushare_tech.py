@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from rquant.factors.catalog import get_catalog
-from rquant.factors.libraries.tushare_tech import (
-    TUSHARE_TECH_NAMES,
-    TushareTechLibrary,
-    range_days,
-    stock_indicators,
-)
+from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine, cpp_compiler_available
+from rquant.factors.libraries.tushare_tech import TUSHARE_TECH_NAMES, TushareTechLibrary
 
-VOLUME_SCALED = ("obv",)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from panel_reference.tushare_tech import TushareTechReference, range_days, stock_indicators  # noqa: E402
+
+KUNQUANT_READY = importlib.util.find_spec("KunQuant") is not None and cpp_compiler_available()
 
 
 def synthetic_bars(days: int = 500, stocks: int = 5, seed: int = 9) -> dict[str, pd.DataFrame]:
@@ -48,12 +51,43 @@ class TushareTechCatalogTests(unittest.TestCase):
         for dropped in ("boll_mid", "xsii_td2", "xsii_td4"):
             self.assertNotIn(dropped, TUSHARE_TECH_NAMES)
 
+    def test_library_runs_on_kunquant_over_each_stocks_quotes(self) -> None:
+        library = TushareTechLibrary()
+        self.assertEqual("kunquant", library.backend)
+        self.assertEqual(("open", "high", "low", "close", "volume"), library.quote_fields)
 
+
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class TushareTechCalculationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+        cls.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.engine = KunQuantFactorEngine(cls.temporary.name, FactorBuildConfig(factor_set="tushare_tech", workers=2))
+        cls.module = cls.engine.compile()
         cls.inputs = synthetic_bars()
-        cls.outputs = TushareTechLibrary().calculate(cls.inputs)
+        cls.outputs = cls.calculate(cls.inputs)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    @classmethod
+    def calculate(cls, inputs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """KunQuant outputs by source name, as panels shaped like the inputs."""
+        output = cls.engine.run({field: panel.to_numpy() for field, panel in inputs.items()}, module=cls.module)
+        close = inputs["close"]
+        return {
+            spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
+            for spec in TushareTechLibrary().specs
+        }
+
+    # Break caught: a KunQuant kernel whose window, recursion or missing-value rule drifts from the pandas reference.
+    def test_every_indicator_matches_the_pandas_reference(self) -> None:
+        expected = TushareTechReference().calculate(self.inputs)
+        for name in TUSHARE_TECH_NAMES:
+            np.testing.assert_allclose(self.outputs[name].to_numpy(), expected[name].to_numpy(), rtol=1e-9,
+                                       atol=1e-12, equal_nan=True, err_msg=name)
 
     def test_all_outputs_are_aligned_populated_and_missing_without_a_quote(self) -> None:
         close = self.inputs["close"]
@@ -68,7 +102,7 @@ class TushareTechCalculationTests(unittest.TestCase):
     # Break caught: any indicator that reads a later quote than the row it is published on.
     def test_no_indicator_uses_information_after_its_row(self) -> None:
         last = self.inputs["close"].index[300]
-        past = TushareTechLibrary().calculate({field: panel.loc[:last] for field, panel in self.inputs.items()})
+        past = self.calculate({field: panel.loc[:last] for field, panel in self.inputs.items()})
         for name in TUSHARE_TECH_NAMES:
             np.testing.assert_allclose(past[name].to_numpy(), self.outputs[name].loc[:last].to_numpy(), rtol=1e-9,
                                        atol=1e-12, equal_nan=True, err_msg=name)
@@ -76,9 +110,9 @@ class TushareTechCalculationTests(unittest.TestCase):
     # Break caught: an output in price units, which would change with each stock's arbitrary adjustment level.
     def test_outputs_do_not_depend_on_the_price_level(self) -> None:
         scaled = {field: panel * (7.5 if field != "volume" else 1.0) for field, panel in self.inputs.items()}
-        rescaled = TushareTechLibrary().calculate(scaled)
+        rescaled = self.calculate(scaled)
         volume = {field: panel * (3.0 if field == "volume" else 1.0) for field, panel in self.inputs.items()}
-        revolumed = TushareTechLibrary().calculate(volume)
+        revolumed = self.calculate(volume)
         for name in TUSHARE_TECH_NAMES:
             np.testing.assert_allclose(rescaled[name].to_numpy(), self.outputs[name].to_numpy(), rtol=1e-7,
                                        atol=1e-9, equal_nan=True, err_msg=name)
