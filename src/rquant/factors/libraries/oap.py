@@ -41,8 +41,8 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -51,15 +51,20 @@ import pandas as pd
 
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS
 from rquant.errors import DataContractError
-from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.libraries.china_chars import (
-    QuarterGrid,
-    lag,
-    nan_mean,
+from rquant.factors.extensions import kunquant_oap as op
+from rquant.factors.extensions import kunquant_oap_regression as regression_op
+from rquant.factors.extensions.kunquant_oap import (
+    cross_bucket,
+    cross_rank,
+    cross_residual,
+    g,
+    group_rank,
+    group_stat,
     ratio,
-    rolling_quarter_std,
-    rolling_regression,
 )
+from rquant.factors.libraries.base import FactorLibrary, FactorSpec
+from rquant.factors.libraries.china_chars import CPP_PRELUDE as CNC_PRELUDE
+from rquant.factors.statements import QuarterGrid
 from rquant.io import sha256_file, stable_hash
 
 Panel = pd.DataFrame
@@ -126,15 +131,40 @@ OPTIONAL_LINES = ("rd_exp",)
 # statement was published for that quarter.
 ZERO_FILL = {
     "total_assets": (
-        "money_cap", "trad_asset", "lt_eqt_invest", "fa_avail_for_sale", "htm_invest", "accounts_receiv",
-        "notes_receiv", "inventories", "fix_assets", "intan_assets", "goodwill", "st_borr", "non_cur_liab_due_1y",
-        "lt_borr", "bond_payable", "acct_payable", "notes_payable", "taxes_payable", "defer_tax_liab",
-        "oth_eqt_tools_p_shr", "minority_int", "prepayment", "oth_receiv",
+        "money_cap",
+        "trad_asset",
+        "lt_eqt_invest",
+        "fa_avail_for_sale",
+        "htm_invest",
+        "accounts_receiv",
+        "notes_receiv",
+        "inventories",
+        "fix_assets",
+        "intan_assets",
+        "goodwill",
+        "st_borr",
+        "non_cur_liab_due_1y",
+        "lt_borr",
+        "bond_payable",
+        "acct_payable",
+        "notes_payable",
+        "taxes_payable",
+        "defer_tax_liab",
+        "oth_eqt_tools_p_shr",
+        "minority_int",
+        "prepayment",
+        "oth_receiv",
     ),
     "revenue": ("sell_exp", "admin_exp", "fin_exp_int_exp"),
     "n_cashflow_act": (
-        "depr_fa_coga_dpba", "amort_intang_assets", "lt_amort_deferred_exp", "c_recp_cap_contrib", "c_recp_borrow",
-        "proc_issue_bonds", "c_prepay_amt_borr", "c_pay_acq_const_fiolta",
+        "depr_fa_coga_dpba",
+        "amort_intang_assets",
+        "lt_amort_deferred_exp",
+        "c_recp_cap_contrib",
+        "c_recp_borrow",
+        "proc_issue_bonds",
+        "c_prepay_amt_borr",
+        "c_pay_acq_const_fiolta",
     ),
 }
 
@@ -205,8 +235,12 @@ OAP: tuple[tuple[str, str, str, int], ...] = (
     ("EntMult", "accounting", "enterprise value over trailing EBITDA", 1),
     ("CashProd", "accounting", "market value minus total assets, over cash", 1),
     ("PayoutYield", "accounting", "trailing dividends over market value six months ago", 6 * MONTH),
-    ("NetPayoutYield", "accounting", "trailing dividends minus equity issuance over market value six months ago",
-     6 * MONTH),
+    (
+        "NetPayoutYield",
+        "accounting",
+        "trailing dividends minus equity issuance over market value six months ago",
+        6 * MONTH,
+    ),
     ("EquityDuration", "accounting", "Dechow-Sloan-Soliman implied equity duration", 1),
     ("IntanBM", "accounting", "residual of 5-year return on lagged log BM and its book return", 5 * YEAR),
     ("IntanCFP", "accounting", "residual of 5-year return on lagged log CF/P and its cash-flow return", 5 * YEAR),
@@ -289,8 +323,7 @@ OAP: tuple[tuple[str, str, str, int], ...] = (
     ("DivInit", "event", "1 if a dividend in the past six months after none in the prior eighteen", 2 * YEAR),
     ("DivOmit", "event", "1 if a two-year payer stopped paying in the past two months", 2 * YEAR),
     ("DivSeason", "event", "1 if a payer's dividend changed 11-12 months ago, 0 for other payers", YEAR),
-    ("DivYieldST", "event", "binned trailing dividend yield when a payment is due within a month, payers only",
-     YEAR),
+    ("DivYieldST", "event", "binned trailing dividend yield when a payment is due within a month, payers only", YEAR),
 )
 OAP_NAMES = tuple(name for name, _, _, _ in OAP)
 
@@ -299,17 +332,58 @@ _ANALYST = "needs IBES analyst forecasts or recommendations, which Tushare does 
 _HOLDINGS = "needs 13F institutional holdings; Chinese fund holdings are semi-annual and not synced"
 _OPTIONS = "needs single-stock option prices; A shares have no listed single-stock options"
 OAP_SKIPPED: dict[str, str] = {
-    **{name: _ANALYST for name in (
-        "AnalystRevision", "ChangeInRecommendation", "ChForecastAccrual", "ChNAnalyst", "CredRatDG",
-        "EarningsForecastDisparity", "ExclExp", "FEPS", "fgr5yrLag", "ForecastDispersion", "Recomm_ShortInterest",
-        "REV6", "sfe", "AnalystValue", "AOP", "ConsRecomm", "DownRecomm", "UpRecomm", "EarningsStreak",
-        "PredictedFE")},
-    **{name: _HOLDINGS for name in (
-        "Activism1", "Activism2", "DelBreadth", "RIO_Disp", "RIO_MB", "RIO_Turnover", "RIO_Volatility",
-        "IO_ShortInterest")},
-    **{name: _OPTIONS for name in (
-        "CPVolSpread", "dVolCall", "dVolPut", "dCPVolSpread", "OptionVolume1", "OptionVolume2", "RIVolSpread",
-        "SmileSlope", "skew1")},
+    **{
+        name: _ANALYST
+        for name in (
+            "AnalystRevision",
+            "ChangeInRecommendation",
+            "ChForecastAccrual",
+            "ChNAnalyst",
+            "CredRatDG",
+            "EarningsForecastDisparity",
+            "ExclExp",
+            "FEPS",
+            "fgr5yrLag",
+            "ForecastDispersion",
+            "Recomm_ShortInterest",
+            "REV6",
+            "sfe",
+            "AnalystValue",
+            "AOP",
+            "ConsRecomm",
+            "DownRecomm",
+            "UpRecomm",
+            "EarningsStreak",
+            "PredictedFE",
+        )
+    },
+    **{
+        name: _HOLDINGS
+        for name in (
+            "Activism1",
+            "Activism2",
+            "DelBreadth",
+            "RIO_Disp",
+            "RIO_MB",
+            "RIO_Turnover",
+            "RIO_Volatility",
+            "IO_ShortInterest",
+        )
+    },
+    **{
+        name: _OPTIONS
+        for name in (
+            "CPVolSpread",
+            "dVolCall",
+            "dVolPut",
+            "dCPVolSpread",
+            "OptionVolume1",
+            "OptionVolume2",
+            "RIVolSpread",
+            "SmileSlope",
+            "skew1",
+        )
+    },
     "BetaLiquidityPS": "needs the Pastor-Stambaugh aggregate liquidity innovation series",
     "betaVIX": "needs a daily implied-volatility index; China's iVIX stopped in 2018",
     "CitationsRD": "needs patent citation data",
@@ -358,7 +432,7 @@ RELEASE_AFTER = {
 REQUIRED_LINES = tuple(sorted({line for lines in ITEMS.values() for line in lines} - set(OPTIONAL_LINES)))
 
 
-class OAPLibrary(PanelFactorLibrary):
+class OAPLibrary(FactorLibrary):
     """Open Source Asset Pricing predictors re-implemented on Tushare data."""
 
     family = "oap"
@@ -383,11 +457,12 @@ class OAPLibrary(PanelFactorLibrary):
     @property
     def implementation_fingerprint(self) -> str:
         """Also pin the shared statement grid and the statement fields, which live in other modules."""
-        shared = importlib.import_module("rquant.factors.libraries.china_chars")
         return stable_hash(
             {
                 "module": super().implementation_fingerprint,
-                "quarter_grid": inspect.getsource(shared),
+                "quarter_grid": inspect.getsource(importlib.import_module("rquant.factors.statements")),
+                "compiled_prelude": self.cpp_prelude,
+                "shared_operators": inspect.getsource(op.k),
                 "statement_fields": {name: list(fields) for name, fields in FUNDAMENTAL_ENDPOINT_FIELDS.items()},
             }
         )
@@ -454,20 +529,65 @@ class OAPLibrary(PanelFactorLibrary):
             "oap_fundamentals": files["fundamentals.parquet"],
             "oap_stock_basic": stock_basic_hash,
         }
-        return inputs, hashes
+        return self.align_reference_inputs(inputs, dates, instruments), hashes
 
-    def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
-        calculator = OAPSignals(inputs)
-        return {name: calculator.calculate(name) for name in OAP_NAMES}
+    strict_float = True
+    compile_split_source = 64
+    cpp_prelude = CNC_PRELUDE + op.CPP_PRELUDE + regression_op.CPP_PRELUDE
+    statement_fields = (*sorted({line for lines in ITEMS.values() for line in lines}), "oap_year")
 
-    def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
-        calculator = OAPSignals(inputs)
-        for spec in self.specs:
-            output_buffers[spec.canonical_name][...] = calculator.calculate(spec.source_name).to_numpy(dtype=float)
-            calculator.release(spec.source_name)
+    @property
+    def statement_outputs(self):
+        return tuple(_definitions()[1])
+
+    @property
+    def reference_inputs(self):
+        return (*DAILY_REFERENCE, *self.statement_outputs)
+
+    def prepare_statements(self, fundamentals):
+        frame = prepare_fundamentals(fundamentals)
+        frame["oap_year"] = pd.to_datetime(frame["end_date"]).dt.year
+        if "rd_exp" not in frame:
+            frame["rd_exp"] = np.nan
+        return frame
+
+    def align_reference_inputs(self, inputs, dates, instruments):
+        dates, instruments = pd.DatetimeIndex(dates), pd.Index(instruments)
+        result = dict(inputs)
+        grid = QuarterGrid(self.prepare_statements(inputs["fundamentals"]), dates, instruments)
+        numbers = np.arange(grid.quarters) + grid.first_quarter
+        ends = pd.to_datetime([f"{n // 4}-{(n % 4) * 3 + 3:02d}-01" for n in numbers]) + pd.offsets.MonthEnd(0)
+        rows = np.searchsorted(dates.to_numpy(), ends.to_numpy(), side="right") - 1
+        result["quarter_end_row"] = grid.gather(np.broadcast_to(rows[:, None], (grid.quarters, len(instruments))))
+        december = pd.to_datetime([f"{year - 1}-12-31" for year in dates.year])
+        result["december_row"] = pd.Series(
+            np.searchsorted(dates.to_numpy(), december.to_numpy(), side="right") - 1, index=dates
+        )
+        epoch = np.datetime64("1970-01-01", "D")
+        result["calendar_day"] = pd.Series(
+            (dates.to_numpy().astype("datetime64[D]") - epoch).astype(float), index=dates
+        )
+        listed = pd.to_datetime(pd.Series(inputs["list_date"]).reindex(instruments)).to_numpy().astype("datetime64[D]")
+        days = np.where(np.isnat(listed), np.nan, (listed - epoch).astype(float))
+        result["listed_day"] = np.broadcast_to(days, (len(dates), len(instruments))).copy()
+        frame = inputs["fundamentals"]
+        rows = np.searchsorted(dates.to_numpy(), pd.to_datetime(frame["ann_date"]).to_numpy()) + 2
+        cols = instruments.get_indexer(frame["instrument"])
+        keep = (cols >= 0) & (rows < len(dates))
+        announced = np.full((len(dates), len(instruments)), np.nan)
+        announced[rows[keep], cols[keep]] = 1
+        result["announced"] = announced
+        return result
+
+    def build_statements(self, inputs):
+        memo = {}
+        return {name: op.lower(expr, inputs, memo) for name, expr in _definitions()[1].items()}
+
+    def build(self, inputs):
+        memo = {}
+        return {name: op.lower(expr, inputs, memo) for name, expr in _definitions()[0].items()}
 
 
-# ---------------------------------------------------------------------------------------------- array helpers
 def prepare_fundamentals(fundamentals: pd.DataFrame) -> pd.DataFrame:
     """Zero-fill lines a published statement leaves blank."""
     frame = fundamentals.copy()
@@ -480,290 +600,126 @@ def prepare_fundamentals(fundamentals: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def positive(values: Any) -> Any:
-    return np.where(values > 0, values, np.nan)
+DAILY_REFERENCE = (
+    *("basic_" + name for name in OAP_DAILY_BASIC),
+    *MARKET_FACTORS,
+    "universe",
+    "calendar_day",
+    "listed_day",
+    "announced",
+    "quarter_end_row",
+    "december_row",
+)
+lag = shift_rows = op.shift
+trailing = op.trailing
 
 
-def safe_log(values: Any) -> Any:
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.log(positive(values))
+def rolling_quarter_std(value, window, minimum):
+    return trailing(value, window, minimum, "std")
 
 
-def finite_or(values: np.ndarray, fill: float) -> np.ndarray:
-    return np.where(np.isfinite(values), values, fill)
+quarter_window = op.mean_lags
 
 
-def flag(condition: np.ndarray, known: np.ndarray) -> np.ndarray:
-    """1.0 where ``condition`` holds, 0.0 where it does not, missing where the inputs are unknown."""
-    return np.where(known, condition.astype(float), np.nan)
+def positive(value):
+    return g.where(value > 0, value, g.nan)
 
 
-def shift_rows(values: np.ndarray, periods: int) -> np.ndarray:
-    """Shift rows down so row t holds row t - periods."""
-    result = np.full(values.shape, np.nan)
-    if 0 < periods < len(values):
-        result[periods:] = values[: len(values) - periods]
-    elif periods == 0:
-        result = values.astype(float, copy=True)
-    return result
+def safe_log(value):
+    return g.log(positive(value))
 
 
-def trailing(values: np.ndarray, window: int, minimum: int, how: str) -> np.ndarray:
-    frame = pd.DataFrame(values).rolling(window, min_periods=minimum)
-    return getattr(frame, how)().to_numpy()
+def finite_or(value, fill):
+    return g.where(g.isfinite(value), value, fill)
 
 
-def growth(current: np.ndarray, previous: np.ndarray) -> np.ndarray:
-    """Relative change, defined only for a positive base."""
+def flag(condition, known):
+    return g.where(known, condition, g.nan)
+
+
+def growth(current, previous):
     return ratio(current - previous, positive(previous))
 
 
-def quarter_window(values: np.ndarray, lags: tuple[int, ...], minimum: int) -> np.ndarray:
-    """Mean over the given quarter lags."""
-    stacked = np.stack([lag(values, k) for k in lags], axis=2)
-    mean, count = nan_mean(stacked, 2)
-    return np.where(count >= minimum, mean, np.nan)
+def corwin_schultz(high, low):
+    today = g.log(high / low) ** 2
+    beta = today + shift_rows(today, 1)
+    gamma = g.log(g.fmax(high, shift_rows(high, 1)) / g.fmin(low, shift_rows(low, 1))) ** 2
+    denominator = 3 - 2 * 2**0.5
+    alpha = (g.sqrt(2 * beta) - g.sqrt(beta)) / denominator - g.sqrt(gamma / denominator)
+    spread = 2 * (g.exp(alpha) - 1) / (1 + g.exp(alpha))
+    return g.where(g.isfinite(spread), g.maximum(spread, 0), g.nan)
 
 
-def monthly(values: np.ndarray, reduce: Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
-    """Apply ``reduce`` to the series of rows t, t-21, t-42, ... for every row t.
+class GraphQuarterGrid:
+    def value(self, name):
+        return op.input_(name)
 
-    ``reduce`` receives one residue class of rows in time order and returns an array of the same shape whose row k
-    depends only on rows up to k, so the result on row t uses non-overlapping 21-day blocks ending on t.
-    """
-    result = np.full(values.shape, np.nan)
-    for residue in range(min(MONTH, len(values))):
-        result[residue::MONTH] = reduce(values[residue::MONTH])
-    return result
+    @property
+    def quarter_index(self):
+        return self.value("fiscal_quarter")
 
+    def single(self, name):
+        value = self.value(name)
+        return g.where(self.quarter_index == 0, value, value - lag(value, 1))
 
-def rolling_coskew(stock: np.ndarray, market: np.ndarray, window: int, minimum: int) -> np.ndarray:
-    """E[r~ m~^2] / (sd(r) var(m)) over trailing windows of jointly observed, demeaned stock and market returns."""
-    weight = (np.isfinite(stock) & np.isfinite(market)[:, None]).astype(float)
-    y = np.where(weight > 0, stock, 0.0)
-    m = np.where(weight > 0, np.broadcast_to(finite_or(market, 0.0)[:, None], stock.shape), 0.0)
+    def ttm(self, name):
+        value = self.single(name)
+        return value + lag(value, 1) + lag(value, 2) + lag(value, 3)
 
-    def sums(values: np.ndarray) -> np.ndarray:
-        prefix = np.concatenate([np.zeros((1, values.shape[1])), np.cumsum(values, axis=0)])
-        out = np.full(values.shape, np.nan)
-        if len(values) >= window:
-            out[window - 1 :] = prefix[window:] - prefix[:-window]
-        return out
-
-    n = sums(weight)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean_y, mean_m = sums(y) / n, sums(m) / n
-        e_ym, e_ymm, e_mm, e_yy = sums(y * m) / n, sums(y * m * m) / n, sums(m * m) / n, sums(y * y) / n
-        co_moment = e_ymm - 2.0 * mean_m * e_ym + 2.0 * mean_m**2 * mean_y - mean_y * e_mm
-        var_y, var_m = e_yy - mean_y**2, e_mm - mean_m**2
-        result = co_moment / (np.sqrt(var_y) * var_m)
-    return np.where((n >= minimum) & (var_y > 0) & (var_m > 0), result, np.nan)
-
-
-def price_delay(stock: np.ndarray, market: np.ndarray, window: int, minimum: int) -> dict[str, np.ndarray]:
-    """Hou-Moskowitz price delay from trailing regressions on the market return and its four lags."""
-    dates, stocks = stock.shape
-    out = {name: np.full((dates, stocks), np.nan) for name in ("rsq", "slope", "tstat")}
-    if dates < window:
-        return out
-    design = np.column_stack([np.ones(dates), *[shift_rows(market[:, None], j)[:, 0] for j in range(5)]])
-    design_ok = np.isfinite(design).all(axis=1)
-    design = np.where(design_ok[:, None], design, 0.0)
-    k = design.shape[1]
-    outer = design[:, :, None] * design[:, None, :]
-    identity = np.eye(k)
-    weights_lag = np.arange(5, dtype=float)
-    rows = slice(window - 1, dates)
-
-    def window_sums(values: np.ndarray) -> np.ndarray:
-        prefix = np.concatenate([np.zeros((1, *values.shape[1:])), np.cumsum(values, axis=0)])
-        return prefix[window:] - prefix[:-window]
-
-    for column in range(stocks):
-        series = stock[:, column]
-        mask = np.isfinite(series) & design_ok
-        if mask.sum() < minimum:
-            continue
-        weight = mask.astype(float)
-        value = np.where(mask, series, 0.0)
-        count = window_sums(weight)
-        valid = count >= minimum
-        if not valid.any():
-            continue
-        gram = window_sums(outer * weight[:, None, None])
-        xy = window_sums(design * value[:, None])
-        yy = window_sums(value**2)
-        gram[~valid] = identity
-        try:
-            inverse = np.linalg.inv(gram)
-        except np.linalg.LinAlgError:
-            inverse = np.linalg.pinv(gram)
-        beta = np.einsum("nkl,nl->nk", inverse, xy)
-        sse = yy - np.einsum("nk,nk->n", beta, xy)
-        restricted_gram = gram[:, :2, :2].copy()
-        restricted = np.linalg.solve(restricted_gram, xy[:, :2, None])[..., 0]
-        sse_restricted = yy - np.einsum("nk,nk->n", restricted, xy[:, :2])
-        with np.errstate(invalid="ignore", divide="ignore"):
-            total = yy - xy[:, 0] ** 2 / count
-            r2_full = 1.0 - sse / total
-            r2_restricted = 1.0 - sse_restricted / total
-            sigma2 = sse / (count - k)
-            se = np.sqrt(sigma2[:, None] * np.einsum("nkk->nk", inverse))
-            t = beta / se
-            slopes = beta[:, 1:]
-            slope = (slopes[:, 1:] * weights_lag[1:]).sum(axis=1) / slopes.sum(axis=1)
-            tstats = t[:, 1:]
-            tstat = (tstats[:, 1:] * weights_lag[1:]).sum(axis=1) / tstats.sum(axis=1)
-            rsq = 1.0 - r2_restricted / r2_full
-        keep = valid & (total > 0) & (sse > 1e-14 * np.maximum(yy, 1e-300))
-        out["rsq"][rows, column] = np.where(keep & (r2_full > 0), rsq, np.nan)
-        out["slope"][rows, column] = np.where(keep, slope, np.nan)
-        out["tstat"][rows, column] = np.where(keep, tstat, np.nan)
-    return out
-
-
-def corwin_schultz(high: np.ndarray, low: np.ndarray) -> np.ndarray:
-    """Two-day Corwin-Schultz spread estimates on the second day, floored at zero."""
-    with np.errstate(invalid="ignore", divide="ignore"):
-        today = np.log(high / low) ** 2
-        previous = shift_rows(today, 1)
-        beta = today + previous
-        gamma = np.log(np.fmax(high, shift_rows(high, 1)) / np.fmin(low, shift_rows(low, 1))) ** 2
-        denominator = 3.0 - 2.0 * np.sqrt(2.0)
-        alpha = (np.sqrt(2.0 * beta) - np.sqrt(beta)) / denominator - np.sqrt(gamma / denominator)
-        spread = 2.0 * (np.exp(alpha) - 1.0) / (1.0 + np.exp(alpha))
-    return np.where(np.isfinite(spread), np.maximum(spread, 0.0), np.nan)
-
-
-# ---------------------------------------------------------------------------------------------- cross sections
-def cross_rank(values: np.ndarray, universe: np.ndarray) -> np.ndarray:
-    """Percentile rank among the day's index members; missing elsewhere."""
-    masked = np.where(universe & np.isfinite(values), values, np.nan)
-    return pd.DataFrame(masked).rank(axis=1, pct=True).to_numpy()
-
-
-def cross_bucket(values: np.ndarray, universe: np.ndarray, buckets: int) -> np.ndarray:
-    """Bucket 1..``buckets`` of the day's index members by value; missing elsewhere."""
-    ranks = cross_rank(values, universe)
-    return np.where(np.isfinite(ranks), np.clip(np.ceil(ranks * buckets), 1, buckets), np.nan)
-
-
-def group_stat(
-    values: np.ndarray,
-    groups: np.ndarray,
-    universe: np.ndarray,
-    how: str,
-    weights: np.ndarray | None = None,
-) -> np.ndarray:
-    """Per-day industry mean, median or std over index members, assigned to every stock of the industry."""
-    result = np.full(values.shape, np.nan)
-    eligible = universe & np.isfinite(values) & np.isfinite(groups)
-    if weights is not None:
-        eligible &= np.isfinite(weights) & (weights > 0)
-    codes = np.unique(groups[np.isfinite(groups)])
-    for code in codes:
-        members = groups == code
-        # Only the columns that are ever in the industry take part, which keeps each reduction small.
-        columns = np.flatnonzero(members.any(axis=0))
-        member = members[:, columns]
-        selected = eligible[:, columns] & member
-        if not selected.any():
-            continue
-        block = values[:, columns]
-        with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
-            warnings.simplefilter("ignore", RuntimeWarning)
-            if how == "median":
-                stat = np.nanmedian(np.where(selected, block, np.nan), axis=1)
-            elif how == "std":
-                stat = np.nanstd(np.where(selected, block, np.nan), axis=1, ddof=1)
-            else:
-                weight = np.where(selected, 1.0 if weights is None else weights[:, columns], 0.0)
-                stat = (np.where(selected, block, 0.0) * weight).sum(axis=1) / weight.sum(axis=1)
-        result[:, columns] = np.where(member, stat[:, None], result[:, columns])
-    return result
-
-
-def group_rank(values: np.ndarray, groups: np.ndarray, universe: np.ndarray) -> np.ndarray:
-    """Percentile rank of index members within their industry on each day."""
-    result = np.full(values.shape, np.nan)
-    eligible = universe & np.isfinite(values) & np.isfinite(groups)
-    for code in np.unique(groups[np.isfinite(groups)]):
-        columns = np.flatnonzero((groups == code).any(axis=0))
-        selected = eligible[:, columns] & (groups[:, columns] == code)
-        ranks = pd.DataFrame(np.where(selected, values[:, columns], np.nan)).rank(axis=1, pct=True).to_numpy()
-        result[:, columns] = np.where(selected, ranks, result[:, columns])
-    return result
-
-
-def cross_residual(
-    target: np.ndarray,
-    regressors: list[np.ndarray],
-    universe: np.ndarray,
-    *,
-    groups: np.ndarray | None = None,
-    minimum: int = 30,
-) -> np.ndarray:
-    """Residual of a daily cross-sectional OLS over index members, with optional industry dummies."""
-    result = np.full(target.shape, np.nan)
-    stacked = np.stack(regressors, axis=2) if regressors else np.zeros((*target.shape, 0))
-    usable = universe & np.isfinite(target) & np.isfinite(stacked).all(axis=2)
-    if groups is not None:
-        usable &= np.isfinite(groups)
-    for row in np.flatnonzero(usable.sum(axis=1) >= minimum):
-        columns = np.flatnonzero(usable[row])
-        parts = [np.ones((len(columns), 1)), stacked[row, columns]]
-        if groups is not None:
-            codes = groups[row, columns]
-            levels = np.unique(codes)
-            parts.append((codes[:, None] == levels[None, 1:]).astype(float))
-        design = np.hstack(parts)
-        if len(columns) < design.shape[1] + 10:
-            continue
-        coefficients, *_ = np.linalg.lstsq(design, target[row, columns], rcond=None)
-        result[row, columns] = target[row, columns] - design @ coefficients
-    return result
+    def annual(self, name):
+        return g.where(self.quarter_index == 3, self.value(name), g.nan)
 
 
 class OAPSignals:
-    """Calculator with shared intermediates; ``calculate`` returns one signal panel on the calendar grid."""
+    """Build statement and daily expressions; this class never evaluates pandas/NumPy formulas."""
 
-    def __init__(self, inputs: Mapping[str, Any]) -> None:
-        self.inputs = inputs
-        close = inputs["close"]
-        self.dates = pd.DatetimeIndex(close.index)
-        self.instruments = pd.Index(close.columns)
-        self.trading = close.notna().to_numpy()
-        self.close = close.to_numpy(dtype=float)
-        self.price = close.ffill().to_numpy(dtype=float)
-        self.returns = self.close / shift_rows(self.close, 1) - 1.0
-        self.cap = positive(self._array("cap"))
-        self.universe = self._panel("universe").reindex(index=self.dates, columns=self.instruments).eq(True).to_numpy()
-        self.sector = self._array("sector")
-        self._cache: dict[str, Any] = {}
-        self._grid: QuarterGrid | None = None
+    def __init__(self):
+        self._cache = {}
+        self.grid = GraphQuarterGrid()
+        self.statements = {}
+        self.close = op.input_("close")
+        self.trading = g.isfinite(self.close)
+        self.price = op.ffill(self.close)
+        self.returns = self.close / shift_rows(self.close, 1) - 1
+        self.cap = positive(op.input_("cap"))
+        self.universe = op.input_("universe") == 1
+        self.sector = op.input_("sector")
 
-    def calculate(self, name: str) -> Panel:
-        result = np.asarray(getattr(self, f"_s_{name}")(), dtype=float)
-        result = np.where(np.isfinite(result) & self.trading, result, np.nan)
-        return Panel(result, index=self.dates, columns=self.instruments)
+    def _array(self, key):
+        return op.input_(key)
 
-    def release(self, name: str) -> None:
-        """Drop intermediates no later signal needs (signals are computed in catalog order)."""
-        for key in RELEASE_AFTER.get(name, ()):
-            self._cache.pop(key, None)
+    def _series(self, key):
+        return op.input_(key)
 
-    # ------------------------------------------------------------------ inputs
-    def _panel(self, key: str) -> Any:
-        value = self.inputs.get(key)
-        if value is None:
-            raise DataContractError(f"oap input is missing: {key}")
-        return value
+    def _ffill(self, value):
+        return op.ffill(value)
 
-    def _array(self, key: str) -> np.ndarray:
-        return self._panel(key).reindex(index=self.dates, columns=self.instruments).to_numpy(dtype=float)
+    def p(self, value, annual=False):
+        name = ("y_" if annual else "q_") + f"oap_{len(self.statements):03d}"
+        self.statements[name] = value
+        return op.input_(name)
 
-    def _series(self, key: str) -> np.ndarray:
-        return np.asarray(pd.Series(self._panel(key)).reindex(self.dates), dtype=float)
+    @property
+    def age_months(self):
+        days = self._array("calendar_day") - self._array("listed_day")
+        return g.where(days >= 0, days / 30.4375, g.nan)
+
+    def _lag_month_mean(self, lags, minimum):
+        return op.mean_lags(self.monthly_returns, [MONTH * (j - 1) for j in lags], minimum)
+
+    def _factor_month(self, name):
+        return trailing(self._series(name), MONTH, 15, "sum")
+
+    def _regression(self, key, regressors, window, minimum):
+        def build():
+            xs = [self._series(name) for name in regressors]
+            return {
+                key: op.regression(self.returns, xs, window, minimum, kind)
+                for key, kind in (("resid_std", "kResidualStd"), ("resid_skew", "kResidualSkew"))
+            }
+
+        return self._memo(key, build)
 
     def _memo(self, key: str, build: Callable[[], Any]) -> Any:
         if key not in self._cache:
@@ -771,102 +727,66 @@ class OAPSignals:
         return self._cache[key]
 
     @property
-    def grid(self) -> QuarterGrid:
-        if self._grid is None:
-            self._grid = QuarterGrid(prepare_fundamentals(self._panel("fundamentals")), self.dates, self.instruments)
-        return self._grid
-
-    def _ffill(self, values: np.ndarray) -> np.ndarray:
-        return pd.DataFrame(values).ffill().to_numpy()
-
-    @property
-    def cap_filled(self) -> np.ndarray:
+    def cap_filled(self) -> g.ndarray:
         return self._memo("cap_filled", lambda: self._ffill(self.cap))
 
     @property
-    def turnover(self) -> np.ndarray:
+    def turnover(self) -> g.ndarray:
         return self._memo("turnover", lambda: self._array("basic_turnover_rate"))
 
     @property
-    def volume(self) -> np.ndarray:
+    def volume(self) -> g.ndarray:
         return self._memo("volume", lambda: self._array("volume"))
 
     @property
-    def amount(self) -> np.ndarray:
+    def amount(self) -> g.ndarray:
         return self._memo("amount", lambda: positive(self._array("amount")))
 
     @property
-    def raw_close(self) -> np.ndarray:
+    def raw_close(self) -> g.ndarray:
         return self._memo("raw_close", lambda: positive(self._array("basic_close")))
 
     @property
-    def adjusted_shares(self) -> np.ndarray:
+    def adjusted_shares(self) -> g.ndarray:
         """Total shares times unadjusted over adjusted close, which removes share splits and bonus issues."""
-        def build() -> np.ndarray:
+
+        def build() -> g.ndarray:
             shares = positive(self._array("basic_total_share"))
-            with np.errstate(invalid="ignore", divide="ignore"):
+            with g.errstate(invalid="ignore", divide="ignore"):
                 return self._ffill(shares * self.raw_close / positive(self.close))
+
         return self._memo("adjusted_shares", build)
 
     @property
-    def dividends(self) -> np.ndarray:
+    def dividends(self) -> g.ndarray:
         """Trailing-twelve-month cash dividends in yuan, zero for a quoted non-payer, carried over gaps.
 
         Tushare counts a payment twice for a few days around its ex-date (up to about two weeks), so the amount is the
         smallest of the last ``DIVIDEND_SPIKE_DAYS`` rows; a real change shows up that many rows later.
         """
-        def build() -> np.ndarray:
-            quoted = np.isfinite(self.raw_close)
+
+        def build() -> g.ndarray:
+            quoted = g.isfinite(self.raw_close)
             dividend_yield = finite_or(self._array("basic_dv_ttm"), 0.0)
-            amount = self._ffill(np.where(quoted, dividend_yield * self.cap_filled, np.nan))
+            amount = self._ffill(g.where(quoted, dividend_yield * self.cap_filled, g.nan))
             return trailing(amount, DIVIDEND_SPIKE_DAYS, 1, "min")
+
         return self._memo("dividends", build)
 
-    @property
-    def age_months(self) -> np.ndarray:
-        def build() -> np.ndarray:
-            listed = pd.to_datetime(pd.Series(self._panel("list_date")).reindex(self.instruments))
-            days = (self.dates.to_numpy()[:, None] - listed.to_numpy()[None, :]) / np.timedelta64(1, "D")
-            return np.where(days >= 0, days / 30.4375, np.nan)
-        return self._memo("age_months", build)
-
-    # ------------------------------------------------------------------ returns
-    def momentum(self, start: int, end: int) -> np.ndarray:
+    def momentum(self, start: int, end: int) -> g.ndarray:
         """Return from ``start`` trading days ago to ``end`` trading days ago (start > end)."""
         return shift_rows(self.price, end) / shift_rows(self.price, start) - 1.0
 
     @property
-    def monthly_returns(self) -> np.ndarray:
+    def monthly_returns(self) -> g.ndarray:
         return self._memo("monthly_returns", lambda: self.momentum(MONTH, 0))
 
-    def _lag_month_mean(self, lags: tuple[int, ...], minimum: int) -> np.ndarray:
-        """Mean of the 21-day returns ``j`` months back (j = 1 is the latest month)."""
-        total = np.zeros(self.price.shape)
-        count = np.zeros(self.price.shape)
-        for j in lags:
-            value = shift_rows(self.monthly_returns, MONTH * (j - 1))
-            known = np.isfinite(value)
-            total += np.where(known, value, 0.0)
-            count += known
-        with np.errstate(invalid="ignore", divide="ignore"):
-            return np.where(count >= minimum, total / count, np.nan)
-
-    def _factor_month(self, name: str) -> np.ndarray:
-        return pd.Series(self._series(name)).rolling(MONTH, min_periods=15).sum().to_numpy()
-
-    def _regression(self, key: str, regressors: tuple[str, ...], window: int, minimum: int) -> dict:
-        def build() -> dict:
-            x = np.column_stack([self._series(name) for name in regressors])
-            return rolling_regression(self.returns, x, window, minimum)
-        return self._memo(key, build)
-
-    # ------------------------------------------------------------------ statements
-    def b(self, item: str) -> np.ndarray:
+    def b(self, item: str) -> g.ndarray:
         """Balance-sheet item on the quarter grid."""
         return self._memo(f"b:{item}", lambda: sum(self.grid.value(line) for line in ITEMS[item]))
 
-    def _flow(self, item: str, kind: str) -> np.ndarray:
-        def build() -> np.ndarray:
+    def _flow(self, item: str, kind: str) -> g.ndarray:
+        def build() -> g.ndarray:
             parts = []
             for line in ITEMS[item]:
                 values = getattr(self.grid, kind)(line)
@@ -874,397 +794,247 @@ class OAPSignals:
                     values = finite_or(values, 0.0)
                 parts.append(values)
             return sum(parts)
+
         return self._memo(f"{kind}:{item}", build)
 
-    def x(self, item: str) -> np.ndarray:
+    def x(self, item: str) -> g.ndarray:
         """Trailing-twelve-month flow on the quarter grid."""
         return self._flow(item, "ttm")
 
-    def qtr(self, item: str) -> np.ndarray:
+    def qtr(self, item: str) -> g.ndarray:
         """Single-quarter flow on the quarter grid."""
         return self._flow(item, "single")
 
-    def p(self, values: np.ndarray) -> np.ndarray:
-        """Latest usable quarter value on every trading day."""
-        return self.grid.panel(values).to_numpy()
-
-    def be(self) -> np.ndarray:
+    def be(self) -> g.ndarray:
         """Common book equity: equity to parent less other equity instruments (preferred and perpetual)."""
         return self.b("seq") - self.b("pstk")
 
-    def avg_at(self) -> np.ndarray:
+    def avg_at(self) -> g.ndarray:
         return (self.b("at") + lag(self.b("at"), 4)) / 2.0
 
-    def change_over_avg_at(self, values: np.ndarray) -> np.ndarray:
+    def change_over_avg_at(self, values: g.ndarray) -> g.ndarray:
         return self.p(ratio(values - lag(values, 4), self.avg_at()))
 
-    def to_me(self, values: np.ndarray) -> np.ndarray:
+    def to_me(self, values: g.ndarray) -> g.ndarray:
         return self.p(values) / self.cap
 
-    def debt(self) -> np.ndarray:
+    def debt(self) -> g.ndarray:
         return self.b("dltt") + self.b("dlc")
 
-    def noa(self) -> np.ndarray:
+    def noa(self) -> g.ndarray:
         """Operating assets (at - che) less operating liabilities (at - debt - mib - be - pstk)."""
         return self.debt() + self.b("mib") + self.be() + self.b("pstk") - self.b("che")
 
-    def ebitda(self) -> np.ndarray:
+    def ebitda(self) -> g.ndarray:
         return self.x("pi") + self.x("xint") + self.x("dp")
 
-    def me_at_quarter_end(self) -> np.ndarray:
-        """Market value on the last trading day of each fiscal quarter (instruments x quarters)."""
-        grid = self.grid
-        numbers = np.arange(grid.quarters) + grid.first_quarter
-        ends = pd.to_datetime([f"{n // 4}-{(n % 4) * 3 + 3:02d}-01" for n in numbers]) + pd.offsets.MonthEnd(0)
-        rows = np.searchsorted(self.dates.to_numpy(), ends.to_numpy(), side="right") - 1
-        result = np.full((len(self.instruments), grid.quarters), np.nan)
-        known = rows >= 0
-        result[:, known] = self.cap_filled[rows[known]].T
-        return result
-
-    def surprise(self, values: np.ndarray) -> np.ndarray:
+    def surprise(self, values: g.ndarray) -> g.ndarray:
         """Four-quarter change minus its mean over the previous eight quarters, over their std."""
         change = values - lag(values, 4)
         drift = quarter_window(change, tuple(range(1, 9)), 6)
         spread = rolling_quarter_std(lag(change, 1), 8, 6)
         return ratio(change - drift, spread)
 
-    def _members(self, values: np.ndarray) -> np.ndarray:
-        return np.where(self.universe, values, np.nan)
+    def _members(self, values: g.ndarray) -> g.ndarray:
+        return g.where(self.universe, values, g.nan)
 
-    # ------------------------------------------------------------------ price
-    def _s_Size(self) -> np.ndarray:
+    def _s_Size(self) -> g.ndarray:
         return safe_log(self.cap)
 
-    def _s_Price(self) -> np.ndarray:
+    def _s_Price(self) -> g.ndarray:
         return safe_log(self.raw_close)
 
-    def _s_STreversal(self) -> np.ndarray:
+    def _s_STreversal(self) -> g.ndarray:
         return self.momentum(MONTH, 0)
 
-    def _s_Mom6m(self) -> np.ndarray:
+    def _s_Mom6m(self) -> g.ndarray:
         return self._memo("mom6", lambda: self.momentum(6 * MONTH, MONTH))
 
-    def _s_Mom12m(self) -> np.ndarray:
+    def _s_Mom12m(self) -> g.ndarray:
         return self.momentum(YEAR, MONTH)
 
-    def _s_IntMom(self) -> np.ndarray:
+    def _s_IntMom(self) -> g.ndarray:
         return self.momentum(YEAR, 6 * MONTH)
 
-    def _s_MRreversal(self) -> np.ndarray:
+    def _s_MRreversal(self) -> g.ndarray:
         return self.momentum(18 * MONTH, 13 * MONTH - MONTH)
 
-    def _s_LRreversal(self) -> np.ndarray:
+    def _s_LRreversal(self) -> g.ndarray:
         return self._memo("mom36", lambda: self.momentum(36 * MONTH, 13 * MONTH - MONTH))
 
-    def _s_Mom12mOffSeason(self) -> np.ndarray:
+    def _s_Mom12mOffSeason(self) -> g.ndarray:
         return self._lag_month_mean(tuple(range(1, 12)), 6)
 
-    def _s_MomSeasonShort(self) -> np.ndarray:
+    def _s_MomSeasonShort(self) -> g.ndarray:
         return self._lag_month_mean((12,), 1)
 
-    def _s_MomSeason(self) -> np.ndarray:
+    def _s_MomSeason(self) -> g.ndarray:
         return self._lag_month_mean((24, 36, 48, 60), 2)
 
-    def _s_MomOffSeason(self) -> np.ndarray:
+    def _s_MomOffSeason(self) -> g.ndarray:
         return self._lag_month_mean(tuple(j for j in range(13, 61) if j % 12), 22)
 
-    def _s_MomSeason06YrPlus(self) -> np.ndarray:
+    def _s_MomSeason06YrPlus(self) -> g.ndarray:
         return self._lag_month_mean((72, 84, 96, 108, 120), 2)
 
-    def _s_MomOffSeason06YrPlus(self) -> np.ndarray:
+    def _s_MomOffSeason06YrPlus(self) -> g.ndarray:
         return self._lag_month_mean(tuple(j for j in range(61, 121) if j % 12), 27)
 
-    def _s_MaxRet(self) -> np.ndarray:
+    def _s_MaxRet(self) -> g.ndarray:
         return trailing(self.returns, MONTH, 15, "max")
 
-    def _s_ReturnSkew(self) -> np.ndarray:
+    def _s_ReturnSkew(self) -> g.ndarray:
         return trailing(self.returns, MONTH, 15, "skew")
 
     def _ff3_month(self) -> dict:
         return self._regression("ff3_month", MARKET_FACTORS, MONTH, 15)
 
-    def _s_ReturnSkew3F(self) -> np.ndarray:
+    def _s_ReturnSkew3F(self) -> g.ndarray:
         return self._ff3_month()["resid_skew"]
 
-    def _s_IdioVol3F(self) -> np.ndarray:
+    def _s_IdioVol3F(self) -> g.ndarray:
         return self._ff3_month()["resid_std"]
 
-    def _s_RealizedVol(self) -> np.ndarray:
+    def _s_RealizedVol(self) -> g.ndarray:
         return trailing(self.returns, MONTH, 15, "std")
 
-    def _s_IdioVolAHT(self) -> np.ndarray:
+    def _s_IdioVolAHT(self) -> g.ndarray:
         return self._regression("capm_year", ("mkt",), YEAR, 100)["resid_std"]
 
-    def _s_Beta(self) -> np.ndarray:
-        market = self._factor_month("mkt")
-        return monthly(
-            np.column_stack([market, self.monthly_returns]),
-            lambda block: np.column_stack(
-                [np.full(len(block), np.nan), rolling_regression(block[:, 1:], block[:, :1], 60, 20)["beta"]]
-            ),
-        )[:, 1:]
-
-    def _s_BetaFP(self) -> np.ndarray:
-        log_returns = np.log1p(self.returns)
-        log_market = np.log1p(self._series("mkt"))
-        stock_3d = trailing(log_returns, 3, 3, "sum")
-        market_3d = pd.Series(log_market).rolling(3, min_periods=3).sum().to_numpy()
-        market_panel = np.where(np.isfinite(stock_3d), market_3d[:, None], np.nan)
-        correlation = (
-            pd.DataFrame(stock_3d).rolling(5 * YEAR, min_periods=3 * YEAR).corr(pd.DataFrame(market_panel)).to_numpy()
-        )
-        sigma_stock = trailing(log_returns, YEAR, 120, "std")
-        market_on_days = np.where(np.isfinite(log_returns), log_market[:, None], np.nan)
-        sigma_market = trailing(market_on_days, YEAR, 120, "std")
-        return np.clip(correlation, -1.0, 1.0) * ratio(sigma_stock, sigma_market)
-
-    def tail_index(self) -> np.ndarray:
-        """Kelly-Jiang tail index from the pooled daily returns of index members over the trailing month."""
-        def build() -> np.ndarray:
-            members = self._members(self.returns)
-            result = np.full(len(self.dates), np.nan)
-            for row in range(MONTH - 1, len(self.dates)):
-                pooled = members[row - MONTH + 1 : row + 1].ravel()
-                pooled = pooled[np.isfinite(pooled)]
-                if len(pooled) < 100:
-                    continue
-                threshold = np.quantile(pooled, 0.05)
-                tail = pooled[pooled < threshold]
-                if threshold < 0 and len(tail):
-                    result[row] = np.mean(np.log(tail / threshold))
-            return result
-        return self._memo("tail_index", build)
-
-    def _s_BetaTailRisk(self) -> np.ndarray:
-        # Each month's stock return is regressed on the previous month's tail index.
-        previous_tail = shift_rows(self.tail_index()[:, None], MONTH)[:, 0]
-        return monthly(
-            np.column_stack([previous_tail, self.monthly_returns]),
-            lambda block: np.column_stack(
-                [np.full(len(block), np.nan), rolling_regression(block[:, 1:], block[:, :1], 60, 36)["beta"]]
-            ),
-        )[:, 1:]
-
-    def _s_CoskewACX(self) -> np.ndarray:
-        return rolling_coskew(np.log1p(self.returns), np.log1p(self._series("mkt")), YEAR, 150)
-
-    def _s_Coskewness(self) -> np.ndarray:
-        market = np.log1p(self._factor_month("mkt"))
-        stock = np.log1p(self.monthly_returns)
-        return monthly(
-            np.column_stack([market, stock]),
-            lambda block: np.column_stack(
-                [np.full(len(block), np.nan), rolling_coskew(block[:, 1:], block[:, 0], 60, 24)]
-            ),
-        )[:, 1:]
-
-    def _price_delay(self) -> dict:
-        return self._memo("price_delay", lambda: price_delay(self.returns, self._series("mkt"), YEAR, 150))
-
-    def _s_PriceDelayRsq(self) -> np.ndarray:
+    def _s_PriceDelayRsq(self) -> g.ndarray:
         return self._price_delay()["rsq"]
 
-    def _s_PriceDelaySlope(self) -> np.ndarray:
+    def _s_PriceDelaySlope(self) -> g.ndarray:
         return self._price_delay()["slope"]
 
-    def _s_PriceDelayTstat(self) -> np.ndarray:
+    def _s_PriceDelayTstat(self) -> g.ndarray:
         return self._price_delay()["tstat"]
 
-    def _s_ResidualMomentum(self) -> np.ndarray:
-        factors = np.column_stack([self._factor_month(name) for name in MARKET_FACTORS])
-
-        def reduce(block: np.ndarray) -> np.ndarray:
-            fit = rolling_regression(block[:, 3:], block[:, :3], 36, 24, residual_slices={"momentum": (24, 35)})
-            return np.column_stack([np.full((len(block), 3), np.nan), fit["momentum"]])
-
-        return monthly(np.column_stack([factors, self.monthly_returns]), reduce)[:, 3:]
-
-    def _s_TrendFactor(self) -> np.ndarray:
-        price = pd.DataFrame(self.close)
-        # Averages of the quotes inside each window; a short suspension does not void the long averages.
-        stacked = np.stack(
-            [ratio(price.rolling(n, min_periods=int(np.ceil(0.8 * n))).mean().to_numpy(), self.close)
-             for n in TREND_WINDOWS],
-            axis=2,
-        )
-        complete = np.isfinite(stacked).all(axis=2)
-        lagged_universe = shift_rows(self.universe.astype(float), MONTH) > 0
-        target = self.momentum(MONTH, 0)
-        k = len(TREND_WINDOWS) + 1
-        loadings = np.full((len(self.dates), k), np.nan)
-        # Each day's return over the last month is regressed on the averages of a month earlier.
-        usable = np.zeros(target.shape, dtype=bool)
-        usable[MONTH:] = lagged_universe[MONTH:] & np.isfinite(target[MONTH:]) & complete[:-MONTH]
-        for row in np.flatnonzero(usable.sum(axis=1) >= 3 * k):
-            columns = np.flatnonzero(usable[row])
-            design = np.column_stack([np.ones(len(columns)), stacked[row - MONTH, columns]])
-            loadings[row], *_ = np.linalg.lstsq(design, target[row, columns], rcond=None)
-        # Expected loadings average the twelve monthly cross-sections ending today.
-        history = np.stack([shift_rows(loadings, MONTH * j) for j in range(12)], axis=2)
-        expected, count = nan_mean(history, 2)
-        expected = np.where(count >= 8, expected, np.nan)
-        return np.einsum("tsk,tk->ts", stacked, expected[:, 1:])
-
-    def _s_High52(self) -> np.ndarray:
+    def _s_High52(self) -> g.ndarray:
         return ratio(self.close, trailing(self.close, YEAR, 126, "max"))
 
-    def _s_IndMom(self) -> np.ndarray:
+    def _s_IndMom(self) -> g.ndarray:
         returns = self.momentum(6 * MONTH, 0)
         return group_stat(returns, self.sector, self.universe, "mean", weights=self.cap)
 
-    def _big_in_industry(self) -> np.ndarray:
+    def _big_in_industry(self) -> g.ndarray:
         return self._memo("big", lambda: group_rank(self.cap, self.sector, self.universe) > 0.7)
 
-    def _for_small_firms(self, values: np.ndarray) -> np.ndarray:
+    def _for_small_firms(self, values: g.ndarray) -> g.ndarray:
         big = self._big_in_industry()
         industry = group_stat(values, self.sector, self.universe & big, "mean")
-        return np.where(self.universe & ~big, industry, np.nan)
+        return g.where(self.universe & ~big, industry, g.nan)
 
-    def _s_IndRetBig(self) -> np.ndarray:
+    def _s_IndRetBig(self) -> g.ndarray:
         return self._for_small_firms(self.momentum(MONTH, 0))
 
-    def _s_FirmAgeMom(self) -> np.ndarray:
-        age = np.where(self.age_months >= 12, self.age_months, np.nan)
+    def _s_FirmAgeMom(self) -> g.ndarray:
+        age = g.where(self.age_months >= 12, self.age_months, g.nan)
         young = cross_bucket(age, self.universe, 5) == 1
-        return np.where(young, self._s_Mom6m(), np.nan)
+        return g.where(young, self._s_Mom6m(), g.nan)
 
-    def _s_MomRev(self) -> np.ndarray:
+    def _s_MomRev(self) -> g.ndarray:
         short = cross_bucket(self._s_Mom6m(), self.universe, 5)
         long = cross_bucket(self._s_LRreversal(), self.universe, 5)
-        result = np.where((short == 5) & (long == 1), 1.0, np.nan)
-        return np.where((short == 1) & (long == 5), 0.0, result)
+        result = g.where((short == 5) & (long == 1), 1.0, g.nan)
+        return g.where((short == 1) & (long == 5), 0.0, result)
 
-    def _s_MomVol(self) -> np.ndarray:
+    def _s_MomVol(self) -> g.ndarray:
         volume = trailing(self.turnover, 6 * MONTH, 5 * MONTH, "mean")
         seasoned = self.age_months >= 24
-        high = cross_bucket(np.where(seasoned, volume, np.nan), self.universe, 3) == 3
-        decile = cross_bucket(np.where(seasoned, self._s_Mom6m(), np.nan), self.universe, 10)
-        return np.where(high, decile, np.nan)
+        high = cross_bucket(g.where(seasoned, volume, g.nan), self.universe, 3) == 3
+        decile = cross_bucket(g.where(seasoned, self._s_Mom6m(), g.nan), self.universe, 10)
+        return g.where(high, decile, g.nan)
 
-    # ------------------------------------------------------------------ trading
-    def _s_DolVol(self) -> np.ndarray:
+    def _s_DolVol(self) -> g.ndarray:
         return safe_log(shift_rows(trailing(self.amount, MONTH, 15, "sum"), MONTH))
 
-    def _s_Illiquidity(self) -> np.ndarray:
-        return trailing(ratio(np.abs(self.returns), self.amount), YEAR, 120, "mean")
+    def _s_Illiquidity(self) -> g.ndarray:
+        return trailing(ratio(g.abs(self.returns), self.amount), YEAR, 120, "mean")
 
-    def _s_ShareVol(self) -> np.ndarray:
+    def _s_ShareVol(self) -> g.ndarray:
         bucket = cross_bucket(trailing(self.turnover, QUARTER, 40, "mean"), self.universe, 3)
-        return np.where(bucket == 3, 1.0, np.where(bucket == 1, 0.0, np.nan))
+        return g.where(bucket == 3, 1.0, g.where(bucket == 1, 0.0, g.nan))
 
-    def _monthly_std(self, values: np.ndarray, window: int, minimum: int) -> np.ndarray:
-        sums = trailing(values, MONTH, 15, "sum")
-        return monthly(sums, lambda block: trailing(block, window, minimum, "std"))
-
-    def _s_std_turn(self) -> np.ndarray:
+    def _s_std_turn(self) -> g.ndarray:
         return self._monthly_std(self.turnover, 36, 24)
 
-    def _s_VolSD(self) -> np.ndarray:
+    def _s_VolSD(self) -> g.ndarray:
         return self._monthly_std(self.volume, 36, 24)
 
-    def _s_VolMkt(self) -> np.ndarray:
+    def _s_VolMkt(self) -> g.ndarray:
         return trailing(self.amount, YEAR, 120, "mean") * MONTH / self.cap
 
-    def _s_VolumeTrend(self) -> np.ndarray:
-        volume = trailing(self.volume, MONTH, 15, "sum")
-
-        def reduce(block: np.ndarray) -> np.ndarray:
-            trend = np.arange(len(block), dtype=float)[:, None]
-            slope = rolling_regression(block, trend, 60, 30)["beta"]
-            return ratio(slope, trailing(block, 60, 30, "mean"))
-
-        return monthly(volume, reduce)
-
-    def _zerotrade(self, months: int) -> np.ndarray:
-        window = months * MONTH
-        listed = np.maximum.accumulate(self.trading, axis=0)
-        zero_days = trailing((listed & ~self.trading).astype(float), window, window, "sum")
-        turnover = trailing(finite_or(self.turnover, 0.0), window, window, "sum")
-        return zero_days + ratio(1.0, positive(turnover)) / 480_000.0
-
-    def _s_zerotrade1M(self) -> np.ndarray:
+    def _s_zerotrade1M(self) -> g.ndarray:
         return self._zerotrade(1)
 
-    def _s_zerotrade6M(self) -> np.ndarray:
+    def _s_zerotrade6M(self) -> g.ndarray:
         return self._zerotrade(6)
 
-    def _s_zerotrade12M(self) -> np.ndarray:
+    def _s_zerotrade12M(self) -> g.ndarray:
         return self._zerotrade(12)
 
-    def _s_BidAskSpread(self) -> np.ndarray:
+    def _s_BidAskSpread(self) -> g.ndarray:
         spread = corwin_schultz(self._array("high"), self._array("low"))
         return trailing(spread, MONTH, 15, "mean")
 
-    # ------------------------------------------------------------------ valuation
-    def _s_AM(self) -> np.ndarray:
+    def _s_AM(self) -> g.ndarray:
         return self.to_me(self.b("at"))
 
-    def _s_BM(self) -> np.ndarray:
-        tangible = self.be() - self.b("intan")
-        return self.p(safe_log(ratio(tangible, self.me_at_quarter_end())))
-
-    def _s_BMdec(self) -> np.ndarray:
-        december = pd.to_datetime([f"{year - 1}-12-31" for year in self.dates.year])
-        rows = np.searchsorted(self.dates.to_numpy(), december.to_numpy(), side="right") - 1
-        columns = np.arange(len(self.instruments))
-        me = np.where(rows[:, None] >= 0, self.cap_filled[np.clip(rows, 0, None)[:, None], columns[None, :]], np.nan)
-        return ratio(self.p(self.be()), me)
-
-    def _s_BookLeverage(self) -> np.ndarray:
+    def _s_BookLeverage(self) -> g.ndarray:
         return self.p(ratio(self.b("at"), positive(self.b("seq") + self.b("txditc"))))
 
-    def _s_Leverage(self) -> np.ndarray:
+    def _s_Leverage(self) -> g.ndarray:
         return self.to_me(self.b("lt"))
 
-    def _s_EP(self) -> np.ndarray:
+    def _s_EP(self) -> g.ndarray:
         return positive(self.to_me(self.x("ib")))
 
-    def _s_CF(self) -> np.ndarray:
+    def _s_CF(self) -> g.ndarray:
         return self.to_me(self.x("ib") + self.x("dp"))
 
-    def _s_cfp(self) -> np.ndarray:
+    def _s_cfp(self) -> g.ndarray:
         return self.to_me(self.x("oancf"))
 
-    def _s_SP(self) -> np.ndarray:
+    def _s_SP(self) -> g.ndarray:
         return self.to_me(self.x("sale"))
 
-    def _net_debt(self) -> np.ndarray:
+    def _net_debt(self) -> g.ndarray:
         return self.p(self.debt() + self.b("pstk") - self.b("che"))
 
-    def _s_EBM(self) -> np.ndarray:
+    def _s_EBM(self) -> g.ndarray:
         net_debt = self._net_debt()
         return ratio(self.p(self.be()) - net_debt, self.cap - net_debt)
 
-    def _s_BPEBM(self) -> np.ndarray:
+    def _s_BPEBM(self) -> g.ndarray:
         return ratio(self.p(self.be()), self.cap) - self._s_EBM()
 
-    def _s_NetDebtPrice(self) -> np.ndarray:
+    def _s_NetDebtPrice(self) -> g.ndarray:
         return self._net_debt() / self.cap
 
-    def _s_EntMult(self) -> np.ndarray:
+    def _s_EntMult(self) -> g.ndarray:
         enterprise = self.cap + self.p(self.debt() - self.b("che"))
-        known_book = np.isfinite(self.p(self.be()))
-        return np.where(known_book, ratio(enterprise, positive(self.p(self.ebitda()))), np.nan)
+        known_book = g.isfinite(self.p(self.be()))
+        return g.where(known_book, ratio(enterprise, positive(self.p(self.ebitda()))), g.nan)
 
-    def _s_CashProd(self) -> np.ndarray:
+    def _s_CashProd(self) -> g.ndarray:
         return ratio(self.cap - self.p(self.b("at")), self.p(self.b("che")))
 
-    def _s_PayoutYield(self) -> np.ndarray:
+    def _s_PayoutYield(self) -> g.ndarray:
         return positive(ratio(self.dividends, shift_rows(self.cap_filled, 6 * MONTH)))
 
-    def _s_NetPayoutYield(self) -> np.ndarray:
+    def _s_NetPayoutYield(self) -> g.ndarray:
         payout = self.dividends - self.p(self.x("sstk"))
         result = ratio(payout, shift_rows(self.cap_filled, 6 * MONTH))
-        return np.where(result != 0, result, np.nan)
+        return g.where(result != 0, result, g.nan)
 
-    def _s_EquityDuration(self) -> np.ndarray:
+    def _s_EquityDuration(self) -> g.ndarray:
         discount, horizon = 0.12, 10
         book = self.be()
         roe = ratio(self.x("ib"), positive(lag(book, 4)))
         sales_growth = growth(self.x("sale"), lag(self.x("sale"), 4))
-        weighted = np.zeros(book.shape)
-        present = np.zeros(book.shape)
+        weighted = g.zeros(book.shape)
+        present = g.zeros(book.shape)
         for year in range(1, horizon + 1):
             roe = 0.12 + 0.57 * (roe - 0.12)
             sales_growth = 0.06 + 0.24 * (sales_growth - 0.06)
@@ -1274,12 +1044,12 @@ class OAPSignals:
             weighted = weighted + year * distribution / factor
             present = present + distribution / factor
         known_book = positive(self.be())
-        weighted = np.where(np.isfinite(known_book), weighted, np.nan)
-        present = np.where(np.isfinite(known_book), present, np.nan)
+        weighted = g.where(g.isfinite(known_book), weighted, g.nan)
+        present = g.where(g.isfinite(known_book), present, g.nan)
         me = self.cap
         return self.p(weighted) / me + (horizon + (1.0 + discount) / discount) * (me - self.p(present)) / me
 
-    def _intangible_return(self, numerator: np.ndarray) -> np.ndarray:
+    def _intangible_return(self, numerator: g.ndarray) -> g.ndarray:
         log_ratio = safe_log(self.to_me(numerator))
         five = 5 * YEAR
         stock_return = safe_log(ratio(self.price, shift_rows(self.price, five)))
@@ -1287,19 +1057,19 @@ class OAPSignals:
         accounting_return = log_ratio - lagged + stock_return
         return cross_residual(stock_return, [lagged, accounting_return], self.universe)
 
-    def _s_IntanBM(self) -> np.ndarray:
+    def _s_IntanBM(self) -> g.ndarray:
         return self._intangible_return(self.be())
 
-    def _s_IntanCFP(self) -> np.ndarray:
+    def _s_IntanCFP(self) -> g.ndarray:
         return self._intangible_return(self.x("ib") + self.x("dp"))
 
-    def _s_IntanEP(self) -> np.ndarray:
+    def _s_IntanEP(self) -> g.ndarray:
         return self._intangible_return(self.x("ib"))
 
-    def _s_IntanSP(self) -> np.ndarray:
+    def _s_IntanSP(self) -> g.ndarray:
         return self._intangible_return(self.x("sale"))
 
-    def _s_Frontier(self) -> np.ndarray:
+    def _s_Frontier(self) -> g.ndarray:
         book = positive(self.be())
         assets = self.b("at")
         sales = self.x("sale")
@@ -1307,65 +1077,50 @@ class OAPSignals:
             self.p(safe_log(book)),
             self.p(ratio(self.b("dltt"), assets)),
             self.p(ratio(self.x("capx"), sales)),
-            self.p(finite_or(ratio(self.x("xrd"), sales), 0.0) * np.isfinite(sales)),
+            self.p(finite_or(ratio(self.x("xrd"), sales), 0.0) * g.isfinite(sales)),
             self.p(ratio(self.b("ppe"), assets)),
             self.p(ratio(self.ebitda(), assets)),
         ]
         target = safe_log(self.p(book) / self.cap)
         return cross_residual(target, regressors, self.universe, groups=self.sector)
 
-    def _s_VarCF(self) -> np.ndarray:
-        cash_flow_price = self._s_CF()
-        return monthly(cash_flow_price, lambda block: trailing(block, 60, 24, "var"))
-
-    # ------------------------------------------------------------------ profitability
-    def _s_Cash(self) -> np.ndarray:
+    def _s_Cash(self) -> g.ndarray:
         return self.p(ratio(self.b("che"), self.b("at")))
 
-    def _s_GP(self) -> np.ndarray:
+    def _s_GP(self) -> g.ndarray:
         return self.p(ratio(self.x("sale") - self.x("cogs"), self.b("at")))
 
-    def _s_OperProf(self) -> np.ndarray:
+    def _s_OperProf(self) -> g.ndarray:
         profit = self.x("sale") - self.x("cogs") - self.x("xsga") - self.x("xint")
         return self.p(ratio(profit, positive(self.be())))
 
-    def _operating_profit_rd(self) -> np.ndarray:
+    def _operating_profit_rd(self) -> g.ndarray:
         return self.x("sale") - self.x("cogs") - (self.x("xsga") - finite_or(self.x("xrd"), 0.0))
 
-    def _s_OperProfRD(self) -> np.ndarray:
+    def _s_OperProfRD(self) -> g.ndarray:
         return self.p(ratio(self._operating_profit_rd(), self.b("at")))
 
-    def _s_CBOperProf(self) -> np.ndarray:
-        def change(item: str) -> np.ndarray:
+    def _s_CBOperProf(self) -> g.ndarray:
+        def change(item: str) -> g.ndarray:
             return self.b(item) - lag(self.b(item), 4)
 
-        cash_profit = (
-            self._operating_profit_rd() - change("rect") - change("invt") - change("prepaid") + change("ap")
-        )
+        cash_profit = self._operating_profit_rd() - change("rect") - change("invt") - change("prepaid") + change("ap")
         return self.p(ratio(cash_profit, self.b("at")))
 
-    def _s_RoE(self) -> np.ndarray:
+    def _s_RoE(self) -> g.ndarray:
         return self.p(ratio(self.x("ni"), positive(self.be())))
 
-    def _s_roaq(self) -> np.ndarray:
+    def _s_roaq(self) -> g.ndarray:
         return self.p(ratio(self.qtr("ib"), lag(self.b("at"), 1)))
 
-    def _s_OPLeverage(self) -> np.ndarray:
+    def _s_OPLeverage(self) -> g.ndarray:
         return self.p(ratio(self.x("xsga") + self.x("cogs"), self.b("at")))
 
-    def _s_tang(self) -> np.ndarray:
+    def _s_tang(self) -> g.ndarray:
         tangible = self.b("che") + 0.715 * self.b("rect") + 0.547 * self.b("invt") + 0.535 * self.b("ppe")
         return self.p(ratio(tangible, self.b("at")))
 
-    def _s_Tax(self) -> np.ndarray:
-        grid = self.grid
-        years = (np.arange(grid.quarters) + grid.first_quarter) // 4
-        rate = np.where(years < 2008, 0.33, 0.25)[None, :]
-        taxes, income = self.x("txt"), self.x("ib")
-        result = ratio(taxes, rate * income)
-        return self.p(np.where((income < 0) & (taxes > 0), 1.0, result))
-
-    def _s_PS(self) -> np.ndarray:
+    def _s_PS(self) -> g.ndarray:
         assets = self.b("at")
         income, cash_flow, sales = self.x("ib"), self.x("oancf"), self.x("sale")
         roa = ratio(income, assets)
@@ -1383,14 +1138,14 @@ class OAPSignals:
             (margin > lag(margin, 4), margin - lag(margin, 4)),
             (turnover > lag(turnover, 4), turnover - lag(turnover, 4)),
         ]
-        known = np.all([np.isfinite(value) for _, value in parts], axis=0)
-        score = self.p(np.where(known, np.sum([signal.astype(float) for signal, _ in parts], axis=0), np.nan))
+        known = g.all([g.isfinite(value) for _, value in parts], axis=0)
+        score = self.p(g.where(known, g.sum([signal.astype(float) for signal, _ in parts], axis=0), g.nan))
         shares = self.adjusted_shares
         previous = shift_rows(shares, YEAR)
-        no_issue = flag(shares <= previous * 1.0001, np.isfinite(shares) & np.isfinite(previous))
+        no_issue = flag(shares <= previous * 1.0001, g.isfinite(shares) & g.isfinite(previous))
         return score + no_issue
 
-    def _s_MS(self) -> np.ndarray:
+    def _s_MS(self) -> g.ndarray:
         assets = self.b("at")
         roa = ratio(self.x("ib"), assets)
         cfroa = ratio(self.x("oancf"), assets)
@@ -1407,10 +1162,10 @@ class OAPSignals:
         score = self.p((cfroa > roa).astype(float))
         for values in components:
             median = group_stat(values, self.sector, self.universe, "median")
-            score = score + np.where(np.isfinite(values) & (values > median), 1.0, 0.0)
-        return np.where(np.isfinite(components[0]) & np.isfinite(components[1]), score, np.nan)
+            score = score + g.where(g.isfinite(values) & (values > median), 1.0, 0.0)
+        return g.where(g.isfinite(components[0]) & g.isfinite(components[1]), score, g.nan)
 
-    def _s_OScore(self) -> np.ndarray:
+    def _s_OScore(self) -> g.ndarray:
         assets, liabilities = self.b("at"), self.b("lt")
         current_assets, current_liabilities = self.b("act"), self.b("lct")
         income = self.x("ib")
@@ -1421,178 +1176,147 @@ class OAPSignals:
             + 6.03 * ratio(liabilities, assets)
             - 1.43 * ratio(current_assets - current_liabilities, assets)
             + 0.076 * ratio(current_liabilities, current_assets)
-            - 1.72 * flag(liabilities > assets, np.isfinite(liabilities - assets))
+            - 1.72 * flag(liabilities > assets, g.isfinite(liabilities - assets))
             - 2.37 * ratio(income, assets)
             - 1.83 * ratio(self.x("oancf"), liabilities)
-            + 0.285 * flag((income < 0) & (previous < 0), np.isfinite(income + previous))
-            - 0.521 * ratio(income - previous, np.abs(income) + np.abs(previous))
+            + 0.285 * flag((income < 0) & (previous < 0), g.isfinite(income + previous))
+            - 0.521 * ratio(income - previous, g.abs(income) + g.abs(previous))
         )
         return self.p(score)
 
-    def _s_EarningsConsistency(self) -> np.ndarray:
+    def _s_EarningsConsistency(self) -> g.ndarray:
         earnings = self.x("ib")
-        base = (np.abs(lag(earnings, 4)) + np.abs(lag(earnings, 8))) / 2.0
+        base = (g.abs(lag(earnings, 4)) + g.abs(lag(earnings, 8))) / 2.0
         change = ratio(earnings - lag(earnings, 4), base)
-        change = np.where(np.abs(change) <= 6.0, change, np.nan)
-        change = np.where(np.sign(change) == np.sign(lag(change, 4)), change, np.nan)
+        change = g.where(g.abs(change) <= 6.0, change, g.nan)
+        change = g.where(g.sign(change) == g.sign(lag(change, 4)), change, g.nan)
         return self.p(quarter_window(change, (0, 4, 8, 12), 4))
 
-    def _earnings_surprise(self) -> np.ndarray:
+    def _earnings_surprise(self) -> g.ndarray:
         return self._memo("earnings_surprise", lambda: self.p(self.surprise(self.qtr("ib"))))
 
-    def _s_EarningsSurprise(self) -> np.ndarray:
+    def _s_EarningsSurprise(self) -> g.ndarray:
         return self._earnings_surprise()
 
-    def _s_RevenueSurprise(self) -> np.ndarray:
+    def _s_RevenueSurprise(self) -> g.ndarray:
         return self.p(self.surprise(self.qtr("sale")))
 
-    def _s_NumEarnIncrease(self) -> np.ndarray:
-        earnings = self.qtr("ib")
-        previous = lag(earnings, 4)
-        known = np.isfinite(earnings) & np.isfinite(previous)
-        streak = np.full(earnings.shape, np.nan)
-        running = np.zeros(earnings.shape[0])
-        for column in range(earnings.shape[1]):
-            running = np.where(known[:, column] & (earnings[:, column] > previous[:, column]),
-                               np.minimum(running + 1.0, 8.0), 0.0)
-            streak[:, column] = np.where(known[:, column], running, np.nan)
-        return self.p(streak)
-
-    def _s_EarnSupBig(self) -> np.ndarray:
+    def _s_EarnSupBig(self) -> g.ndarray:
         return self._for_small_firms(self._earnings_surprise())
 
-    def _s_MeanRankRevGrowth(self) -> np.ndarray:
-        sales = self.x("sale")
-        ranks = cross_rank(self.p(growth(sales, lag(sales, 4))), self.universe)
-        total = np.zeros(ranks.shape)
-        weights = np.zeros(ranks.shape)
-        for year, weight in enumerate((5.0, 4.0, 3.0, 2.0, 1.0)):
-            value = shift_rows(ranks, YEAR * year)
-            known = np.isfinite(value)
-            total += np.where(known, weight * value, 0.0)
-            weights += weight * known
-        with np.errstate(invalid="ignore", divide="ignore"):
-            return np.where(weights >= 12.0, total / weights, np.nan)
-
-    def _growth_over_two_years(self, values: np.ndarray) -> np.ndarray:
+    def _growth_over_two_years(self, values: g.ndarray) -> g.ndarray:
         """Growth relative to the average of one and two years ago, or one year ago when two is missing."""
         previous = lag(values, 4)
-        base = np.where(np.isfinite(lag(values, 8)), (previous + lag(values, 8)) / 2.0, previous)
+        base = g.where(g.isfinite(lag(values, 8)), (previous + lag(values, 8)) / 2.0, previous)
         return growth(values, base)
 
-    def _s_GrSaleToGrInv(self) -> np.ndarray:
+    def _s_GrSaleToGrInv(self) -> g.ndarray:
         return self.p(self._growth_over_two_years(self.x("sale")) - self._growth_over_two_years(self.b("invt")))
 
-    def _s_GrSaleToGrOverhead(self) -> np.ndarray:
+    def _s_GrSaleToGrOverhead(self) -> g.ndarray:
         return self.p(self._growth_over_two_years(self.x("sale")) - self._growth_over_two_years(self.x("xsga")))
 
-    def _s_ChAssetTurnover(self) -> np.ndarray:
+    def _s_ChAssetTurnover(self) -> g.ndarray:
         noa = self.noa()
         turnover = ratio(self.x("sale"), positive((noa + lag(noa, 4)) / 2.0))
         return self.p(turnover - lag(turnover, 4))
 
-    def _s_OrgCap(self) -> np.ndarray:
-        grid = self.grid
-        expense = self.grid.annual("sell_exp") + self.grid.annual("admin_exp")
-        capital = np.full(expense.shape, np.nan)
-        running = np.full(expense.shape[0], np.nan)
-        for column in np.flatnonzero(grid.quarter_index == 3):
-            current = expense[:, column]
-            started = np.isfinite(running)
-            running = np.where(started, 0.85 * running + finite_or(current, 0.0), 4.0 * current)
-            capital[:, column] = np.where(np.isfinite(current), running, np.nan)
-        scaled = self.grid.panel(ratio(capital, self.b("at")), annual=True).to_numpy()
-        mean = group_stat(scaled, self.sector, self.universe, "mean")
-        spread = group_stat(scaled, self.sector, self.universe, "std")
-        return ratio(scaled - mean, spread)
-
-    # ------------------------------------------------------------------ investment and accruals
-    def _s_AssetGrowth(self) -> np.ndarray:
+    def _s_AssetGrowth(self) -> g.ndarray:
         assets = self.b("at")
         return self.p(growth(assets, lag(assets, 4)))
 
-    def _s_ChEQ(self) -> np.ndarray:
+    def _s_ChEQ(self) -> g.ndarray:
         book = positive(self.be())
         return self.p(ratio(book, lag(book, 4)))
 
-    def _s_ChInv(self) -> np.ndarray:
+    def _s_ChInv(self) -> g.ndarray:
         return self.change_over_avg_at(self.b("invt"))
 
-    def _s_InvGrowth(self) -> np.ndarray:
+    def _s_InvGrowth(self) -> g.ndarray:
         inventory = self.b("invt")
         return self.p(growth(inventory, lag(inventory, 4)))
 
-    def _s_InvestPPEInv(self) -> np.ndarray:
+    def _s_InvestPPEInv(self) -> g.ndarray:
         values = self.b("ppe") + self.b("invt")
         return self.p(ratio(values - lag(values, 4), lag(self.b("at"), 4)))
 
-    def _s_dNoa(self) -> np.ndarray:
+    def _s_dNoa(self) -> g.ndarray:
         noa = self.noa()
         return self.p(ratio(noa - lag(noa, 4), lag(self.b("at"), 4)))
 
-    def _s_NOA(self) -> np.ndarray:
+    def _s_NOA(self) -> g.ndarray:
         return self.p(ratio(self.noa(), lag(self.b("at"), 4)))
 
-    def _s_ChNWC(self) -> np.ndarray:
+    def _s_ChNWC(self) -> g.ndarray:
         working = ratio((self.b("act") - self.b("che")) - (self.b("lct") - self.b("dlc")), self.b("at"))
         return self.p(working - lag(working, 4))
 
-    def _s_ChNNCOA(self) -> np.ndarray:
+    def _s_ChNNCOA(self) -> g.ndarray:
         assets = self.b("at") - self.b("act") - self.b("ivao")
         liabilities = self.b("lt") - self.b("lct") - self.b("dltt")
         non_current = ratio(assets - liabilities, self.b("at"))
         return self.p(non_current - lag(non_current, 4))
 
-    def _s_DelCOA(self) -> np.ndarray:
+    def _s_DelCOA(self) -> g.ndarray:
         return self.change_over_avg_at(self.b("act") - self.b("che"))
 
-    def _s_DelCOL(self) -> np.ndarray:
+    def _s_DelCOL(self) -> g.ndarray:
         return self.change_over_avg_at(self.b("lct") - self.b("dlc"))
 
-    def _s_DelEqu(self) -> np.ndarray:
+    def _s_DelEqu(self) -> g.ndarray:
         return self.change_over_avg_at(self.be())
 
-    def _s_DelFINL(self) -> np.ndarray:
+    def _s_DelFINL(self) -> g.ndarray:
         return self.change_over_avg_at(self.debt() + self.b("pstk"))
 
-    def _s_DelLTI(self) -> np.ndarray:
+    def _s_DelLTI(self) -> g.ndarray:
         return self.change_over_avg_at(self.b("ivao"))
 
-    def _s_DelNetFin(self) -> np.ndarray:
+    def _s_DelNetFin(self) -> g.ndarray:
         return self.change_over_avg_at(self.b("ivst") + self.b("ivao") - self.debt() - self.b("pstk"))
 
-    def _s_GrLTNOA(self) -> np.ndarray:
+    def _s_GrLTNOA(self) -> g.ndarray:
         assets = self.b("at")
         other_assets = self.b("nca") - self.b("ppe") - self.b("intan") - self.b("ivao")
         current_other = self.b("lct") - self.b("dlc") - self.b("ap")
         long_other = self.b("ncl") - self.b("dltt")
         operating = (
-            self.b("rect") + self.b("invt") + self.b("ppe") + self.b("aco") + self.b("intan") + other_assets
-            - self.b("ap") - current_other - long_other
+            self.b("rect")
+            + self.b("invt")
+            + self.b("ppe")
+            + self.b("aco")
+            + self.b("intan")
+            + other_assets
+            - self.b("ap")
+            - current_other
+            - long_other
         )
         noa = ratio(operating, assets)
 
-        def change(values: np.ndarray) -> np.ndarray:
+        def change(values: g.ndarray) -> g.ndarray:
             return values - lag(values, 4)
 
         accruals = ratio(
-            change(self.b("rect")) + change(self.b("invt")) + change(self.b("aco"))
-            - (change(self.b("ap")) + change(current_other)) - self.x("dp"),
+            change(self.b("rect"))
+            + change(self.b("invt"))
+            + change(self.b("aco"))
+            - (change(self.b("ap")) + change(current_other))
+            - self.x("dp"),
             self.avg_at(),
         )
         return self.p(noa - lag(noa, 4) - accruals)
 
-    def _accruals(self) -> np.ndarray:
-        def change(item: str) -> np.ndarray:
+    def _accruals(self) -> g.ndarray:
+        def change(item: str) -> g.ndarray:
             return self.b(item) - lag(self.b(item), 4)
 
         working = change("act") - change("che") - (change("lct") - change("dlc") - change("txp"))
         return ratio(working, self.avg_at())
 
-    def _s_Accruals(self) -> np.ndarray:
+    def _s_Accruals(self) -> g.ndarray:
         return self.p(self._accruals())
 
-    def _s_AbnormalAccruals(self) -> np.ndarray:
+    def _s_AbnormalAccruals(self) -> g.ndarray:
         assets = self.b("at")
         lagged = lag(assets, 4)
         accruals = self.p(ratio(self.x("ib") - self.x("oancf"), self.avg_at()))
@@ -1603,99 +1327,98 @@ class OAPSignals:
         ]
         return cross_residual(accruals, regressors, self.universe)
 
-    def _s_AccrualsBM(self) -> np.ndarray:
+    def _s_AccrualsBM(self) -> g.ndarray:
         book_to_market = ratio(self.p(positive(self.be())), self.cap)
-        accruals = np.where(np.isfinite(book_to_market), self.p(self._accruals()), np.nan)
+        accruals = g.where(g.isfinite(book_to_market), self.p(self._accruals()), g.nan)
         accrual_bucket = cross_bucket(accruals, self.universe, 5)
         value_bucket = cross_bucket(book_to_market, self.universe, 5)
-        result = np.where((accrual_bucket == 5) & (value_bucket == 1), 1.0, np.nan)
-        return np.where((accrual_bucket == 1) & (value_bucket == 5), 0.0, result)
+        result = g.where((accrual_bucket == 5) & (value_bucket == 1), 1.0, g.nan)
+        return g.where((accrual_bucket == 1) & (value_bucket == 5), 0.0, result)
 
-    def _s_PctAcc(self) -> np.ndarray:
+    def _s_PctAcc(self) -> g.ndarray:
         income = self.x("ib")
-        return self.p(ratio(income - self.x("oancf"), np.abs(income)))
+        return self.p(ratio(income - self.x("oancf"), g.abs(income)))
 
-    def _total_accruals(self) -> np.ndarray:
+    def _total_accruals(self) -> g.ndarray:
         """Net income less operating, investing and financing cash flows, plus equity issuance, less dividends."""
         flows = self.x("ni") - self.x("oancf") - self.x("ivncf") - self.x("fincf") + self.x("sstk")
         return self.p(flows) - self.dividends
 
-    def _s_PctTotAcc(self) -> np.ndarray:
-        return ratio(self._total_accruals(), self.p(np.abs(self.x("ni"))))
+    def _s_PctTotAcc(self) -> g.ndarray:
+        return ratio(self._total_accruals(), self.p(g.abs(self.x("ni"))))
 
-    def _s_TotalAccruals(self) -> np.ndarray:
+    def _s_TotalAccruals(self) -> g.ndarray:
         return ratio(self._total_accruals(), self.p(lag(self.b("at"), 4)))
 
-    def _s_ChTax(self) -> np.ndarray:
+    def _s_ChTax(self) -> g.ndarray:
         tax = self.qtr("txt")
         return self.p(ratio(tax - lag(tax, 4), lag(self.b("at"), 4)))
 
-    def _s_Investment(self) -> np.ndarray:
+    def _s_Investment(self) -> g.ndarray:
         intensity = ratio(self.x("capx"), positive(self.x("sale")))
         return self.p(ratio(intensity, quarter_window(intensity, (4, 8, 12), 3)))
 
-    def _s_ChInvIA(self) -> np.ndarray:
+    def _s_ChInvIA(self) -> g.ndarray:
         capex = self.x("capx")
         previous = lag(capex, 4)
-        base = np.where(np.isfinite(lag(capex, 8)), (previous + lag(capex, 8)) / 2.0, previous)
+        base = g.where(g.isfinite(lag(capex, 8)), (previous + lag(capex, 8)) / 2.0, previous)
         capex_growth = self.p(growth(capex, base))
         return capex_growth - group_stat(capex_growth, self.sector, self.universe, "mean")
 
-    def _s_grcapx(self) -> np.ndarray:
+    def _s_grcapx(self) -> g.ndarray:
         capex = self.x("capx")
         return self.p(growth(capex, lag(capex, 8)))
 
-    def _s_grcapx3y(self) -> np.ndarray:
+    def _s_grcapx3y(self) -> g.ndarray:
         capex = self.x("capx")
         return self.p(ratio(capex, positive(quarter_window(capex, (4, 8, 12), 3))))
 
-    def _s_CompositeDebtIssuance(self) -> np.ndarray:
+    def _s_CompositeDebtIssuance(self) -> g.ndarray:
         debt = self.debt()
         return self.p(safe_log(debt) - safe_log(lag(debt, 20)))
 
-    def _s_CompEquIss(self) -> np.ndarray:
+    def _s_CompEquIss(self) -> g.ndarray:
         five = 5 * YEAR
         value_growth = safe_log(ratio(self.cap_filled, shift_rows(self.cap_filled, five)))
         price_growth = safe_log(ratio(self.price, shift_rows(self.price, five)))
         return value_growth - price_growth
 
-    def _s_ShareIss1Y(self) -> np.ndarray:
+    def _s_ShareIss1Y(self) -> g.ndarray:
         shares = self.adjusted_shares
         return ratio(shift_rows(shares, 6 * MONTH), shift_rows(shares, 18 * MONTH)) - 1.0
 
-    def _s_ShareIss5Y(self) -> np.ndarray:
+    def _s_ShareIss5Y(self) -> g.ndarray:
         shares = self.adjusted_shares
         return ratio(shares, shift_rows(shares, 5 * YEAR)) - 1.0
 
-    def _s_NetEquityFinance(self) -> np.ndarray:
+    def _s_NetEquityFinance(self) -> g.ndarray:
         return self.p(ratio(self.x("sstk"), self.avg_at()))
 
-    def _net_debt_issued(self) -> np.ndarray:
+    def _net_debt_issued(self) -> g.ndarray:
         return self.x("dltis") - self.x("dltr")
 
-    def _s_NetDebtFinance(self) -> np.ndarray:
+    def _s_NetDebtFinance(self) -> g.ndarray:
         return self.p(ratio(self._net_debt_issued(), self.avg_at()))
 
-    def _s_XFIN(self) -> np.ndarray:
+    def _s_XFIN(self) -> g.ndarray:
         financing = self.p(self.x("sstk") + self._net_debt_issued()) - self.dividends
         return ratio(financing, self.p(self.b("at")))
 
-    def _s_DebtIssuance(self) -> np.ndarray:
+    def _s_DebtIssuance(self) -> g.ndarray:
         issued = self.x("dltis")
-        return self.p(flag(issued > 0, np.isfinite(issued)))
+        return self.p(flag(issued > 0, g.isfinite(issued)))
 
-    # ------------------------------------------------------------------ R&D and other
-    def _s_RD(self) -> np.ndarray:
+    def _s_RD(self) -> g.ndarray:
         return self.to_me(self.x("xrd"))
 
-    def _s_RDcap(self) -> np.ndarray:
+    def _s_RDcap(self) -> g.ndarray:
         research = self.x("xrd")
         capital = research.copy()
         for years, weight in ((1, 0.8), (2, 0.6), (3, 0.4), (4, 0.2)):
             capital = capital + weight * finite_or(lag(research, 4 * years), 0.0)
         return self.p(ratio(capital, self.b("at")))
 
-    def _s_SurpriseRD(self) -> np.ndarray:
+    def _s_SurpriseRD(self) -> g.ndarray:
         research, assets = self.x("xrd"), self.b("at")
         intensity = ratio(research, assets)
         surprise = (
@@ -1704,95 +1427,239 @@ class OAPSignals:
             & (growth(research, lag(research, 4)) > 0.05)
             & (growth(intensity, lag(intensity, 4)) > 0.05)
         )
-        return self.p(flag(surprise, np.isfinite(research)))
+        return self.p(flag(surprise, g.isfinite(research)))
 
-    def _herfindahl(self, values: np.ndarray) -> np.ndarray:
-        values = positive(self.p(values))
-        size = self._industry_size(values)
-        share = values / (group_stat(values, self.sector, self.universe, "mean") * size)
-        index = group_stat(share**2, self.sector, self.universe, "mean") * size
-        history = np.stack([shift_rows(index, YEAR * k) for k in range(3)], axis=2)
-        return nan_mean(history, 2)[0]
-
-    def _industry_size(self, values: np.ndarray) -> np.ndarray:
-        """Number of index members with a value in each stock's industry on each day."""
-        known = np.where(np.isfinite(values) & self.universe, 1.0, 0.0)
-        result = np.full(values.shape, np.nan)
-        for code in np.unique(self.sector[np.isfinite(self.sector)]):
-            members = self.sector == code
-            size = (known * members).sum(axis=1)
-            result = np.where(members, np.where(size > 0, size, np.nan)[:, None], result)
-        return result
-
-    def _s_Herf(self) -> np.ndarray:
+    def _s_Herf(self) -> g.ndarray:
         return self._herfindahl(self.x("sale"))
 
-    def _s_HerfBE(self) -> np.ndarray:
+    def _s_HerfBE(self) -> g.ndarray:
         return self._herfindahl(self.be())
 
-    def _s_HerfAsset(self) -> np.ndarray:
+    def _s_HerfAsset(self) -> g.ndarray:
         return self._herfindahl(self.b("at"))
 
-    def _s_FirmAge(self) -> np.ndarray:
+    def _s_FirmAge(self) -> g.ndarray:
         return self.age_months
 
-    # ------------------------------------------------------------------ events
-    def _s_AnnouncementReturn(self) -> np.ndarray:
-        frame = self._panel("fundamentals")
-        abnormal = self.returns - self._series("mkt")[:, None]
-        window_sum = trailing(abnormal, 4, 3, "sum")
-        announced = np.searchsorted(self.dates.to_numpy(), pd.to_datetime(frame["ann_date"]).to_numpy())
-        columns = self.instruments.get_indexer(frame["instrument"])
-        # The window ends two trading days after the announcement, when the signal is published.
-        published = announced + 2
-        keep = (columns >= 0) & (published < len(self.dates))
-        events = np.full(window_sum.shape, np.nan)
-        events[published[keep], columns[keep]] = window_sum[published[keep], columns[keep]]
-        return self._ffill(events)
-
-    def _s_IndIPO(self) -> np.ndarray:
+    def _s_IndIPO(self) -> g.ndarray:
         age = self.age_months
-        return flag((age >= 6) & (age <= 36), np.isfinite(age))
+        return flag((age >= 6) & (age <= 36), g.isfinite(age))
 
-    def _s_RDIPO(self) -> np.ndarray:
-        grid = self.grid
-        research, sales = self.x("xrd"), self.x("sale")
-        # A trailing year that lies wholly after R&D became its own line, with a blank line, has no R&D.
-        separate = (np.arange(grid.quarters) + grid.first_quarter) >= RD_LINE_YEAR * 4 + 3
-        known = np.isfinite(sales) & separate[None, :]
-        no_research = self.p(flag(finite_or(research, 0.0) == 0, known))
-        return self._s_IndIPO() * no_research
-
-    def _dividend_changes(self) -> np.ndarray:
+    def _dividend_changes(self) -> g.ndarray:
         """Days the trailing dividend amount changes by more than 5%: a payment enters or a year-old one drops out."""
-        def build() -> np.ndarray:
+
+        def build() -> g.ndarray:
             dividends = self.dividends
             previous = shift_rows(dividends, 1)
-            larger = np.fmax(dividends, previous)
-            known = np.isfinite(dividends) & np.isfinite(previous) & (larger > 0)
-            return known & (np.abs(dividends - previous) > 0.05 * larger)
+            larger = g.fmax(dividends, previous)
+            known = g.isfinite(dividends) & g.isfinite(previous) & (larger > 0)
+            return known & (g.abs(dividends - previous) > 0.05 * larger)
+
         return self._memo("dividend_changes", build)
 
-    def _s_DivInit(self) -> np.ndarray:
+    def _s_DivInit(self) -> g.ndarray:
         dividends = self.dividends
         half, year = shift_rows(dividends, 6 * MONTH), shift_rows(dividends, YEAR)
-        return flag((dividends > 0) & (half == 0) & (year == 0), np.isfinite(dividends) & np.isfinite(year))
+        return flag((dividends > 0) & (half == 0) & (year == 0), g.isfinite(dividends) & g.isfinite(year))
 
-    def _s_DivOmit(self) -> np.ndarray:
+    def _s_DivOmit(self) -> g.ndarray:
         dividends = self.dividends
         recent, year, two = (shift_rows(dividends, lag_days) for lag_days in (2 * MONTH, YEAR, 2 * YEAR))
         omitted = (dividends == 0) & (recent > 0) & (year > 0) & (two > 0)
-        return flag(omitted, np.isfinite(dividends) & np.isfinite(two))
+        return flag(omitted, g.isfinite(dividends) & g.isfinite(two))
 
-    def _seasonal_payer(self) -> np.ndarray:
+    def _seasonal_payer(self) -> g.ndarray:
         """1 where a dividend changed 11 to 12 months ago, so the annual payment is due within a month."""
         changes = trailing(self._dividend_changes().astype(float), MONTH, 1, "max")
         return shift_rows(changes, YEAR - MONTH) > 0
 
-    def _s_DivSeason(self) -> np.ndarray:
-        return np.where(self.dividends > 0, self._seasonal_payer().astype(float), np.nan)
+    def _s_DivSeason(self) -> g.ndarray:
+        return g.where(self.dividends > 0, self._seasonal_payer().astype(float), g.nan)
 
-    def _s_DivYieldST(self) -> np.ndarray:
-        expected = np.where(self._seasonal_payer(), ratio(self.dividends, self.cap), 0.0)
-        bins = np.where(expected <= 0, 0.0, np.where(expected <= 0.005, 1.0, np.where(expected <= 0.01, 2.0, 3.0)))
-        return np.where((self.dividends > 0) & np.isfinite(self.cap), bins, np.nan)
+    def _s_DivYieldST(self) -> g.ndarray:
+        expected = g.where(self._seasonal_payer(), ratio(self.dividends, self.cap), 0.0)
+        bins = g.where(expected <= 0, 0.0, g.where(expected <= 0.005, 1.0, g.where(expected <= 0.01, 2.0, 3.0)))
+        return g.where((self.dividends > 0) & g.isfinite(self.cap), bins, g.nan)
+
+    def _s_Beta(self):
+        return op.regression(self.monthly_returns, [self._factor_month("mkt")], 60, 20, "kBeta", MONTH)
+
+    def _s_BetaFP(self):
+        stock = g.log1p(self.returns)
+        market = g.log1p(self._series("mkt"))
+        s3 = trailing(stock, 3, 3, "sum")
+        m3 = trailing(market, 3, 3, "sum")
+        corr = op.correlation(s3, g.where(g.isfinite(s3), m3, g.nan), 5 * YEAR, 3 * YEAR)
+        return g.clip(corr, -1, 1) * ratio(
+            trailing(stock, YEAR, 120, "std"), trailing(g.where(g.isfinite(stock), market, g.nan), YEAR, 120, "std")
+        )
+
+    def tail_index(self):
+        values = [shift_rows(self._members(self.returns), j) for j in range(MONTH)]
+        pushes = "".join(f"if(std::isfinite(input_{j}[i])) pool.push_back(input_{j}[i]);" for j in range(MONTH))
+        tail = op.cross(
+            f"""
+        std::vector<double> pool;for(size_t i=0;i<num_stocks;++i) {{{pushes}}}
+        double tail=NAN;
+        if(pool.size()>=100) {{
+            std::sort(pool.begin(),pool.end());double position=(pool.size()-1)*0.05;size_t lo=(size_t)position;
+            double threshold=pool[lo]+(position-lo)*(pool[std::min(lo+1,pool.size()-1)]-pool[lo]);
+            double total=0,count=0;
+            if(threshold<0) for(double z:pool) if(z<threshold) {{total+=std::log(z/threshold);++count;}}
+            if(count>0) tail=total/count;
+        }}
+        for(size_t i=0;i<num_stocks;++i) output_0[i]=tail;
+        """,
+            *values,
+        )
+        row = op.state([self.close], "y=s.row++;", "int row;", "s.row=0;")
+        return g.where(row >= MONTH - 1, tail, g.nan)
+
+    def _s_BetaTailRisk(self):
+        return op.regression(self.monthly_returns, [shift_rows(self.tail_index(), MONTH)], 60, 36, "kBeta", MONTH)
+
+    def _s_CoskewACX(self):
+        return op.coskew(g.log1p(self.returns), g.log1p(self._series("mkt")), YEAR, 150)
+
+    def _s_Coskewness(self):
+        return op.coskew(g.log1p(self.monthly_returns), g.log1p(self._factor_month("mkt")), 60, 24, MONTH)
+
+    def _price_delay(self):
+        return self._memo(
+            "price_delay",
+            lambda: {
+                name: op.price_delay(self.returns, self._series("mkt"), YEAR, 150, name)
+                for name in ("rsq", "slope", "tstat")
+            },
+        )
+
+    def _s_ResidualMomentum(self):
+        return op.regression(
+            self.monthly_returns,
+            [self._factor_month(name) for name in MARKET_FACTORS],
+            36,
+            24,
+            "kResidualMomentum",
+            MONTH,
+            24,
+            35,
+        )
+
+    def _s_TrendFactor(self):
+        ratios = [ratio(trailing(self.close, n, (4 * n + 4) // 5, "mean"), self.close) for n in TREND_WINDOWS]
+        xs = [shift_rows(value, MONTH) for value in ratios]
+        universe = shift_rows(self.universe, MONTH) > 0
+        coefficients = [
+            op.cross_fit(self.monthly_returns, xs, universe, minimum=36, coefficient=j + 1) for j in range(len(ratios))
+        ]
+        averaged = [op.mean_lags(value, [MONTH * j for j in range(12)], 8) for value in coefficients]
+        return sum(value * coefficient for value, coefficient in zip(ratios, averaged, strict=False))
+
+    def _monthly_std(self, values, window, minimum):
+        return trailing(trailing(values, MONTH, 15, "sum"), window, minimum, "std", MONTH)
+
+    def _s_VolumeTrend(self):
+        volume = trailing(self.volume, MONTH, 15, "sum")
+        trend = op.state([volume], "y=s.index++;", "int index;", "s.index=0;")
+        # A residue class advances one observation each 21 trading days.
+        slope = op.regression(volume, [trend / MONTH], 60, 30, "kBeta", MONTH)
+        return ratio(slope, trailing(volume, 60, 30, "mean", MONTH))
+
+    def _zerotrade(self, months):
+        window = months * MONTH
+        listed = op.state([self.trading], "s.known=s.known||x0;y=s.known;", "bool known;", "s.known=false;")
+        zero = trailing(listed & ~self.trading, window, window, "sum")
+        turnover = trailing(finite_or(self.turnover, 0), window, window, "sum")
+        return zero + ratio(1, positive(turnover)) / 480000
+
+    def _historical_cap(self, name):
+        return op.state(
+            [self.cap_filled, self._array(name)],
+            "s.v.push_back(x0); y=NAN; if(std::isfinite(x1) && x1>=0 && x1<(double)s.v.size()) y=s.v[(size_t)x1];",
+            "std::vector<double> v;",
+        )
+
+    def _s_BM(self):
+        return safe_log(ratio(self.p(self.be() - self.b("intan")), self._historical_cap("quarter_end_row")))
+
+    def _s_BMdec(self):
+        return ratio(self.p(self.be()), self._historical_cap("december_row"))
+
+    def _s_VarCF(self):
+        return trailing(self._s_CF(), 60, 24, "var", MONTH)
+
+    def _s_Tax(self):
+        rate = g.where(self.grid.value("oap_year") < 2008, 0.33, 0.25)
+        taxes, income = self.x("txt"), self.x("ib")
+        return self.p(g.where((income < 0) & (taxes > 0), 1, ratio(taxes, rate * income)))
+
+    def _s_NumEarnIncrease(self):
+        earnings = self.qtr("ib")
+        previous = lag(earnings, 4)
+        streak = op.state(
+            [earnings, previous],
+            "bool known=std::isfinite(x0)&&std::isfinite(x1);"
+            "s.count=known&&x0>x1?std::min(s.count+1,8):0;y=known?s.count:NAN;",
+            "int count;",
+            "s.count=0;",
+        )
+        return self.p(streak)
+
+    def _s_MeanRankRevGrowth(self):
+        sales = self.x("sale")
+        ranks = cross_rank(self.p(growth(sales, lag(sales, 4))), self.universe)
+        total = op.as_expr(0)
+        weights = op.as_expr(0)
+        for year, weight in enumerate((5, 4, 3, 2, 1)):
+            value = shift_rows(ranks, YEAR * year)
+            known = g.isfinite(value)
+            total = total + g.where(known, weight * value, 0)
+            weights = weights + weight * known
+        return g.where(weights >= 12, total / weights, g.nan)
+
+    def _s_OrgCap(self):
+        expense = self.grid.annual("sell_exp") + self.grid.annual("admin_exp")
+        capital = op.state(
+            [expense, self.grid.quarter_index],
+            "y=NAN;if(x1==3) {"
+            "s.running=std::isfinite(s.running)?0.85*s.running+(std::isfinite(x0)?x0:0):4*x0;"
+            "if(std::isfinite(x0)) y=s.running;}",
+            "double running;",
+            "s.running=NAN;",
+        )
+        scaled = self.p(ratio(capital, self.b("at")), annual=True)
+        return ratio(
+            scaled - group_stat(scaled, self.sector, self.universe, "mean"),
+            group_stat(scaled, self.sector, self.universe, "std"),
+        )
+
+    def _industry_size(self, values):
+        return group_stat(values, self.sector, self.universe, "count")
+
+    def _herfindahl(self, values):
+        values = positive(self.p(values))
+        size = self._industry_size(values)
+        share = values / (group_stat(values, self.sector, self.universe, "mean") * size)
+        index = group_stat(share**2, self.sector, self.universe, "mean") * size
+        return op.mean_lags(index, [0, YEAR, 2 * YEAR], 1)
+
+    def _s_AnnouncementReturn(self):
+        abnormal = self.returns - self._series("mkt")
+        total = trailing(abnormal, 4, 3, "sum")
+        return op.ffill(g.where(self._array("announced") == 1, total, g.nan))
+
+    def _s_RDIPO(self):
+        research, sales = self.x("xrd"), self.x("sale")
+        separate = (self.grid.value("oap_year") * 4 + self.grid.quarter_index) >= (RD_LINE_YEAR * 4 + 3)
+        no_research = self.p(flag(finite_or(research, 0) == 0, g.isfinite(sales) & separate))
+        return self._s_IndIPO() * no_research
+
+
+@lru_cache(maxsize=1)
+def _definitions():
+    graph = OAPSignals()
+    outputs = {}
+    for name in OAP_NAMES:
+        value = getattr(graph, "_s_" + name)()
+        outputs[name] = g.where(g.isfinite(value) & graph.trading, value, g.nan)
+    return outputs, graph.statements

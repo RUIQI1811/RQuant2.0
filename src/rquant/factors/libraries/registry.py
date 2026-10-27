@@ -26,6 +26,8 @@ class FactorLibraryRegistry:
         unknown_inputs = sorted(set(library.required_inputs) - set(CANONICAL_INPUT_FIELDS))
         if unknown_inputs:
             raise FactorContractError(f"Factor library {family} requires unknown inputs: {unknown_inputs}")
+        if set(library.reference_inputs) & set(CANONICAL_INPUT_FIELDS):
+            raise FactorContractError(f"Factor library {family} declares canonical fields as reference inputs")
         if not library.specs:
             raise FactorContractError(f"Factor library is empty: {family}")
         if any(spec.family != family for spec in library.specs):
@@ -106,6 +108,11 @@ class FactorLibraryRegistry:
     def required_inputs(self, factor_set: FactorSet) -> tuple[str, ...]:
         required = {field for library in self.select(factor_set) for field in library.required_inputs}
         return tuple(field for field in CANONICAL_INPUT_FIELDS if field in required)
+
+    def reference_inputs(self, factor_set: FactorSet) -> tuple[str, ...]:
+        """Non-canonical inputs of the factor set's libraries, in library declaration order."""
+        names = (name for library in self.select(factor_set) for name in library.reference_inputs)
+        return tuple(dict.fromkeys(names))
 
     def implementation_fingerprint(self, factor_set: FactorSet) -> str:
         libraries = [

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -9,13 +11,21 @@ import pandas as pd
 
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS, STATEMENT_KEY_FIELDS
 from rquant.factors.catalog import get_catalog
-from rquant.factors.engine import FactorBuildConfig, PanelFactorEngine, create_factor_engine
+from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine, create_factor_engine
 from rquant.factors.libraries.oap import (
     OAP,
     OAP_NAMES,
     OAP_SKIPPED,
     REQUIRED_LINES,
     OAPLibrary,
+)
+from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from panel_reference.oap import (  # noqa: E402
+    OAPLibrary as ReferenceLibrary,
+)
+from panel_reference.oap import (
     corwin_schultz,
     cross_residual,
     group_stat,
@@ -24,7 +34,32 @@ from rquant.factors.libraries.oap import (
     price_delay,
     rolling_coskew,
 )
-from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+
+@lru_cache(maxsize=1)
+def compiled():
+    temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    engine = KunQuantFactorEngine(temporary.name, FactorBuildConfig(factor_set="oap", workers=2))
+    return temporary, engine, engine.compile(), engine.compile_statements()
+
+
+def calculate(inputs):
+    _, engine, module, statement_modules = compiled()
+    close = inputs["close"]
+    prepared = OAPLibrary().align_reference_inputs(inputs, close.index, close.columns)
+    statements = engine.run_statements(prepared, close.index, close.columns, statement_modules)
+    arrays = {}
+    for name in engine.input_fields:
+        value = statements.daily(name) if name in statements else prepared[name]
+        if isinstance(value, pd.Series):
+            value = np.repeat(value.to_numpy()[:, None], len(close.columns), axis=1)
+        arrays[name] = np.ascontiguousarray(value, dtype=float)
+    output = engine.run(arrays, module=module, statements=statements)
+    return {
+        spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
+        for spec in OAPLibrary().specs
+    }
+
 
 BALANCE = tuple(f for f in FUNDAMENTAL_ENDPOINT_FIELDS["balancesheet"] if f not in STATEMENT_KEY_FIELDS)
 FLOWS = tuple(
@@ -110,8 +145,8 @@ def synthetic_inputs(days: int = 2200, stocks: int = 40, seed: int = 5) -> dict[
         "cap": cap,
         "sector": sector,
         "basic_close": raw_close,
-        "basic_turnover_rate": panels["volume"] / pd.DataFrame(
-            np.tile(shares * 0.8, (days, 1)), index=dates, columns=instruments),
+        "basic_turnover_rate": panels["volume"]
+        / pd.DataFrame(np.tile(shares * 0.8, (days, 1)), index=dates, columns=instruments),
         "basic_total_share": pd.DataFrame(np.tile(shares, (days, 1)), index=dates, columns=instruments),
         "basic_dv_ttm": dps / raw_close,
         "mkt": pd.Series(market, index=dates),
@@ -156,7 +191,19 @@ class OAPCalculationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.inputs = synthetic_inputs()
-        cls.outputs = OAPLibrary().calculate(cls.inputs)
+        cls.outputs = calculate(cls.inputs)
+
+    def test_every_signal_matches_independent_reference(self) -> None:
+        reference = ReferenceLibrary().calculate(self.inputs)
+        for name in OAP_NAMES:
+            np.testing.assert_allclose(
+                self.outputs[name].to_numpy(),
+                reference[name].to_numpy(),
+                rtol=1e-6,
+                atol=1e-9,
+                equal_nan=True,
+                err_msg=name,
+            )
 
     def test_all_signals_are_aligned_and_populated(self) -> None:
         close = self.inputs["close"]
@@ -173,7 +220,7 @@ class OAPCalculationTests(unittest.TestCase):
         dates = self.inputs["close"].index
         for cut in (900, 1700):
             last = dates[cut]
-            past = OAPLibrary().calculate(truncated(self.inputs, last))
+            past = calculate(truncated(self.inputs, last))
             for name in OAP_NAMES:
                 expected = self.outputs[name].loc[:last].to_numpy()
                 actual = past[name].to_numpy()
@@ -185,8 +232,9 @@ class OAPCalculationTests(unittest.TestCase):
         price = close.iloc[:, column]
         mom6 = price.iloc[row - 21] / price.iloc[row - 126] - 1.0
         self.assertAlmostEqual(mom6, self.outputs["Mom6m"].iloc[row, column])
-        self.assertAlmostEqual(price.iloc[row - 252] / price.iloc[row - 378] - 1.0,
-                               self.outputs["MRreversal"].iloc[row, column])
+        self.assertAlmostEqual(
+            price.iloc[row - 252] / price.iloc[row - 378] - 1.0, self.outputs["MRreversal"].iloc[row, column]
+        )
         returns = price.pct_change()
         self.assertAlmostEqual(returns.iloc[row - 20 : row + 1].max(), self.outputs["MaxRet"].iloc[row, column])
         monthly_returns = price / price.shift(21) - 1.0
@@ -303,8 +351,14 @@ class OAPHelperTests(unittest.TestCase):
         np.testing.assert_allclose(0.0, residual, atol=1e-9)
 
     def test_published_statements_zero_fill_blank_lines(self) -> None:
-        frame = pd.DataFrame({"total_assets": [10.0, np.nan], "goodwill": [np.nan, np.nan],
-                              "revenue": [1.0, 1.0], "n_cashflow_act": [1.0, 1.0]})
+        frame = pd.DataFrame(
+            {
+                "total_assets": [10.0, np.nan],
+                "goodwill": [np.nan, np.nan],
+                "revenue": [1.0, 1.0],
+                "n_cashflow_act": [1.0, 1.0],
+            }
+        )
         prepared = prepare_fundamentals(frame)
         self.assertEqual(0.0, prepared["goodwill"].iloc[0])
         self.assertTrue(np.isnan(prepared["goodwill"].iloc[1]))
@@ -317,15 +371,19 @@ class OAPEngineTests(unittest.TestCase):
             root = Path(temporary)
             canonical = root / "canonical"
             reference = canonical / "reference"
-            records = [inputs[field].stack(future_stack=True).rename(field)
-                       for field in ("high", "low", "close", "volume", "amount", "cap", "sector")]
+            records = [
+                inputs[field].stack(future_stack=True).rename(field)
+                for field in ("high", "low", "close", "volume", "amount", "cap", "sector")
+            ]
             bars = pd.concat(records, axis=1).reset_index()
             bars["in_csi300"] = True
             bars_path = canonical / "bars" / "year=2012" / "bars.parquet"
             bars_path.parent.mkdir(parents=True)
             bars.to_parquet(bars_path, index=False)
-            atomic_write_json(canonical / "manifest.json", {"status": "complete", "fingerprint": "canonical-fixture",
-                                                            "raw_fingerprint": "raw-fixture"})
+            atomic_write_json(
+                canonical / "manifest.json",
+                {"status": "complete", "fingerprint": "canonical-fixture", "raw_fingerprint": "raw-fixture"},
+            )
             files = {}
             daily = pd.concat(
                 [
@@ -341,34 +399,47 @@ class OAPEngineTests(unittest.TestCase):
                 path.parent.mkdir(parents=True)
                 frame.to_parquet(path, index=False)
                 files[f"daily_basic/year={year_value}/data.parquet"] = sha256_file(path)
-            pd.DataFrame({"datetime": inputs["close"].index, "mkt": inputs["mkt"].to_numpy(),
-                          "smb": inputs["smb"].to_numpy(), "hml": inputs["hml"].to_numpy(),
-                          "stocks": 200}).to_parquet(reference / "market_factors.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "datetime": inputs["close"].index,
+                    "mkt": inputs["mkt"].to_numpy(),
+                    "smb": inputs["smb"].to_numpy(),
+                    "hml": inputs["hml"].to_numpy(),
+                    "stocks": 200,
+                }
+            ).to_parquet(reference / "market_factors.parquet", index=False)
             files["market_factors.parquet"] = sha256_file(reference / "market_factors.parquet")
             inputs["fundamentals"].to_parquet(reference / "fundamentals.parquet", index=False)
             files["fundamentals.parquet"] = sha256_file(reference / "fundamentals.parquet")
             listed = inputs["list_date"]
-            pd.DataFrame({"ts_code": [f"{code[2:]}.SH" for code in listed.index],
-                          "list_date": listed.dt.strftime("%Y%m%d").to_numpy()}).to_parquet(
-                reference / "stock_basic.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "ts_code": [f"{code[2:]}.SH" for code in listed.index],
+                    "list_date": listed.dt.strftime("%Y%m%d").to_numpy(),
+                }
+            ).to_parquet(reference / "stock_basic.parquet", index=False)
             manifest = {"status": "complete", "raw_fingerprint": "raw-fixture", "files": files}
             manifest["fingerprint"] = stable_hash(manifest)
             atomic_write_json(reference / "manifest.json", manifest)
 
             engine = create_factor_engine(root / "cache", FactorBuildConfig(factor_set="oap"))
-            self.assertIsInstance(engine, PanelFactorEngine)
+            self.assertIsInstance(engine, KunQuantFactorEngine)
+            _, _, module, statement_modules = compiled()
+            engine.compile = lambda: module
+            engine.compile_statements = lambda: statement_modules
             result = engine.build_from_canonical(canonical, root / "factors")
             self.assertEqual(len(OAP), result["columns"])
             self.assertEqual(manifest["fingerprint"], result["reference_inputs"]["oap_reference"])
             stored = pd.read_parquet(root / "factors" / "oap" / "year=2012" / "factors.parquet")
             self.assertEqual(["datetime", "instrument", *get_catalog().canonical_names("oap")], list(stored.columns))
-            direct = OAPLibrary().calculate(inputs)
+            direct = ReferenceLibrary().calculate(inputs)
             for position in (0, 19, 70, 138):
                 canonical_name, name = f"oap_{position + 1:03d}", OAP_NAMES[position]
                 values = stored.set_index(["datetime", "instrument"])[canonical_name].unstack()
                 expected = direct[name].loc[values.index, values.columns]
-                np.testing.assert_allclose(values.to_numpy(), expected.to_numpy(), rtol=1e-9, equal_nan=True,
-                                           err_msg=name)
+                np.testing.assert_allclose(
+                    values.to_numpy(), expected.to_numpy(), rtol=1e-9, equal_nan=True, err_msg=name
+                )
 
             stale = inputs["fundamentals"].drop(columns=["c_recp_borrow"])
             stale.to_parquet(reference / "fundamentals.parquet", index=False)
@@ -382,3 +453,7 @@ class OAPEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_oap_uses_compiled_backend():
+    assert OAPLibrary.backend == "kunquant"

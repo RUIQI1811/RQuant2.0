@@ -12,23 +12,24 @@ and trading day:
 
 Rows are trading dates and columns are instruments. Every regression window ends on the row it is published on and
 uses factor returns of that day and earlier only. Every output is missing on days the stock has no quote.
+
+The formulas run in KunQuant: the regressions are C++ kernels (``CPP_PRELUDE``) that read each stock's whole return
+series and accumulate the window sums with prefix sums, as the pandas reference in ``tests/panel_reference`` does.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from rquant.errors import DataContractError
-from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.panel_operators import replace_inf
+from rquant.factors.extensions import kunquant_panel as k
+from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 from rquant.io import sha256_file, stable_hash
 
-Panel = pd.DataFrame
 MONTH = 21
 HALF_YEAR = 120
 YEAR = 250
@@ -69,17 +70,155 @@ SIZE_VALUE_CHINA: tuple[tuple[str, str, int, tuple[str, str] | None], ...] = (
      ("ch4_250", "resmom")),
 )
 SIZE_VALUE_CHINA_NAMES = tuple(name for name, _, _, _ in SIZE_VALUE_CHINA)
-LAST_OUTPUT = {
-    key: [name for name, _, _, source in SIZE_VALUE_CHINA if source and source[0] == key][-1] for key in FITS
-}
 DAILY_BASIC_FIELDS = ("total_mv", "pe_ttm", "turnover_total")
+REFERENCE_INPUTS = (
+    *(f"basic_{field}" for field in DAILY_BASIC_FIELDS),
+    *(f"ch4_{name}" for name in sorted(set(CH3) | set(CH4))),
+)
+
+CPP_PRELUDE = r"""
+namespace rq_svc {
+
+// Mean of the finite values among the ``window`` rows ending at ``t``, missing with fewer than ``minimum`` of them.
+static inline double rolling_mean(const double *values, int t, int window, int minimum) {
+    double total = 0.0;
+    int count = 0;
+    for (int i = t - window + 1 < 0 ? 0 : t - window + 1; i <= t; ++i) {
+        if (std::isfinite(values[i])) { total += values[i]; ++count; }
+    }
+    return count >= minimum ? total / count : std::numeric_limits<double>::quiet_NaN();
+}
+
+// Solve the k x k system ``a x = b`` by Gaussian elimination with partial pivoting; false when singular.
+static inline bool solve(int k, std::vector<double> a, std::vector<double> b, double *x) {
+    for (int c = 0; c < k; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < k; ++r) if (std::fabs(a[r * k + c]) > std::fabs(a[pivot * k + c])) pivot = r;
+        if (a[pivot * k + c] == 0.0) return false;
+        if (pivot != c) {
+            for (int j = 0; j < k; ++j) std::swap(a[c * k + j], a[pivot * k + j]);
+            std::swap(b[c], b[pivot]);
+        }
+        for (int r = c + 1; r < k; ++r) {
+            const double factor = a[r * k + c] / a[c * k + c];
+            for (int j = c; j < k; ++j) a[r * k + j] -= factor * a[c * k + j];
+            b[r] -= factor * b[c];
+        }
+    }
+    for (int r = k - 1; r >= 0; --r) {
+        double value = b[r];
+        for (int j = r + 1; j < k; ++j) value -= a[r * k + j] * x[j];
+        x[r] = value / a[r * k + r];
+    }
+    return true;
+}
+
+// Rolling OLS of a stock's daily return on a constant and ``nx`` regressors over trailing ``window`` rows, dropping
+// rows where the return or a regressor is missing. ``output`` selects the published statistic: 0 alpha, 1..nx the
+// loadings, nx + 1 the residual standard deviation, nx + 2 R-squared, nx + 3 the mean over standard deviation of the
+// full-window residuals in window positions [first, last).
+static inline void rolling_ols(int n, const double *close, const double *const *x, int nx, int window, int minimum,
+                               int output, int first, int last, double *out) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const int k = nx + 1;
+    std::vector<double> design(static_cast<size_t>(n) * k, 0.0), weight(n, 0.0), value(n, 0.0);
+    int observed = 0;
+    for (int t = 0; t < n; ++t) {
+        const double y = t == 0 ? nan : close[t] / close[t - 1] - 1.0;
+        bool ok = true;
+        for (int j = 0; j < nx; ++j) ok = ok && std::isfinite(x[j][t]);
+        if (ok) {
+            design[t * k] = 1.0;
+            for (int j = 0; j < nx; ++j) design[t * k + 1 + j] = x[j][t];
+        }
+        if (ok && std::isfinite(y)) { weight[t] = 1.0; value[t] = y; ++observed; }
+    }
+    if (n < window || observed < minimum) return;
+    // Prefix sums of the window statistics: count, y, y^2, x w, x y and x x' w.
+    std::vector<double> pn(n + 1, 0.0), py(n + 1, 0.0), pyy(n + 1, 0.0);
+    std::vector<double> px(static_cast<size_t>(n + 1) * k, 0.0), pxy(static_cast<size_t>(n + 1) * k, 0.0);
+    std::vector<double> pxx(static_cast<size_t>(n + 1) * k * k, 0.0);
+    for (int t = 0; t < n; ++t) {
+        pn[t + 1] = pn[t] + weight[t];
+        py[t + 1] = py[t] + value[t];
+        pyy[t + 1] = pyy[t] + value[t] * value[t];
+        for (int a = 0; a < k; ++a) {
+            const double d = design[t * k + a];
+            px[(t + 1) * k + a] = px[t * k + a] + d * weight[t];
+            pxy[(t + 1) * k + a] = pxy[t * k + a] + d * value[t];
+            for (int b = 0; b < k; ++b) {
+                const size_t at = (static_cast<size_t>(t + 1) * k + a) * k + b;
+                pxx[at] = pxx[at - k * k] + d * design[t * k + b] * weight[t];
+            }
+        }
+    }
+    std::vector<double> gram(k * k), sxy(k), beta(k);
+    // Sum of x_a x_b w over rows [lo, hi).
+    auto xx = [&](int lo, int hi, int a, int b) {
+        return pxx[(static_cast<size_t>(hi) * k + a) * k + b] - pxx[(static_cast<size_t>(lo) * k + a) * k + b];
+    };
+    // beta' (sum of x x' w) beta and beta' (sum of v) over rows [lo, hi).
+    auto quadratic = [&](int lo, int hi) {
+        double total = 0.0;
+        for (int a = 0; a < k; ++a) {
+            double row = 0.0;
+            for (int b = 0; b < k; ++b) row += xx(lo, hi, a, b) * beta[b];
+            total += beta[a] * row;
+        }
+        return total;
+    };
+    auto linear = [&](const std::vector<double> &prefix, int lo, int hi) {
+        double total = 0.0;
+        for (int a = 0; a < k; ++a) total += beta[a] * (prefix[hi * k + a] - prefix[lo * k + a]);
+        return total;
+    };
+    for (int t = window - 1; t < n; ++t) {
+        const int lo = t + 1 - window, hi = t + 1;
+        const double count = pn[hi] - pn[lo];
+        if (!(count >= minimum)) continue;
+        for (int a = 0; a < k; ++a) {
+            sxy[a] = pxy[hi * k + a] - pxy[lo * k + a];
+            for (int b = 0; b < k; ++b) gram[a * k + b] = xx(lo, hi, a, b);
+        }
+        if (!solve(k, gram, sxy, beta.data())) continue;
+        double result = nan;
+        if (output <= nx) {
+            result = beta[output];
+        } else {
+            const double sy = py[hi] - py[lo], syy = pyy[hi] - pyy[lo];
+            const double squared = syy - 2.0 * linear(pxy, lo, hi) + quadratic(lo, hi);
+            const double total = syy - sy * sy / count;
+            const bool keep = squared > 1e-14 * (syy > 1e-300 ? syy : 1e-300) && total > 0;
+            if (output == nx + 1) {
+                result = keep && count > k ? std::sqrt(squared / (count - k)) : nan;
+            } else if (output == nx + 2) {
+                result = keep ? 1.0 - squared / total : nan;
+            } else {
+                const int start = lo + first, stop = lo + last;
+                const double part_n = pn[stop] - pn[start];
+                const double part_e = py[stop] - py[start] - linear(px, start, stop);
+                const double part_ee = pyy[stop] - pyy[start] - 2.0 * linear(pxy, start, stop) + quadratic(start, stop);
+                const double mean = part_e / part_n;
+                const double spread = std::sqrt((part_ee - part_n * (mean * mean)) / (part_n - 1));
+                result = part_n >= (last - first) / 2 && spread > 0 ? mean / spread : nan;
+            }
+        }
+        out[t] = std::isfinite(result) && std::isfinite(close[t]) ? result : nan;
+    }
+}
+
+}  // namespace rq_svc
+"""
 
 
-class SizeValueChinaLibrary(PanelFactorLibrary):
-    """CH-3/CH-4 characteristics and loadings, evaluated as daily point-in-time panels."""
+class SizeValueChinaLibrary(FactorLibrary):
+    """CH-3/CH-4 characteristics and loadings, evaluated as daily point-in-time panels in KunQuant."""
 
     family = "size_value_china"
     required_inputs = ("close",)
+    reference_inputs = REFERENCE_INPUTS
+    strict_float = True
+    cpp_prelude = CPP_PRELUDE
 
     @property
     def specs(self) -> tuple[FactorSpec, ...]:
@@ -91,8 +230,8 @@ class SizeValueChinaLibrary(PanelFactorLibrary):
                 ordinal=ordinal,
                 formula=description,
                 max_lookback=lookback,
-                implementation=f"rquant.factors.libraries.size_value_china.SizeValueChina.{name}",
-                catalog_version=1,
+                implementation=f"rquant.factors.libraries.size_value_china.{name}",
+                catalog_version=2,
             )
             for ordinal, (name, description, lookback, _) in enumerate(SIZE_VALUE_CHINA, 1)
         )
@@ -131,170 +270,43 @@ class SizeValueChinaLibrary(PanelFactorLibrary):
         }
         return inputs, hashes
 
-    def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
-        calculator = SizeValueChina(inputs)
-        return {name: calculator.calculate(name) for name in SIZE_VALUE_CHINA_NAMES}
-
-    def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
-        calculator = SizeValueChina(inputs)
-        for spec in self.specs:
-            output_buffers[spec.canonical_name][...] = calculator.calculate(spec.source_name).to_numpy(dtype=float)
-            calculator.release(spec.source_name)
-
-
-def _window_sums(values: np.ndarray, window: int) -> np.ndarray:
-    """Sums over every trailing ``window`` rows, one result per window end row from ``window - 1`` on."""
-    prefix = np.concatenate([np.zeros((1, *values.shape[1:])), np.cumsum(values, axis=0)])
-    return prefix[window:] - prefix[:-window]
-
-
-def rolling_ols(
-    y: np.ndarray,
-    x: np.ndarray,
-    names: tuple[str, ...],
-    window: int,
-    minimum: int,
-    residual_slices: Mapping[str, tuple[int, int]] | None = None,
-) -> dict[str, np.ndarray]:
-    """OLS of every stock column of ``y`` on a constant and the columns of ``x`` over trailing windows.
-
-    Rows where the stock or any regressor is missing are dropped inside each window, and statistics are placed on the
-    window's last row. Outputs are ``alpha``, ``beta_<name>`` per regressor, ``ivol`` (residual standard deviation),
-    ``r2`` and, for every ``residual_slices`` entry ``(first, last)`` of window positions, the mean over standard
-    deviation of the full-window fit's residuals in that part of the window.
-    """
-    dates, stocks = y.shape
-    residual_slices = dict(residual_slices or {})
-    outputs = ("alpha", *(f"beta_{name}" for name in names), "ivol", "r2", *residual_slices)
-    out = {name: np.full((dates, stocks), np.nan) for name in outputs}
-    if dates < window:
-        return out
-    design = np.column_stack([np.ones(dates), x])
-    design_ok = np.isfinite(design).all(axis=1)
-    design = np.where(design_ok[:, None], design, 0.0)
-    k = design.shape[1]
-    outer = design[:, :, None] * design[:, None, :]
-    identity = np.eye(k)
-    rows = slice(window - 1, dates)
-    ends = np.arange(window - 1, dates)
-    for column in range(stocks):
-        series = y[:, column]
-        mask = np.isfinite(series) & design_ok
-        if mask.sum() < minimum:
-            continue
-        weight = mask.astype(float)
-        value = np.where(mask, series, 0.0)
-        count = _window_sums(weight, window)
-        valid = count >= minimum
-        if not valid.any():
-            continue
-        gram = _window_sums(outer * weight[:, None, None], window)
-        sum_xy = _window_sums(design * value[:, None], window)
-        sum_y = _window_sums(value, window)
-        sum_yy = _window_sums(value**2, window)
-        gram[~valid] = identity
-        try:
-            beta = np.linalg.solve(gram, sum_xy[..., None])[..., 0]
-        except np.linalg.LinAlgError:
-            beta = (np.linalg.pinv(gram) @ sum_xy[..., None])[..., 0]
-        squared = sum_yy - 2.0 * np.einsum("nk,nk->n", beta, sum_xy) + np.einsum("nk,nkl,nl->n", beta, gram, beta)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            total = sum_yy - sum_y**2 / count
-            dof = np.where(count > k, count - k, np.nan)
-            ivol = np.sqrt(squared / dof)
-            r2 = 1.0 - squared / total
-        # Prefix-sum rounding can leave a tiny negative or zero residual sum of squares for an exact fit.
-        keep = valid & (squared > 1e-14 * np.maximum(sum_yy, 1e-300)) & (total > 0)
-        out["alpha"][rows, column] = np.where(valid, beta[:, 0], np.nan)
-        for position, name in enumerate(names, 1):
-            out[f"beta_{name}"][rows, column] = np.where(valid, beta[:, position], np.nan)
-        out["ivol"][rows, column] = np.where(keep, ivol, np.nan)
-        out["r2"][rows, column] = np.where(keep, r2, np.nan)
-        if not residual_slices:
-            continue
-        prefix_n = np.concatenate([[0.0], np.cumsum(weight)])
-        prefix_y = np.concatenate([[0.0], np.cumsum(value)])
-        prefix_yy = np.concatenate([[0.0], np.cumsum(value**2)])
-        prefix_x = np.concatenate([np.zeros((1, k)), np.cumsum(design * weight[:, None], axis=0)])
-        prefix_xy = np.concatenate([np.zeros((1, k)), np.cumsum(design * value[:, None], axis=0)])
-        prefix_xx = np.concatenate([np.zeros((1, k, k)), np.cumsum(outer * weight[:, None, None], axis=0)])
-        for name, (first, last) in residual_slices.items():
-            start = ends - window + 1 + first
-            stop = ends - window + 1 + last
-            part_n = prefix_n[stop] - prefix_n[start]
-            part_e = prefix_y[stop] - prefix_y[start] - np.einsum("nk,nk->n", beta, prefix_x[stop] - prefix_x[start])
-            part_ee = (
-                prefix_yy[stop]
-                - prefix_yy[start]
-                - 2.0 * np.einsum("nk,nk->n", beta, prefix_xy[stop] - prefix_xy[start])
-                + np.einsum("nk,nkl,nl->n", beta, prefix_xx[stop] - prefix_xx[start], beta)
-            )
-            with np.errstate(invalid="ignore", divide="ignore"):
-                mean = part_e / part_n
-                spread = np.sqrt((part_ee - part_n * mean**2) / (part_n - 1))
-                score = mean / spread
-            enough = valid & (part_n >= (last - first) // 2) & (spread > 0)
-            out[name][rows, column] = np.where(enough, score, np.nan)
-    return out
-
-
-class SizeValueChina:
-    """Calculator with shared regression fits; ``calculate`` returns one output panel."""
-
-    def __init__(self, inputs: Mapping[str, Any]) -> None:
-        self.inputs = inputs
+    def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         close = inputs["close"]
-        self.dates = pd.DatetimeIndex(close.index)
-        self.instruments = pd.Index(close.columns)
-        self.trading = close.notna()
-        self.returns = close / close.shift(1) - 1.0
-        self._fits: dict[str, dict[str, np.ndarray]] = {}
-
-    def calculate(self, name: str) -> Panel:
-        _, _, _, source = SIZE_VALUE_CHINA[SIZE_VALUE_CHINA_NAMES.index(name)]
-        if source is None:
-            method: Callable[[], Panel] = getattr(self, f"_char_{name}")
-            result = method()
-        else:
-            fit, output = source
-            result = Panel(self._fit(fit)[output], index=self.dates, columns=self.instruments)
-        result = replace_inf(result.astype(float))
-        return result.where(self.trading)
-
-    def release(self, name: str) -> None:
-        """Drop a regression fit once its last output in catalog order is published."""
-        for key in FITS:
-            if name == LAST_OUTPUT[key]:
-                self._fits.pop(key, None)
-
-    def _panel(self, key: str) -> Panel:
-        value = self.inputs.get(key)
-        if value is None:
-            raise DataContractError(f"size_value_china input is missing: {key}")
-        return value
-
-    def _fit(self, key: str) -> dict[str, np.ndarray]:
-        if key not in self._fits:
+        trading = k.notna(close)
+        total_mv, pe = inputs["basic_total_mv"], inputs["basic_pe_ttm"]
+        outputs = {
+            "size": k.log(k.mask(total_mv, k.gt(total_mv, 0.0))),
+            "ep": 1.0 / k.mask(pe, k.gt(pe, 0.0)),
+            "abturn": k.series_kernel(
+                [close, inputs["basic_turnover_total"]],
+                f"""
+                std::vector<double> turnover(n);
+                for (int t = 0; t < n; ++t) turnover[t] = std::isfinite(x0[t]) ? x1[t] : NAN;
+                for (int t = 0; t < n; ++t) {{
+                    const double year = rq_svc::rolling_mean(turnover.data(), t, {YEAR}, 120);
+                    out[t] = rq_svc::rolling_mean(turnover.data(), t, {TURNOVER_DAYS}, 15) / (year > 0 ? year : NAN);
+                }}""",
+            ),
+        }
+        for name, _, _, source in SIZE_VALUE_CHINA:
+            if source is None:
+                continue
+            key, statistic = source
             regressors, window, minimum, slices = FITS[key]
-            x = np.column_stack(
-                [np.asarray(pd.Series(self._panel(f"ch4_{name}")).reindex(self.dates), dtype=float)
-                 for name in regressors]
+            if statistic == "alpha":
+                output, first, last = 0, 0, 0
+            elif statistic.startswith("beta_"):
+                output, first, last = regressors.index(statistic.removeprefix("beta_")) + 1, 0, 0
+            elif statistic in ("ivol", "r2"):
+                output, first, last = len(regressors) + (1 if statistic == "ivol" else 2), 0, 0
+            else:
+                output, (first, last) = len(regressors) + 3, slices[statistic]
+            columns = ", ".join(f"x{index}" for index in range(1, len(regressors) + 1))
+            outputs[name] = k.series_kernel(
+                [close, *(inputs[f"ch4_{regressor}"] for regressor in regressors)],
+                f"""
+                const double *regressors[] = {{{columns}}};
+                rq_svc::rolling_ols(n, x0, regressors, {len(regressors)}, {window}, {minimum}, {output}, {first},
+                                    {last}, out);""",
             )
-            self._fits[key] = rolling_ols(
-                self.returns.to_numpy(dtype=float), x, regressors, window, minimum, slices
-            )
-        return self._fits[key]
-
-    def _char_size(self) -> Panel:
-        value = self._panel("basic_total_mv")
-        return np.log(value.where(value > 0))
-
-    def _char_ep(self) -> Panel:
-        pe = self._panel("basic_pe_ttm")
-        return 1.0 / pe.where(pe > 0)
-
-    def _char_abturn(self) -> Panel:
-        turnover = self._panel("basic_turnover_total").where(self.trading)
-        recent = turnover.rolling(TURNOVER_DAYS, min_periods=15).mean()
-        year = turnover.rolling(YEAR, min_periods=120).mean()
-        return recent / year.where(year > 0)
+        return {name: k.mask(k.replace_inf(value), trading) for name, value in outputs.items()}

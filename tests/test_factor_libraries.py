@@ -4,6 +4,7 @@ import importlib.util
 import inspect
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from rquant.errors import FactorContractError
 from rquant.factors.catalog import catalog_from_registry
@@ -32,6 +33,49 @@ def custom_price_library() -> CustomFactorLibrary:
 
 
 class FactorLibraryRegistryTests(unittest.TestCase):
+    def test_imported_cpp_helpers_invalidate_the_library_fingerprint(self) -> None:
+        from rquant.factors.libraries.oap import OAPLibrary
+
+        library = OAPLibrary()
+        previous = library.implementation_fingerprint
+        with patch.object(OAPLibrary, "cpp_prelude", library.cpp_prelude + "\n// changed imported helper\n"):
+            self.assertNotEqual(previous, library.implementation_fingerprint)
+
+    def test_oap_shared_operator_changes_invalidate_the_library_fingerprint(self) -> None:
+        from rquant.factors.libraries.oap import OAPLibrary
+
+        library = OAPLibrary()
+        previous = library.implementation_fingerprint
+        original = inspect.getsource
+
+        def changed_source(module):
+            source = original(module)
+            if getattr(module, "__name__", "") == "rquant.factors.extensions.kunquant_panel":
+                source += "\n# changed shared operator\n"
+            return source
+
+        with patch("rquant.factors.libraries.base.inspect.getsource", side_effect=changed_source):
+            self.assertNotEqual(previous, library.implementation_fingerprint)
+
+    def test_large_graph_library_can_split_compilation_sources(self) -> None:
+        registry = FactorLibraryRegistry()
+        library = custom_price_library()
+        library.compile_split_source = 64
+        registry.register_library(library)
+        engine = KunQuantFactorEngine("unused", FactorBuildConfig(factor_set="custom_price"), registry=registry)
+        _, config = engine.build_graph()
+        self.assertEqual(64, config.split_source)
+
+    def test_every_builtin_formula_library_uses_kunquant(self) -> None:
+        registry = get_library_registry()
+        for factor_set in registry.factor_sets():
+            if registry.selection(factor_set) is not None:
+                continue
+            with self.subTest(factor_set=factor_set):
+                self.assertTrue(registry.select(factor_set))
+                for library in registry.select(factor_set):
+                    self.assertEqual("kunquant", library.backend)
+
     # Break caught: omitting Alpha360 from the default registry leaves callers unable to select its declared inputs.
     def test_default_registry_keeps_locked_factor_sets_and_input_contracts(self) -> None:
         registry = get_library_registry()

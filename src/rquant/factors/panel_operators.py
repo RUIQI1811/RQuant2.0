@@ -7,6 +7,8 @@ whose published semantics differ remain in their calculator modules.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import pandas as pd
 
@@ -170,3 +172,128 @@ __all__ = [
     "ts_sum",
     "window",
 ]
+
+
+def _window_sums(values: np.ndarray, window: int) -> np.ndarray:
+    """Sums over every trailing ``window`` rows, one result per window end row from ``window - 1`` on."""
+    prefix = np.concatenate([np.zeros((1, *values.shape[1:])), np.cumsum(values, axis=0)])
+    return prefix[window:] - prefix[:-window]
+
+
+def _range_sums(prefix: np.ndarray, first: np.ndarray, last: np.ndarray) -> np.ndarray:
+    return prefix[last] - prefix[first]
+
+
+def rolling_regression(
+    y: np.ndarray,
+    x: np.ndarray,
+    window: int,
+    minimum: int,
+    *,
+    residual_slices: Mapping[str, tuple[int, int]] | None = None,
+) -> dict[str, np.ndarray]:
+    """OLS of every stock column of ``y`` on a constant and the columns of ``x`` over trailing windows.
+
+    Missing stock or regressor rows are dropped inside each window. Statistics are placed on the window's last row.
+    The first ``x`` column is the market for co-skewness. ``residual_slices`` maps output names to positions inside
+    the window whose residual mean over residual standard deviation is reported (residual momentum).
+
+    Window statistics come from prefix sums of cross-products up to third order, so the cost does not grow with the
+    window length; a window's result depends only on rows up to its last row.
+    """
+    dates, stocks = y.shape
+    residual_slices = dict(residual_slices or {})
+    names = ("beta", "slopes", "resid_std", "resid_skew", "coskew", *residual_slices)
+    out = {name: np.full((dates, stocks), np.nan) for name in names}
+    if dates < window:
+        return out
+    design = np.column_stack([np.ones(dates), x])
+    design_ok = np.isfinite(design).all(axis=1)
+    design = np.where(design_ok[:, None], design, 0.0)
+    k = design.shape[1]
+    outer = design[:, :, None] * design[:, None, :]
+    cubic = outer[:, :, :, None] * design[:, None, None, :]
+    identity = np.eye(k)
+    ends = np.arange(window - 1, dates)
+    rows = slice(window - 1, dates)
+    for column in range(stocks):
+        series = y[:, column]
+        mask = np.isfinite(series) & design_ok
+        if mask.sum() < minimum:
+            continue
+        weight = mask.astype(float)
+        value = np.where(mask, series, 0.0)
+        count = _window_sums(weight, window)
+        valid = count >= minimum
+        if not valid.any():
+            continue
+        sum_x = _window_sums(design * weight[:, None], window)
+        gram = _window_sums(outer * weight[:, None, None], window)
+        sum_y = _window_sums(value, window)
+        sum_yy = _window_sums(value**2, window)
+        sum_xy = _window_sums(design * value[:, None], window)
+        gram[~valid] = identity
+        try:
+            beta = np.linalg.solve(gram, sum_xy[..., None])[..., 0]
+        except np.linalg.LinAlgError:
+            beta = (np.linalg.pinv(gram) @ sum_xy[..., None])[..., 0]
+        fitted_xy = np.einsum("nk,nk->n", beta, sum_xy)
+        squared = sum_yy - 2.0 * fitted_xy + np.einsum("nk,nkl,nl->n", beta, gram, beta)
+        sum_e = sum_y - np.einsum("nk,nk->n", beta, sum_x)
+        sum_xyy = _window_sums(design * (value**2)[:, None], window)
+        sum_xxy = _window_sums(outer * value[:, None, None], window)
+        sum_xxx = _window_sums(cubic * weight[:, None, None, None], window)
+        cubed = (
+            _window_sums(value**3, window)
+            - 3.0 * np.einsum("nk,nk->n", beta, sum_xyy)
+            + 3.0 * np.einsum("nk,nkl,nl->n", beta, sum_xxy, beta)
+            - np.einsum("ni,nj,nl,nijl->n", beta, beta, beta, sum_xxx)
+        )
+        # Residual moments against the market column: sum(e m) and sum(e m^2).
+        e_m = sum_xy[:, 1] - np.einsum("nk,nk->n", beta, gram[:, :, 1])
+        e_mm = sum_xxy[:, 1, 1] - np.einsum("nk,nk->n", beta, sum_xxx[:, :, 1, 1])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            market_mean = sum_x[:, 1] / count
+            centered_squares = gram[:, 1, 1] - count * market_mean**2
+            co_moment = e_mm - 2.0 * market_mean * e_m + market_mean**2 * sum_e
+            variance = squared / count
+            dof = np.where(count > k, count - k, np.nan)
+            resid_std = np.sqrt(squared / dof)
+            resid_skew = (cubed / count) / variance**1.5
+            coskew = (co_moment / count) / (np.sqrt(variance) * centered_squares / count)
+        # Prefix-sum rounding can leave a tiny negative or zero residual sum of squares for an exact fit.
+        keep = valid & (squared > 1e-14 * np.maximum(sum_yy, 1e-300))
+        out["beta"][rows, column] = np.where(valid, beta[:, 1], np.nan)
+        out["slopes"][rows, column] = np.where(valid, beta[:, 1:].sum(axis=1), np.nan)
+        out["resid_std"][rows, column] = np.where(keep, resid_std, np.nan)
+        out["resid_skew"][rows, column] = np.where(keep, resid_skew, np.nan)
+        out["coskew"][rows, column] = np.where(keep, coskew, np.nan)
+        if not residual_slices:
+            continue
+        prefix = {
+            "n": np.concatenate([[0.0], np.cumsum(weight)]),
+            "y": np.concatenate([[0.0], np.cumsum(value)]),
+            "yy": np.concatenate([[0.0], np.cumsum(value**2)]),
+            "x": np.concatenate([np.zeros((1, k)), np.cumsum(design * weight[:, None], axis=0)]),
+            "xy": np.concatenate([np.zeros((1, k)), np.cumsum(design * value[:, None], axis=0)]),
+            "xx": np.concatenate([np.zeros((1, k, k)), np.cumsum(outer * weight[:, None, None], axis=0)]),
+        }
+        for name, (first, last) in residual_slices.items():
+            start = ends - window + 1 + first
+            stop = ends - window + 1 + last
+            part_count = _range_sums(prefix["n"], start, stop)
+            part_e = _range_sums(prefix["y"], start, stop) - np.einsum(
+                "nk,nk->n", beta, _range_sums(prefix["x"], start, stop)
+            )
+            part_ee = (
+                _range_sums(prefix["yy"], start, stop)
+                - 2.0 * np.einsum("nk,nk->n", beta, _range_sums(prefix["xy"], start, stop))
+                + np.einsum("nk,nkl,nl->n", beta, _range_sums(prefix["xx"], start, stop), beta)
+            )
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mean = part_e / part_count
+                spread = np.sqrt((part_ee - part_count * mean**2) / (part_count - 1))
+                momentum = mean / spread
+            enough = valid & (part_count >= (last - first) // 2) & (spread > 0)
+            out[name][rows, column] = np.where(enough, momentum, np.nan)
+    return out
