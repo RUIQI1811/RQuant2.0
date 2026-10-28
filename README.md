@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算全部十二个公式因子集；Hquality 和 recent 从已构建的源因子集选列。
+- KunQuant 编译并计算全部十二个公式因子集；Hquality、recent 和 recent_sh_main 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -354,6 +354,8 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `talib`：`ta_001` 至 `ta_125`，共 125 列，TA-Lib 经典技术指标（64 列）与 K 线形态（61 列），见下文“TA-Lib 因子集 talib”。
 - `recent`：从上述七个库中挑出 2020 年以后单因子 RankIC 依然显著且稳定的因子，按相关性去重后共 117 列，成员、方向与
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
+- `recent_sh_main`：用 recent 的规则在沪市主板（`sh_main`）上从全部十二个库中筛出的 291 列，只用于 `sh_main`，
+  成员与方向锁定在 `src/rquant/factors/libraries/recent_sh_main.py`（见下文“沪市主板近期有效因子集 recent_sh_main”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
 - `oap`：`oap_001` 至 `oap_142`，共 142 列，Open Source Asset Pricing（Chen-Zimmermann）212 个预测信号中能用 Tushare
@@ -400,6 +402,7 @@ src/rquant/factors/
     ├── gtja191.py                       # 190 条 GTJA191 KunQuant 公式与语义说明
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
     ├── recent.py                        # recent（2020 年以后仍有效）选择型因子集的锁定成员与方向
+    ├── recent_sh_main.py                # recent_sh_main（沪市主板上 2020 年以后仍有效）的锁定成员与方向
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
@@ -593,6 +596,26 @@ LGB 1d walk-forward（2013-2026，run `20261024T100453Z-6304df62`）：预测 Ra
 最大回撤 -44.5%，仍低于 Hquality 的 19.1% / 0.83 和 Alpha158 的 19.5% / 0.86。2022 年以来累计收益 -3.4%（2022 年 -26.2%），
 Hquality 为 +3.0%，Alpha158 为 +24.8%。此前按 2022 年以后筛选的 96 因子版本（run `20261024T092049Z-405a155f`）年化 17.9%、
 夏普 0.79，2022 年以来累计 +26.9%。
+
+### 沪市主板近期有效因子集 recent_sh_main
+
+`recent` 是在沪深 300 上挑的。`recent_sh_main` 用同样的方法在沪市主板（`sh_main`）股票池上重新筛选，候选为全部
+十二个库因子集（1696 个因子），因此必须先在该股票池上构建这十二个源因子集：
+
+```bash
+rquant --universe sh_main factors build --factor-set recent_sh_main
+rquant --universe sh_main factors validate --factor-set recent_sh_main
+rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set recent_sh_main
+```
+
+筛选口径（锁定在 `recent_sh_main.py` 的 `criteria`，基于对十二个库分别执行的
+`rquant --universe sh_main factors evaluate --horizon 1d --start 2020-01-01 --end 2026-10-21`）与 recent 相同，只有一处放宽：
+定向年度 Rank IC 为正的年份不少于 70%（7 年中至少 5 年）。在约 1500 只股票的截面上单因子 IC 更稳定，1078 个因子通过
+|Rank IC| >= 0.01、t >= 3 等条件（通过者 |Rank IC| 中位数约 0.028），按相关系数 0.8 去重后保留 291 个：gtja191 79、
+qlib_alpha158 46、wq_alpha101 38、qlib_alpha360 30、jq240 25、talib 20、oap 18、china_chars 10、tushare_tech 9、
+jkp153 8、barra_cne6 4、size_value_china 4。同 recent 一样，2020 年及以后的测试年份对成员选择而言是样本内。
+
+RESULT_SH_MAIN_PLACEHOLDER
 
 ### 中国 A 股股票特征 china_chars
 
