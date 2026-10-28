@@ -1,6 +1,9 @@
 """Prune the full rank-correlation matrix with an ordering taken from the sh_main 2020+ 1d evaluation.
 
 Usage: python order_and_prune.py <rank_correlation.parquet> <factor_stability.csv> <out_dir> [max_abs_rank_correlation]
+       [source,source,...]
+
+The optional comma-separated source factor sets restrict the candidates to those libraries (all twelve by default).
 
 Writes one selection per ordering: ``long_excess`` (mean yearly excess of the oriented top/bottom 20% over the
 equal-weight universe) and ``abs_rank_ic``. Factors without the score are ordered last, in registry order.
@@ -15,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from rquant.factors.catalog import get_catalog
 from rquant.factors.selection import prune_correlated
 
 
@@ -23,7 +27,15 @@ def main() -> None:
     scored = pd.read_csv(sys.argv[2]).set_index("factor")
     out = Path(sys.argv[3])
     max_corr = float(sys.argv[4]) if len(sys.argv) > 4 else 0.8
+    sources = sys.argv[5].split(",") if len(sys.argv) > 5 else None
     out.mkdir(parents=True, exist_ok=True)
+    if sources is not None:
+        catalog = get_catalog()
+        candidates = {name for source in sources for name in catalog.canonical_names(source)}
+        names = [name for name in correlation.index if name in candidates]
+        if len(names) != len(candidates):
+            raise SystemExit(f"{len(candidates) - len(names)} source factors are missing from the matrix")
+        correlation = correlation.loc[names, names]
     names = list(correlation.index)
     scores = {
         "long_excess": scored["mean_long_excess"],
@@ -44,6 +56,8 @@ def main() -> None:
         table.to_csv(out / f"kept_{key}.csv", index=False)
         meta = {
             "ordering": key,
+            "sources": sources,
+            "candidates": len(names),
             "max_abs_rank_correlation": max_corr,
             "kept_count": len(kept),
             "kept_per_source": table.groupby("factor_set").size().to_dict(),

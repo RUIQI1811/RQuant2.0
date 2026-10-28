@@ -37,7 +37,10 @@ def main() -> None:
     ordering, label = ORDERINGS[selection["ordering"]]
     limit = selection["max_abs_rank_correlation"]
     per_source = selection["kept_per_source"]
-    counts = ", ".join(f"{source} {per_source[source]}" for source in SOURCES if per_source.get(source))
+    sources = tuple(source for source in SOURCES if source in (selection.get("sources") or SOURCES))
+    candidates = selection.get("candidates", sampled["factors"])
+    libraries = "the twelve formula libraries" if len(sources) == len(SOURCES) else ", ".join(sources)
+    counts = ", ".join(f"{source} {per_source[source]}" for source in sources if per_source.get(source))
     provenance = RECENT_SH_MAIN_SELECTION.provenance
     members = []
     for member in selection["kept"]:
@@ -58,13 +61,13 @@ def main() -> None:
         "            },"
         for item in provenance["evaluations"]
     )
-    source_lines = "\n".join(f'        "{source}",' for source in SOURCES)
+    source_lines = "\n".join(f'        "{source}",' for source in sources)
     paragraphs = [
         f"Locked membership of the {name} factor set.",
-        f"{name} keeps every factor of the twelve formula libraries except duplicates: no Rank IC, t-statistic, "
+        f"{name} keeps every factor of {libraries} except duplicates: no Rank IC, t-statistic, "
         "yearly or long-side threshold removes a factor. Only the choice of which member of a group of near "
         "duplicates survives uses returns:",
-        f"- the absolute mean daily cross-sectional Spearman correlation of every pair of the {sampled['factors']} "
+        f"- the absolute mean daily cross-sectional Spearman correlation of every pair of the {candidates} "
         f"library factors was measured on the ``sh_main`` stores on every {sampled['correlation_date_step']}th "
         f"trading date from {sampled['correlation_start']} to {sampled['correlation_end']} "
         f"({sampled['sampled_dates']} dates; ``rquant.factors.selection.RankCorrelationAccumulator``, scripts in "
