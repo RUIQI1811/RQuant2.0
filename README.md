@@ -994,6 +994,17 @@ sed -n '1,240p' runs/walk-forward/RUN_ID/report.md
 - 年度收益是否稳定、是否持续跑赢基准，以及回撤、换手和成本是否集中在少数年份；
 - `trades.parquet` 与 `positions.parquet` 是否能解释组合变化。
 
+### 任意时间窗口的指标
+
+`portfolio.parquet` 保存了每日的 `return`、`cost`、`turnover` 和基准 `bench`，因此任意起止日期的指标都可以直接从已有运行切片计算，不需要重新训练或回测：
+
+```bash
+python scripts/analysis/window_metrics.py runs 2019-01-01 2026-10-21 \
+  jq240=20261027T202921Z-41fb3dde jq240_drop5=20261027T202921Z-41fb3dde-top50-drop5
+```
+
+每个 `标签=目录` 指向 `runs/walk-forward/` 下已经运行过 `report` 的目录，结束日期可以省略。输出按夏普排序，包含年化、夏普、最大回撤、Calmar、累计收益、相对基准的年化超额和信息比率、日均换手和年化成本。口径与报告相同：每日净收益为 `return - cost`，夏普为日均收益 × 252 / (日收益标准差 × √252)。
+
 ## 9. 运行清单与状态判断
 
 所有会改变数据或产生研究结果的主流程命令都会创建 `run.json` 和 `run.log`。三个研究命令使用分类目录，
