@@ -28,7 +28,7 @@ HORIZON_STEPS = {"1d": 1, "5d": 5, "20d": 20}
 class KunQuantDataLoader(_QlibDataLoaderBase):
     """Load a registered RQuant factor store and a Qlib-evaluated next-open label."""
 
-    def __init__(self, factor_root: str, factor_set: FactorSet = "Hquality", horizon: str = "1d") -> None:
+    def __init__(self, factor_root: str, factor_set: FactorSet = "jq240", horizon: str = "1d") -> None:
         if horizon not in LABEL_EXPRESSIONS:
             raise DataContractError(f"Unsupported horizon: {horizon}")
         self.factor_root = Path(factor_root)

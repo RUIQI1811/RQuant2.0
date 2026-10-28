@@ -8,7 +8,7 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算全部十二个公式因子集；Hquality、recent、recent_sh_main、remove_duplicates 和 oap_jq_cnc 从源因子集选列；
+- KunQuant 用于编译和计算全部十二个公式因子集；oap_jq_cnc 从源因子集选列；
   talib 将仓库内的 TA-Lib 0.8.1 C 函数编译到 KunQuant 图中，锁定的 `TA-Lib==0.8.2` 包用于对照测试；
 - 所有因子集的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
   不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；
@@ -116,7 +116,7 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   不要在 CLI、加载器和引擎中重复硬编码新名称；
 - 一个组合因子集内的库必须使用同一执行后端：全部为 `kunquant` 或全部为 `panel`；当前通用引擎
   不支持在同一 factor set 中混合两种后端。唯一例外是用 `register_factor_selection` 注册的选择型因子集
-  （如 `Hquality`）：它不重算公式，只从已构建且指纹为当前的源因子集复制所选列，因此成员可以跨后端；
+  （如 `oap_jq_cnc`）：它不重算公式，只从已构建且指纹为当前的源因子集复制所选列，因此成员可以跨后端；
 - KunQuant 因子优先组合其公共算子，只有现有算子无法表达的最小能力才可加入 `extensions/`；
   Pandas 面板算子必须明确行是交易日、列是证券，并锁定窗口、NaN、排名和回归语义；
 - 从第三方迁入或改写公式时，必须保留来源、版本、修改边界和许可证文本，并同步更新
@@ -147,26 +147,11 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 当前注册表共有 1696 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
   `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
   应注册一个新的、名称稳定的因子集；
-- `Hquality` 是选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/hquality.py`（当前 137 列），
-  由 `rquant.factors.selection` 按 1d 单因子评估的年度稳定性与覆盖率筛出，再按截面秩相关去重。成员保留源规范列名
-  和原值，`direction=-1` 只表示反向使用，存储值不取负。构建前 `qlib_alpha158`、`wq_alpha101`、`gtja191` 必须已按当前代码
-  和标准数据构建完成；改变成员会改变其目录与引擎指纹；
-- `recent` 是第二个选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/recent.py`（当前 117 列），按 2020-01-02 至
-  2026-10-21 的 1d 单因子评估筛选（|RankIC| >= 0.01、|t| >= 3、7 年中至少 6 年定向 RankIC 为正、覆盖率 >= 80%），
-  再按截面秩相关 0.8 去重。成员来自全部七个库因子集，构建前它们都必须已按当前代码和标准数据构建完成；由于筛选用到了
-  2020 年以后的收益，walk-forward 中 2020 年以后的测试年份对成员选择而言属于样本内；
-- `recent_sh_main` 是第三个选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/recent_sh_main.py`（当前 140 列），
-  用 recent 的规则在沪市主板股票池上筛选：`rquant --universe sh_main factors evaluate` 对全部十二个库因子集做
-  2020-01-02 至 2026-10-21 的 1d 评估，要求 |RankIC| >= 0.01、|t| >= 3、7 年中至少 5 年定向 RankIC 为正、覆盖率 >= 80%，
-  且做多端（方向为正取最高 20%，为负取最低 20%）7 年中至少 5 年、平均也跑赢全池等权收益，再按做多端年均超额排序、
-  截面秩相关 0.8 去重。成员只适用于 `sh_main`，构建前十二个源因子集都必须已在该股票池上按当前代码构建；
-- `remove_duplicates` 是第四个选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/remove_duplicates.py`（当前 672 列）：
-  全部十二个库的 1696 个因子不设 IC、t 值、年度或做多端门槛，只按 sh_main 2008-2026 每 5 个交易日的平均截面秩相关
-  0.8 去重；同类里按 recent_sh_main 那次 2020-2026 评估的做多端年均超额留最高的。脚本在 `scripts/remove_duplicates/`，
-  成员只适用于 `sh_main`，构建前十二个源因子集都必须已在该股票池上按当前代码构建；
-- `oap_jq_cnc` 是第五个选择型因子集，成员锁定在 `src/rquant/factors/libraries/oap_jq_cnc.py`（当前 254 列）：oap、jq240、
+- `oap_jq_cnc` 是唯一的选择型因子集，成员锁定在 `src/rquant/factors/libraries/oap_jq_cnc.py`（当前 254 列）：oap、jq240、
   china_chars 的 484 个因子用同一个 sh_main 全期秩相关矩阵按 0.8 去重，同类里按覆盖率、再按因子库顺序留，不用收益信息；
-  由 `scripts/remove_duplicates/select_by_coverage.py` 生成，成员只适用于 `sh_main`；
+  由 `scripts/remove_duplicates/select_by_coverage.py` 生成，成员只适用于 `sh_main`，构建前三个源因子集都必须已在该股票池上按当前
+  代码构建；成员保留源规范列名和原值，`direction` 只是元数据，存储值不取负。Hquality、recent、recent_sh_main、
+  remove_duplicates 等按单因子效果或收益挑选的因子集已按用户要求删除，需要时从 git 历史找回；
 - `china_chars` 列名为 `cnc_001` 至 `cnc_109`，来源名为特征简称；它是按 Quantactix/ChinaAShareEquityCharacteristics
   公布定义独立重写的日频版本（未使用其 GPL 代码），读取参考数据中的 daily_basic、市场因子和财报。财报必须是
   首次披露值，报告期从公告日起且所有更早报告期都已公告后才可用；任何特征都不得使用当日之后的行情、市场收益或
@@ -248,7 +233,7 @@ python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); prin
 ```
 
 当前预期为唯一目录（unique catalog）`1696`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`Hquality=137`、`china_chars=109`、`size_value_china=21`、`talib=125`、`recent=117`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`recent_sh_main=140`、`remove_duplicates=672`、`oap_jq_cnc=254`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+`qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`oap_jq_cnc=254`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：
@@ -296,8 +281,6 @@ rquant factors build --factor-set gtja191
 rquant factors validate --factor-set gtja191
 rquant factors build --factor-set qlib_alpha360
 rquant factors validate --factor-set qlib_alpha360
-rquant factors build --factor-set Hquality
-rquant factors validate --factor-set Hquality
 rquant factors build --factor-set china_chars
 rquant factors validate --factor-set china_chars
 rquant factors build --factor-set size_value_china
@@ -312,15 +295,9 @@ rquant factors build --factor-set tushare_tech
 rquant factors validate --factor-set tushare_tech
 rquant factors build --factor-set jkp153
 rquant factors validate --factor-set jkp153
-rquant factors build --factor-set recent
-rquant factors validate --factor-set recent
-rquant --universe sh_main factors build --factor-set recent_sh_main
-rquant --universe sh_main factors validate --factor-set recent_sh_main
-rquant --universe sh_main factors build --factor-set remove_duplicates
-rquant --universe sh_main factors validate --factor-set remove_duplicates
 rquant --universe sh_main factors build --factor-set oap_jq_cnc
 rquant --universe sh_main factors validate --factor-set oap_jq_cnc
-rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
+rquant walk-forward --model lgb --horizon 1d --factor-set jq240
 rquant report RUN_ID
 ```
 

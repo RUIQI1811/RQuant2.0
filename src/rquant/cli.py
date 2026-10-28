@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     factors = commands.add_parser("factors", help="Inspect, build and validate factor stores")
     factor_commands = factors.add_subparsers(dest="factor_command", required=True)
     catalog = factor_commands.add_parser("catalog", help="Show the locked canonical factor catalog")
-    catalog.add_argument("--factor-set", choices=_factor_sets(), default="Hquality")
+    catalog.add_argument("--factor-set", choices=_factor_sets(), default="jq240")
     catalog.add_argument("--format", choices=("table", "json", "csv"), default="table")
     catalog.add_argument("--output", help="Export JSON or CSV to this path")
     catalog.set_defaults(handler=_factor_catalog)

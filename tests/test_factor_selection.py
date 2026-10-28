@@ -9,16 +9,12 @@ import numpy as np
 import pandas as pd
 
 from rquant.errors import DataContractError, FactorContractError
-from rquant.factors.catalog import catalog_from_registry, get_catalog
+from rquant.factors.catalog import catalog_from_registry
 from rquant.factors.engine import FactorBuildConfig, SelectionFactorEngine, create_factor_engine
 from rquant.factors.libraries.base import FactorSelection, FactorSpec, PanelFactorLibrary, SelectedFactor
 from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
-from rquant.factors.libraries.hquality import HQUALITY_SELECTION
 from rquant.factors.libraries.oap_jq_cnc import OAP_JQ_CNC_SELECTION
-from rquant.factors.libraries.recent import RECENT_SELECTION
-from rquant.factors.libraries.recent_sh_main import RECENT_SH_MAIN_SELECTION
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
-from rquant.factors.libraries.remove_duplicates import REMOVE_DUPLICATES_SELECTION
 from rquant.factors.selection import (
     RankCorrelationAccumulator,
     StabilityCriteria,
@@ -133,60 +129,6 @@ class FactorSelectionRegistryTests(unittest.TestCase):
         )
         self.assertEqual({"kunquant", "panel"}, {library.backend for library in registry.select("picked")})
         self.assertEqual(("open", "close"), registry.required_inputs("picked"))
-
-    def test_default_registry_publishes_hquality_from_built_source_sets(self) -> None:
-        registry = get_library_registry()
-        catalog = get_catalog()
-        selection = registry.selection("Hquality")
-
-        self.assertIs(HQUALITY_SELECTION, selection)
-        self.assertEqual(HQUALITY_SELECTION.canonical_names, catalog.canonical_names("Hquality"))
-        self.assertEqual(1696, len(catalog.specs))
-        for name in selection.canonical_names:
-            self.assertIn(registry.source_factor_set(selection, name), ("qlib_alpha158", "wq_alpha101", "gtja191"))
-        self.assertNotIn("gtja_030", selection.canonical_names)
-
-    # Break caught: a recent member whose only source is a factor set the selection does not declare.
-    def test_default_registry_publishes_recent_from_all_library_factor_sets(self) -> None:
-        registry = get_library_registry()
-        catalog = get_catalog()
-        selection = registry.selection("recent")
-
-        self.assertIs(RECENT_SELECTION, selection)
-        self.assertEqual(RECENT_SELECTION.canonical_names, catalog.canonical_names("recent"))
-        self.assertEqual(117, len(selection.canonical_names))
-        sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
-        self.assertEqual(set(selection.source_factor_sets), sources)
-        self.assertEqual({"kunquant"}, {library.backend for library in registry.select("recent")})
-
-    # Break caught: a recent_sh_main member from a library the selection does not list as a source.
-    def test_default_registry_publishes_recent_sh_main_from_all_twelve_libraries(self) -> None:
-        registry = get_library_registry()
-        catalog = get_catalog()
-        selection = registry.selection("recent_sh_main")
-
-        self.assertIs(RECENT_SH_MAIN_SELECTION, selection)
-        self.assertEqual(RECENT_SH_MAIN_SELECTION.canonical_names, catalog.canonical_names("recent_sh_main"))
-        self.assertEqual(140, len(selection.canonical_names))
-        self.assertEqual(12, len(selection.source_factor_sets))
-        sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
-        self.assertEqual(set(selection.source_factor_sets), sources)
-        self.assertEqual("sh_main", selection.provenance["universe"])
-
-
-    # Break caught: a remove_duplicates member outside the twelve libraries, or a library dropped from its sources.
-    def test_default_registry_publishes_remove_duplicates_from_all_twelve_libraries(self) -> None:
-        registry = get_library_registry()
-        catalog = get_catalog()
-        selection = registry.selection("remove_duplicates")
-
-        self.assertIs(REMOVE_DUPLICATES_SELECTION, selection)
-        self.assertEqual(REMOVE_DUPLICATES_SELECTION.canonical_names, catalog.canonical_names("remove_duplicates"))
-        self.assertEqual(672, len(selection.canonical_names))
-        self.assertEqual(12, len(selection.source_factor_sets))
-        sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
-        self.assertEqual(set(selection.source_factor_sets), sources)
-        self.assertEqual("sh_main", selection.provenance["universe"])
 
 
 class SelectionFactorEngineTests(unittest.TestCase):
@@ -400,47 +342,6 @@ class FactorDeduplicationTests(unittest.TestCase):
         accumulator.add(frame[frame["datetime"].isin(dates[:2])])
         accumulator.add(frame[frame["datetime"].isin(dates[2:])])
         pd.testing.assert_frame_equal(mean_rank_correlation(frame, names), accumulator.mean())
-
-    def test_locked_hquality_has_no_pair_above_its_correlation_limit(self) -> None:
-        dropped = HQUALITY_SELECTION.provenance["deduplicated"]
-        kept = set(HQUALITY_SELECTION.canonical_names)
-        self.assertEqual(137, len(kept))
-        self.assertFalse(kept & set(dropped))
-        self.assertTrue(set(dropped.values()) <= kept)
-        self.assertEqual(0.8, HQUALITY_SELECTION.criteria["max_abs_rank_correlation"])
-
-    def test_locked_recent_has_no_pair_above_its_correlation_limit(self) -> None:
-        dropped = RECENT_SELECTION.provenance["deduplicated"]
-        kept = set(RECENT_SELECTION.canonical_names)
-        self.assertEqual(117, len(kept))
-        self.assertFalse(kept & set(dropped))
-        self.assertTrue(set(dropped.values()) <= kept)
-        self.assertEqual(0.8, RECENT_SELECTION.criteria["max_abs_rank_correlation"])
-
-    def test_locked_recent_sh_main_has_no_pair_above_its_correlation_limit(self) -> None:
-        dropped = RECENT_SH_MAIN_SELECTION.provenance["deduplicated"]
-        kept = set(RECENT_SH_MAIN_SELECTION.canonical_names)
-        self.assertEqual(140, len(kept))
-        self.assertFalse(kept & set(dropped))
-        self.assertTrue(set(dropped.values()) <= kept)
-        self.assertEqual(0.7, RECENT_SH_MAIN_SELECTION.criteria["min_positive_rank_ic_year_ratio"])
-        self.assertEqual(0.7, RECENT_SH_MAIN_SELECTION.criteria["min_positive_long_excess_year_ratio"])
-
-    # Break caught: a remove_duplicates module that drops non-duplicates or keeps a factor it maps as a duplicate.
-    def test_locked_remove_duplicates_only_drops_duplicates(self) -> None:
-        dropped = REMOVE_DUPLICATES_SELECTION.provenance["deduplicated"]
-        kept = set(REMOVE_DUPLICATES_SELECTION.canonical_names)
-        library_factors = {
-            spec.canonical_name
-            for source in REMOVE_DUPLICATES_SELECTION.source_factor_sets
-            for library in get_library_registry().select(source)
-            for spec in library.specs
-        }
-        self.assertEqual(672, len(kept))
-        self.assertFalse(kept & set(dropped))
-        self.assertTrue(set(dropped.values()) <= kept)
-        self.assertEqual(library_factors, kept | set(dropped))
-        self.assertEqual(0.8, REMOVE_DUPLICATES_SELECTION.criteria["max_abs_rank_correlation"])
 
     # Break caught: an oap_jq_cnc module that drops non-duplicates, takes a factor from another library, or lets
     # returns choose among duplicates.

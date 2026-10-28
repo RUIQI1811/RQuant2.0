@@ -20,7 +20,7 @@ data:
   fundamentals_window_years: 6
 
 factors:
-  factor_set: Hquality
+  factor_set: jq240
   dtype: double
   input_layout: TS
   output_layout: TS
