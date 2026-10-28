@@ -154,7 +154,7 @@ class JQ240CatalogTests(unittest.TestCase):
         self.assertEqual(233, len(names))
         self.assertEqual(("jq_001", "jq_233"), (names[0], names[-1]))
         self.assertEqual(len(set(JQ240_NAMES)), len(JQ240_NAMES))
-        self.assertEqual(1439, len(catalog.specs))
+        self.assertEqual(1696, len(catalog.specs))
         counts = pd.Series([entry[1] for entry in JQ240]).value_counts().to_dict()
         self.assertEqual(
             {

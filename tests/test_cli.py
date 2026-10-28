@@ -204,7 +204,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual("ok", payload["status"])
         self.assertTrue(factor_catalog["ok"])
-        self.assertEqual(1439, factor_catalog["detail"]["columns"])
+        self.assertEqual(1696, factor_catalog["detail"]["columns"])
 
     def test_doctor_reports_missing_clang_instead_of_crashing(self) -> None:
         output = io.StringIO()
