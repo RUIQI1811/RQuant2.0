@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算全部九个公式因子集；Hquality 和 recent 从已构建的源因子集选列。
+- KunQuant 编译并计算全部十二个公式因子集；Hquality 和 recent 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -374,7 +374,7 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 
 所有可研究的因子公式由 RQuant 自己维护。Alpha158、Alpha101、Alpha360、GTJA191、china_chars、
 size_value_china、talib、jq240 与 oap 全部使用 KunQuant 后端；它们共用目录、清单、年度 Parquet、验证器和下游加载契约。
-原 Pandas 实现保留在 `tests/panel_reference/` 中作为独立数值对照。barra_cne6、tushare_tech 与 jkp153 暂用 Pandas 面板后端。Python 负责读取、排列数据和按公告日发布财报结果；
+原 Pandas 实现保留在 `tests/panel_reference/` 中作为独立数值对照。Python 负责读取、排列数据和按公告日发布财报结果；
 财报公式在季度图中计算，日频公式在交易日图中计算，缺失的窗口、递推、回归和行业截面能力由 C++ 扩展算子提供：
 
 ```text
@@ -405,9 +405,9 @@ src/rquant/factors/
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
     ├── jq240.py                         # 233 个按聚宽因子库定义重写的日频因子
     ├── oap.py                           # 142 个按 Open Source Asset Pricing 定义重写的日频信号
-    ├── barra_cne6.py                    # 38 个 Barra CNE6 风格描述子（Pandas 面板后端）
-    ├── tushare_tech.py                  # 75 个 Tushare stk_factor_pro 技术指标（Pandas 面板后端）
-    ├── jkp153.py                        # 144 个 JKP 全球因子特征的日频版本（Pandas 面板后端）
+    ├── barra_cne6.py                    # 38 个 Barra CNE6 风格描述子
+    ├── tushare_tech.py                  # 75 个 Tushare stk_factor_pro 技术指标
+    ├── jkp153.py                        # 144 个 JKP 全球因子特征的日频版本
     └── custom.py                        # 自定义小型因子库构造器
 ```
 
@@ -814,7 +814,7 @@ rquant factors validate --factor-set jkp153
 rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 ```
 
-`barra_cne6`、`tushare_tech` 与 `jkp153` 暂时仍使用 Pandas 面板后端（`PanelFactorLibrary`），尚未迁移到 KunQuant；它们只能单独构建，不能与 KunQuant 库组合进同一个因子集。
+`barra_cne6`、`tushare_tech` 与 `jkp153` 与其他库一样在 KunQuant 中计算：财报公式在季度图中计算并按公告日发布，指数加权窗口、滚动回归、截面排名与标准化由逐股或逐日 C++ 算子完成，`tushare_tech` 的指标是逐股序列 C++ 内核；原 Pandas 实现保留在 `tests/panel_reference/` 中，测试逐列对齐。
 
 ### 验证因子
 

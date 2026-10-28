@@ -8,7 +8,7 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算九个公式因子集；barra_cne6、tushare_tech 与 jkp153 暂用 Pandas 面板后端；Hquality 和 recent 从源因子集选列；
+- KunQuant 用于编译和计算全部十二个公式因子集；Hquality 和 recent 从源因子集选列；
   talib 将仓库内的 TA-Lib 0.8.1 C 函数编译到 KunQuant 图中，锁定的 `TA-Lib==0.8.2` 包用于对照测试；
 - 所有因子集的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
   不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；

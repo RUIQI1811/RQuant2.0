@@ -1,25 +1,62 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 import tempfile
 import unittest
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from rquant.factors.catalog import get_catalog
-from rquant.factors.engine import FactorBuildConfig, PanelFactorEngine, create_factor_engine
-from rquant.factors.libraries.jkp153 import (
-    FLOWS,
-    ITEMS,
-    JKP_NAMES,
-    JKP153Library,
+from rquant.factors.engine import (
+    FactorBuildConfig,
+    KunQuantFactorEngine,
+    cpp_compiler_available,
+    create_factor_engine,
+)
+from rquant.factors.libraries.jkp153 import FLOWS, ITEMS, JKP_NAMES, JKP153Library
+from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from panel_reference.jkp153 import JKP153Library as ReferenceLibrary  # noqa: E402
+from panel_reference.jkp153 import (  # noqa: E402
     JKPChars,
     corwin_schultz,
     cross_section_rank,
     step_sums,
 )
-from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+KUNQUANT_READY = importlib.util.find_spec("KunQuant") is not None and cpp_compiler_available()
+
+
+@lru_cache(maxsize=1)
+def compiled():
+    # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+    temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    engine = KunQuantFactorEngine(temporary.name, FactorBuildConfig(factor_set="jkp153", workers=2))
+    return temporary, engine, engine.compile(), engine.compile_statements()
+
+
+def calculate(inputs: dict[str, object]) -> dict[str, pd.DataFrame]:
+    """KunQuant outputs by source name, as panels shaped like the inputs."""
+    _, engine, module, statement_modules = compiled()
+    close = inputs["close"]
+    prepared = JKP153Library().align_reference_inputs(inputs, close.index, close.columns)
+    statements = engine.run_statements(prepared, close.index, close.columns, statement_modules)
+    arrays = {}
+    for name in engine.input_fields:
+        value = statements.daily(name) if name in statements else prepared[name]
+        if isinstance(value, pd.Series):
+            value = np.repeat(value.to_numpy()[:, None], len(close.columns), axis=1)
+        arrays[name] = np.ascontiguousarray(value, dtype=float)
+    output = engine.run(arrays, module=module, statements=statements)
+    return {
+        spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
+        for spec in JKP153Library().specs
+    }
 
 FLOW_LINES = sorted({line for lines in FLOWS.values() for line in lines})
 STOCK_LINES = sorted({line for lines in ITEMS.values() for line in lines})
@@ -118,11 +155,19 @@ class JKP153CatalogTests(unittest.TestCase):
             self.assertTrue(hasattr(JKPChars, f"_c_{name}"), name)
 
 
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class JKP153CalculationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.inputs = synthetic_inputs()
-        cls.outputs = JKP153Library().calculate(cls.inputs)
+        cls.outputs = calculate(cls.inputs)
+
+    # Break caught: a KunQuant formula, window, regression or ranking step that drifts from the pandas reference.
+    def test_every_characteristic_matches_the_pandas_reference(self) -> None:
+        expected = ReferenceLibrary().calculate(self.inputs)
+        for name in JKP_NAMES:
+            np.testing.assert_allclose(self.outputs[name].to_numpy(), expected[name].to_numpy(), rtol=1e-7,
+                                       atol=1e-10, equal_nan=True, err_msg=name)
 
     def test_all_characteristics_are_aligned_and_populated(self) -> None:
         close = self.inputs["close"]
@@ -139,7 +184,7 @@ class JKP153CalculationTests(unittest.TestCase):
         dates = self.inputs["close"].index
         for cut in (900, 1500):
             last = dates[cut]
-            past = JKP153Library().calculate(truncated(self.inputs, last))
+            past = calculate(truncated(self.inputs, last))
             for name in JKP_NAMES:
                 np.testing.assert_allclose(past[name].to_numpy(), self.outputs[name].loc[:last].to_numpy(),
                                            rtol=1e-8, atol=1e-11, equal_nan=True, err_msg=name)
@@ -188,7 +233,7 @@ class JKP153CalculationTests(unittest.TestCase):
         changed = dict(self.inputs)
         changed["close"] = self.inputs["close"].copy()
         changed["close"].iloc[:400, 0] *= np.linspace(1.0, 3.0, 400)
-        moved = JKP153Library().calculate(changed)["mispricing_perf"]
+        moved = calculate(changed)["mispricing_perf"]
         np.testing.assert_allclose(moved.iloc[300:400, 3].to_numpy(),
                                    self.outputs["mispricing_perf"].iloc[300:400, 3].to_numpy(), equal_nan=True)
         quality = self.outputs["qmj"].to_numpy()
@@ -222,6 +267,7 @@ class JKP153HelperTests(unittest.TestCase):
         self.assertGreaterEqual(spread[3, 0], 0.0)
 
 
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class JKP153EngineTests(unittest.TestCase):
     def test_engine_reads_audited_reference_files(self) -> None:
         inputs = synthetic_inputs(days=320, stocks=4)
@@ -266,14 +312,17 @@ class JKP153EngineTests(unittest.TestCase):
             atomic_write_json(reference / "manifest.json", manifest)
 
             engine = create_factor_engine(root / "cache", FactorBuildConfig(factor_set="jkp153"))
-            self.assertIsInstance(engine, PanelFactorEngine)
+            self.assertIsInstance(engine, KunQuantFactorEngine)
+            _, _, module, statement_modules = compiled()
+            engine.compile = lambda: module
+            engine.compile_statements = lambda: statement_modules
             result = engine.build_from_canonical(canonical, root / "factors")
             self.assertEqual(144, result["columns"])
             self.assertEqual(manifest["fingerprint"], result["reference_inputs"]["jkp153_reference"])
             store = root / "factors" / "jkp153"
             stored = pd.concat([pd.read_parquet(path) for path in sorted(store.glob("year=*/*.parquet"))])
             stored = stored.set_index(["datetime", "instrument"])
-            direct = JKP153Library().calculate(inputs)
+            direct = ReferenceLibrary().calculate(inputs)
             for name in ("be_me", "ret_1_0", "cash_at", "prc"):
                 canonical_name = f"jkp_{JKP_NAMES.index(name) + 1:03d}"
                 expected = direct[name].stack(future_stack=True).reindex(stored.index)
