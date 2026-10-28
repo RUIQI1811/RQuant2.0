@@ -98,8 +98,8 @@ def _load_feature_block(
     one trailing column for the label: ``labels(index)`` when given, else left uninitialised.
 
     ``labels`` runs before the block is allocated. Qlib evaluates the label in a pool of worker processes, fresh
-    interpreters that took about 6.7 GB together on Windows; with the block already committed next to them, a
-    672-factor sh_main window left 0.2 GB of a 16 GB machine free.
+    interpreters that took about 6.3 GB together on Windows; with the block already committed next to them, a
+    672-factor sh_main window left 0.2 GB of a 16 GB machine free (1.3 GB with the label first).
 
     Rows are filtered by date range and instruments. Factor stores are written in double precision; models train on
     single precision, which halves the memory of every copy DataHandlerLP and LightGBM make of a multi-year panel.
