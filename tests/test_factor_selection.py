@@ -15,9 +15,11 @@ from rquant.factors.libraries.base import FactorSelection, FactorSpec, PanelFact
 from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
 from rquant.factors.libraries.hquality import HQUALITY_SELECTION
 from rquant.factors.libraries.recent import RECENT_SELECTION
+from rquant.factors.libraries.recent_sh_main import RECENT_SH_MAIN_SELECTION
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
 from rquant.factors.selection import (
     StabilityCriteria,
+    compound_by_year,
     factor_coverage,
     mean_rank_correlation,
     prune_correlated,
@@ -148,10 +150,24 @@ class FactorSelectionRegistryTests(unittest.TestCase):
 
         self.assertIs(RECENT_SELECTION, selection)
         self.assertEqual(RECENT_SELECTION.canonical_names, catalog.canonical_names("recent"))
-        self.assertEqual(96, len(selection.canonical_names))
+        self.assertEqual(117, len(selection.canonical_names))
         sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
         self.assertEqual(set(selection.source_factor_sets), sources)
         self.assertEqual({"kunquant"}, {library.backend for library in registry.select("recent")})
+
+    # Break caught: a recent_sh_main member from a library the selection does not list as a source.
+    def test_default_registry_publishes_recent_sh_main_from_all_twelve_libraries(self) -> None:
+        registry = get_library_registry()
+        catalog = get_catalog()
+        selection = registry.selection("recent_sh_main")
+
+        self.assertIs(RECENT_SH_MAIN_SELECTION, selection)
+        self.assertEqual(RECENT_SH_MAIN_SELECTION.canonical_names, catalog.canonical_names("recent_sh_main"))
+        self.assertEqual(140, len(selection.canonical_names))
+        self.assertEqual(12, len(selection.source_factor_sets))
+        sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
+        self.assertEqual(set(selection.source_factor_sets), sources)
+        self.assertEqual("sh_main", selection.provenance["universe"])
 
 
 class SelectionFactorEngineTests(unittest.TestCase):
@@ -267,6 +283,32 @@ class FactorStabilityScoreTests(unittest.TestCase):
         self.assertFalse(scored.loc["steady", "selected"])
         self.assertEqual("rank_ic_t_stat", scored.loc["steady", "failed_checks"])
 
+    # Break caught: scoring an inverted factor's long side from the top quantile instead of the bottom one.
+    def test_long_excess_uses_the_oriented_long_quantile_against_the_universe(self) -> None:
+        summary, annual = self._frames()
+        # "steady" is inverted, so its long side is the bottom quantile; "flaky" (direction +1) is long the top.
+        annual = annual.assign(top_return=0.05, bottom_return=0.15)
+        universe = pd.Series({year: 0.10 for year in range(2010, 2019)})
+        coverage = pd.Series({"steady": 0.99, "flaky": 0.99})
+        criteria = StabilityCriteria(min_positive_rank_ic_year_ratio=0.0, min_positive_long_excess_year_ratio=0.75)
+        scored = score_factor_stability(
+            summary, annual, coverage, criteria, universe_returns=universe
+        ).set_index("factor")
+
+        self.assertEqual(8, scored.loc["steady", "positive_long_excess_years"])
+        self.assertAlmostEqual(0.05, scored.loc["steady", "mean_long_excess"])
+        self.assertTrue(scored.loc["steady", "selected"])
+        self.assertEqual(0, scored.loc["flaky", "positive_long_excess_years"])
+        self.assertIn("long_excess_years", scored.loc["flaky", "failed_checks"])
+        with self.assertRaises(DataContractError):
+            score_factor_stability(summary, annual, coverage, criteria)
+
+    def test_compound_by_year_compounds_within_each_calendar_year(self) -> None:
+        daily = pd.Series([0.1, 0.1, -0.5], index=pd.to_datetime(["2020-12-30", "2020-12-31", "2021-01-04"]))
+        yearly = compound_by_year(daily)
+        self.assertAlmostEqual(0.21, yearly[2020])
+        self.assertAlmostEqual(-0.5, yearly[2021])
+
     def test_low_coverage_blocks_selection(self) -> None:
         summary, annual = self._frames()
         scored = score_factor_stability(
@@ -327,10 +369,19 @@ class FactorDeduplicationTests(unittest.TestCase):
     def test_locked_recent_has_no_pair_above_its_correlation_limit(self) -> None:
         dropped = RECENT_SELECTION.provenance["deduplicated"]
         kept = set(RECENT_SELECTION.canonical_names)
-        self.assertEqual(96, len(kept))
+        self.assertEqual(117, len(kept))
         self.assertFalse(kept & set(dropped))
         self.assertTrue(set(dropped.values()) <= kept)
         self.assertEqual(0.8, RECENT_SELECTION.criteria["max_abs_rank_correlation"])
+
+    def test_locked_recent_sh_main_has_no_pair_above_its_correlation_limit(self) -> None:
+        dropped = RECENT_SH_MAIN_SELECTION.provenance["deduplicated"]
+        kept = set(RECENT_SH_MAIN_SELECTION.canonical_names)
+        self.assertEqual(140, len(kept))
+        self.assertFalse(kept & set(dropped))
+        self.assertTrue(set(dropped.values()) <= kept)
+        self.assertEqual(0.7, RECENT_SH_MAIN_SELECTION.criteria["min_positive_rank_ic_year_ratio"])
+        self.assertEqual(0.7, RECENT_SH_MAIN_SELECTION.criteria["min_positive_long_excess_year_ratio"])
 
 
 if __name__ == "__main__":
