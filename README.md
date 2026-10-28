@@ -354,7 +354,7 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `talib`：`ta_001` 至 `ta_125`，共 125 列，TA-Lib 经典技术指标（64 列）与 K 线形态（61 列），见下文“TA-Lib 因子集 talib”。
 - `recent`：从上述七个库中挑出 2020 年以后单因子 RankIC 依然显著且稳定的因子，按相关性去重后共 117 列，成员、方向与
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
-- `recent_sh_main`：用 recent 的规则在沪市主板（`sh_main`）上从全部十二个库中筛出的 291 列，只用于 `sh_main`，
+- `recent_sh_main`：用 recent 的规则加做多端条件在沪市主板（`sh_main`）上从全部十二个库中筛出的 140 列，只用于 `sh_main`，
   成员与方向锁定在 `src/rquant/factors/libraries/recent_sh_main.py`（见下文“沪市主板近期有效因子集 recent_sh_main”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
@@ -609,13 +609,33 @@ rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set rec
 ```
 
 筛选口径（锁定在 `recent_sh_main.py` 的 `criteria`，基于对十二个库分别执行的
-`rquant --universe sh_main factors evaluate --horizon 1d --start 2020-01-01 --end 2026-10-21`）与 recent 相同，只有一处放宽：
-定向年度 Rank IC 为正的年份不少于 70%（7 年中至少 5 年）。在约 1500 只股票的截面上单因子 IC 更稳定，1078 个因子通过
-|Rank IC| >= 0.01、t >= 3 等条件（通过者 |Rank IC| 中位数约 0.028），按相关系数 0.8 去重后保留 291 个：gtja191 79、
-qlib_alpha158 46、wq_alpha101 38、qlib_alpha360 30、jq240 25、talib 20、oap 18、china_chars 10、tushare_tech 9、
-jkp153 8、barra_cne6 4、size_value_china 4。同 recent 一样，2020 年及以后的测试年份对成员选择而言是样本内。
+`rquant --universe sh_main factors evaluate --horizon 1d --start 2020-01-01 --end 2026-10-21`）：
 
-RESULT_SH_MAIN_PLACEHOLDER
+- 与 recent 相同的 IC 条件：2020 年以来 |Rank IC| >= 0.01、t >= 3、覆盖率 >= 80%，定向年度 Rank IC 为正的年份放宽到
+  不少于 70%（7 年中至少 5 年）；
+- 做多端条件：按因子方向做多的那一档（方向为正取最高 20%，为负取最低 20%）的年收益要跑赢 sh_main 全池等权收益，
+  7 年中至少 5 年做到（`min_positive_long_excess_year_ratio=0.7`），且 2020 年以来平均跑赢。组合只做多 top 50，
+  而 sh_main 上通过 IC 条件的 1078 个因子中，做多端每年只比全池多赚中位数 1.6%，做空端却少赚 14.7%，IC 大多来自
+  识别会跌的股票；全池等权年收益记在 `provenance["universe_annual_returns"]`；
+- 去重：491 个因子通过以上条件，按做多端年均超额从强到弱排序，与已保留因子的截面 Spearman 相关系数绝对值不低于 0.8
+  就剔除，保留 140 个：gtja191 27、wq_alpha101 26、qlib_alpha158 24、jq240 13、qlib_alpha360 11、talib 9、oap 9、
+  china_chars 7、jkp153 7、tushare_tech 3、barra_cne6 2、size_value_china 2。
+
+同 recent 一样，2020 年及以后的测试年份对成员选择而言是样本内。
+
+sh_main 上的 LGB 1d walk-forward（2013-2026，top 50 每 5 天调仓）：
+
+| 因子集 | run | 预测 RankIC 全区间 / 2022+ | 年化 / 夏普 / 最大回撤 | 2020 年以来累计 |
+| :--- | :--- | ---: | ---: | ---: |
+| recent_sh_main（140，做多端规则） | `20261028T033032Z-61dc64d6` | 0.081 / 0.045 | 28.2% / 0.98 / -49.0% | +177% |
+| 只按 IC 筛的版本（291） | `20261028T012626Z-1a05c1e7` | 0.093 / 0.045 | 25.3% / 0.92 / -44.9% | +98% |
+| recent 2020 版（117） | `20261028T021454Z-78c51396` | 0.085 / 0.044 | 24.6% / 0.90 / -47.9% | +103% |
+| recent 2022 版（96） | `20261027T192107Z-b2944c54` | 0.084 / 0.047 | 27.4% / 0.97 / -47.2% | +179% |
+| jq240 | `20261027T202921Z-41fb3dde` | 0.073 / 0.042 | 29.1% / 1.02 / -44.1% | +277% |
+| Hquality | `20261027T174016Z-18ae32b0` | 0.085 / 0.041 | 24.1% / 0.90 / -41.8% | +121% |
+
+加入做多端条件后预测 RankIC 从 0.093 降到 0.081，组合年化却从 25.3% 升到 28.2%：对只做多的组合，做多端的区分能力
+比整体排序相关性更重要。
 
 ### 中国 A 股股票特征 china_chars
 
