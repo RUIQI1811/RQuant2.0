@@ -15,6 +15,7 @@ from rquant.factors.libraries.base import FactorSelection, FactorSpec, PanelFact
 from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
 from rquant.factors.libraries.hquality import HQUALITY_SELECTION
 from rquant.factors.libraries.recent import RECENT_SELECTION
+from rquant.factors.libraries.recent_sh_main import RECENT_SH_MAIN_SELECTION
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
 from rquant.factors.selection import (
     StabilityCriteria,
@@ -152,6 +153,20 @@ class FactorSelectionRegistryTests(unittest.TestCase):
         sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
         self.assertEqual(set(selection.source_factor_sets), sources)
         self.assertEqual({"kunquant"}, {library.backend for library in registry.select("recent")})
+
+    # Break caught: a recent_sh_main member from a library the selection does not list as a source.
+    def test_default_registry_publishes_recent_sh_main_from_all_twelve_libraries(self) -> None:
+        registry = get_library_registry()
+        catalog = get_catalog()
+        selection = registry.selection("recent_sh_main")
+
+        self.assertIs(RECENT_SH_MAIN_SELECTION, selection)
+        self.assertEqual(RECENT_SH_MAIN_SELECTION.canonical_names, catalog.canonical_names("recent_sh_main"))
+        self.assertEqual(291, len(selection.canonical_names))
+        self.assertEqual(12, len(selection.source_factor_sets))
+        sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
+        self.assertEqual(set(selection.source_factor_sets), sources)
+        self.assertEqual("sh_main", selection.provenance["universe"])
 
 
 class SelectionFactorEngineTests(unittest.TestCase):
@@ -331,6 +346,14 @@ class FactorDeduplicationTests(unittest.TestCase):
         self.assertFalse(kept & set(dropped))
         self.assertTrue(set(dropped.values()) <= kept)
         self.assertEqual(0.8, RECENT_SELECTION.criteria["max_abs_rank_correlation"])
+
+    def test_locked_recent_sh_main_has_no_pair_above_its_correlation_limit(self) -> None:
+        dropped = RECENT_SH_MAIN_SELECTION.provenance["deduplicated"]
+        kept = set(RECENT_SH_MAIN_SELECTION.canonical_names)
+        self.assertEqual(291, len(kept))
+        self.assertFalse(kept & set(dropped))
+        self.assertTrue(set(dropped.values()) <= kept)
+        self.assertEqual(0.7, RECENT_SH_MAIN_SELECTION.criteria["min_positive_rank_ic_year_ratio"])
 
 
 if __name__ == "__main__":
