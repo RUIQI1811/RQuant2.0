@@ -18,9 +18,12 @@ Daily adaptation
   ``china_chars``: a quarter is usable once it and every earlier quarter are announced. Flow-to-price and flow-to-assets
   ratios use trailing-twelve-month flows; five-year descriptors use the last five fiscal-year (Q4) values and need at
   least three of them.
-* The two cross-sectional descriptors (MIDCAP, INDMOM) use only the stocks in the CSI 300 on that day, so later index
-  members do not shape earlier cross-sections.
+* The two cross-sectional descriptors (MIDCAP, INDMOM) use only the research universe's members of that day (the
+  CSI 300 by default), so later index members do not shape earlier cross-sections.
 * Every output is missing on days the stock has no quote.
+* Statement formulas run in a KunQuant graph over fiscal quarters and reach the daily graph from their first usable
+  announcement day; exponentially weighted windows, regressions and the cross-sectional steps are per-stock or
+  per-day C++ kernels. The original pandas implementation is the parity reference in ``tests/panel_reference``.
 
 Left out: the analyst-forecast descriptors EPIBS, EGRLF, ETOPF_STD and DPIBS (Tushare's forecast endpoint allows one
 call per minute at this account level).
@@ -28,20 +31,21 @@ call per minute at this account level).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import inspect
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from rquant.errors import DataContractError
-from rquant.factors.libraries.base import FactorSpec, PanelFactorLibrary
-from rquant.factors.panel_operators import replace_inf, safe_div
-from rquant.factors.statements import QuarterGrid, lag, ratio
+from rquant.factors import statements
+from rquant.factors.extensions import kunquant_oap as op
+from rquant.factors.extensions.kunquant_oap import g
+from rquant.factors.libraries.base import FactorLibrary, FactorSpec
+from rquant.factors.libraries.china_chars import CPP_PRELUDE as CNC_PRELUDE
 from rquant.io import sha256_file, stable_hash
 
-Panel = pd.DataFrame
 MONTH = 21
 YEAR = 252
 LONG_WINDOW = 1040
@@ -109,12 +113,382 @@ CNE6_DESCRIPTORS: tuple[tuple[str, str, int], ...] = (
 )
 CNE6_NAMES = tuple(name for name, _, _ in CNE6_DESCRIPTORS)
 
+STATEMENT_FIELDS = (
+    "revenue",
+    "oper_cost",
+    "fin_exp",
+    "total_profit",
+    "n_income_attr_p",
+    "n_cashflow_act",
+    "n_cashflow_inv_act",
+    "n_incr_cash_cash_equ",
+    "c_pay_acq_const_fiolta",
+    "depr_fa_coga_dpba",
+    "amort_intang_assets",
+    "lt_amort_deferred_exp",
+    "total_share",
+    "money_cap",
+    "total_assets",
+    "total_liab",
+    "st_borr",
+    "non_cur_liab_due_1y",
+    "lt_borr",
+    "bond_payable",
+    "oth_eqt_tools_p_shr",
+    "total_hldr_eqy_exc_min_int",
+)
+# Descriptors published unchanged from a statement-graph result (``q_`` latest quarter, ``y_`` latest fiscal year).
+STATEMENT_FACTORS = {
+    **{name: f"q_{name}" for name in ("blev", "dtoa", "abs", "acf", "ato", "gp", "gpm", "roa")},
+    **{name: f"y_{name}" for name in ("vsal", "vern", "vflo", "agro", "igro", "cxgro", "egro", "sgro")},
+}
+# Statement results the daily graph combines with the market value.
+STATEMENT_INPUTS = ("q_book", "q_earnings_ttm", "q_cash_ttm", "q_ebit_ttm", "q_net_debt", "q_other_capital")
+DAILY_REFERENCE = ("basic_turnover_rate", "basic_dv_ttm", "mkt", "universe")
 
-class BarraCNE6Library(PanelFactorLibrary):
-    """Barra CNE6 style descriptors, re-dated to daily point-in-time panels."""
+# Exponentially weighted window sums, kept per stock with the recursion of the pandas reference:
+# ``S_t = d S_{t-1} + x_t - d^window x_{t-window}``; counts use ``d = 1``.
+CPP_PRELUDE = r"""
+#ifndef RQUANT_CNE6_CPP_HELPERS
+#define RQUANT_CNE6_CPP_HELPERS
+namespace rq_cne6 {
+struct EwSum {
+    double decay = 1.0, tail = 1.0, running = 0.0;
+    int window = 1;
+    std::vector<double> history;
+    void setup(int w, double half_life) {
+        window = w;
+        decay = half_life > 0 ? std::pow(0.5, 1.0 / half_life) : 1.0;
+        tail = std::pow(decay, (double)w);
+        running = 0.0;
+        history.clear();
+    }
+    double push(double x) {
+        history.push_back(x);
+        const size_t row = history.size() - 1;
+        running = decay * running + x;
+        if (row >= (size_t)window) running = running - tail * history[row - window];
+        return running;
+    }
+};
+}  // namespace rq_cne6
+#endif
+"""
+
+# Weighted market regression: sums of the weight, x, y, xx, xy and yy plus the plain count of known pairs.
+_FIT_MEMBERS = "rq_cne6::EwSum w, x, y, xx, xy, yy, n; bool ready;"
+_FIT_SETUP = (
+    "if (!s.ready) {{ s.w.setup({window}, {half_life}); s.x.setup({window}, {half_life}); "
+    "s.y.setup({window}, {half_life}); s.xx.setup({window}, {half_life}); s.xy.setup({window}, {half_life}); "
+    "s.yy.setup({window}, {half_life}); s.n.setup({window}, 0.0); s.ready = true; }}"
+)
+_FIT_STEP = """
+    const bool known = std::isfinite(x0) && std::isfinite(x1);
+    const double ry = known ? x0 : 0.0, rx = known ? x1 : 0.0, rw = known ? 1.0 : 0.0;
+    const double sw = s.w.push(rw), sx = s.x.push(rx), sy = s.y.push(ry);
+    const double sxx = s.xx.push(rx * rx), sxy = s.xy.push(rx * ry), syy = s.yy.push(ry * ry);
+    const double count = s.n.push(rw);
+    const double mean_x = sx / sw, mean_y = sy / sw;
+    const double var_x = sxx / sw - mean_x * mean_x, var_y = syy / sw - mean_y * mean_y;
+    const double cov = sxy / sw - mean_x * mean_y;
+    const double beta = cov / var_x, alpha = mean_y - beta * mean_x, residual = var_y - beta * cov;
+    const bool valid = count > {minimum} - 0.5 && var_x > 1e-16;
+    y = NAN;
+    if (valid) {{ {publish} }}
+"""
+_FIT_PUBLISH = {
+    "beta": "y = beta;",
+    "alpha": "y = alpha;",
+    "resid_std": "if (residual > 0) y = std::sqrt(std::max(residual, 0.0));",
+}
+
+
+def ew_market_fit(returns, market, window: int, half_life: float, minimum: int, output: str):
+    step = _FIT_SETUP.format(window=window, half_life=half_life) + _FIT_STEP.format(
+        minimum=minimum, publish=_FIT_PUBLISH[output]
+    )
+    return op.state([returns, market], step, _FIT_MEMBERS, "s.ready = false;")
+
+
+def ew_log_return(log_returns, window: int, half_life: float, minimum: int):
+    """Exponentially weighted sum of the known log returns, given at least ``minimum`` of them in the window."""
+    step = f"""
+    if (!s.ready) {{ s.r.setup({window}, {half_life}); s.n.setup({window}, 0.0); s.ready = true; }}
+    const bool known = std::isfinite(x0);
+    const double total = s.r.push(known ? x0 : 0.0), count = s.n.push(known ? 1.0 : 0.0);
+    y = count > {minimum} - 0.5 ? total : NAN;"""
+    return op.state([log_returns], step, "rq_cne6::EwSum r, n; bool ready;", "s.ready = false;")
+
+
+def lag_average(value, first: int, last: int):
+    """Mean of ``value`` lagged ``first`` through ``last`` rows; missing unless every lag is known."""
+    return sum(lag(value, periods) for periods in range(first, last + 1)) / float(last - first + 1)
+
+
+def five_year_slope(values, *, absolute_mean: bool = False):
+    """OLS slope of the last five fiscal-year values on time over their mean (or mean absolute value)."""
+    stacked = [lag(values, 4 * (FISCAL_YEARS - 1 - k)) for k in range(FISCAL_YEARS)]
+    known = [g.isfinite(value) for value in stacked]
+    count = sum(known)
+    times = [float(k + 1) for k in range(FISCAL_YEARS)]
+    mean_t = sum(g.where(f, t, 0.0) for f, t in zip(known, times, strict=True)) / count
+    mean_v = sum(g.where(f, v, 0.0) for f, v in zip(known, stacked, strict=True)) / count
+    centered = [g.where(f, t - mean_t, 0.0) for f, t in zip(known, times, strict=True)]
+    covariance = sum(c * g.where(f, v - mean_v, 0.0) for c, f, v in zip(centered, known, stacked, strict=True))
+    slope = covariance / sum(c * c for c in centered)
+    scale = sum(g.where(f, g.abs(v), 0.0) for f, v in zip(known, stacked, strict=True)) / count if absolute_mean \
+        else mean_v
+    return g.where(count >= 3, ratio(slope, scale), g.nan)
+
+
+def five_year_variation(values):
+    """Sample std of the last five fiscal-year values over their mean absolute value; at least three years."""
+    stacked = [lag(values, 4 * k) for k in range(FISCAL_YEARS)]
+    known = [g.isfinite(value) for value in stacked]
+    count = sum(known)
+    mean = sum(g.where(f, v, 0.0) for f, v in zip(known, stacked, strict=True)) / count
+    squares = sum(g.where(f, (v - mean) * (v - mean), 0.0) for f, v in zip(known, stacked, strict=True))
+    std = g.sqrt(squares / (count - 1))
+    scale = sum(g.where(f, g.abs(v), 0.0) for f, v in zip(known, stacked, strict=True)) / count
+    return g.where(count >= 3, ratio(std, scale), g.nan)
+
+
+def positive(value):
+    return g.where(value > 0, value, g.nan)
+
+
+def lag(value, periods: int):
+    return op.shift(value, periods)
+
+
+def ratio(numerator, denominator):
+    return op.ratio(numerator, denominator)
+
+
+def _statement_graph() -> dict[str, Any]:
+    """Statement formulas over fiscal quarters (rows) x instruments."""
+    quarter = op.input_("fiscal_quarter")
+
+    def value(name: str):
+        return op.input_(name)
+
+    def single(name: str):
+        ytd = value(name)
+        return g.where(quarter == 0, ytd, ytd - lag(ytd, 1))
+
+    def ttm(name: str):
+        flow = single(name)
+        return flow + lag(flow, 1) + lag(flow, 2) + lag(flow, 3)
+
+    def annual(name: str):
+        return g.where(quarter == 3, value(name), g.nan)
+
+    def fiscal_year(node):
+        return g.where(quarter == 3, node, g.nan)
+
+    assets = value("total_assets")
+    equity = value("total_hldr_eqy_exc_min_int") - value("oth_eqt_tools_p_shr")
+    long_term_debt = value("lt_borr") + value("bond_payable")
+    total_debt = value("st_borr") + value("non_cur_liab_due_1y") + long_term_debt
+    depreciation = ttm("depr_fa_coga_dpba") + ttm("amort_intang_assets") + ttm("lt_amort_deferred_exp")
+    revenue = ttm("revenue")
+    gross = revenue - ttm("oper_cost")
+    shares = fiscal_year(value("total_share"))
+
+    def per_share(flow: str):
+        return ratio(annual(flow), positive(shares))
+
+    operating = (assets - value("money_cap")) - (value("total_liab") - total_debt)
+    out = {
+        "q_book": equity,
+        "q_earnings_ttm": ttm("n_income_attr_p"),
+        "q_cash_ttm": ttm("n_cashflow_act"),
+        "q_ebit_ttm": ttm("total_profit") + ttm("fin_exp"),
+        "q_net_debt": total_debt - value("money_cap"),
+        "q_other_capital": value("oth_eqt_tools_p_shr") + long_term_debt,
+        "q_blev": ratio(equity + value("oth_eqt_tools_p_shr") + long_term_debt, positive(equity)),
+        "q_dtoa": ratio(value("total_liab"), assets),
+        "y_vsal": five_year_variation(annual("revenue")),
+        "y_vern": five_year_variation(annual("n_income_attr_p")),
+        "y_vflo": five_year_variation(annual("n_incr_cash_cash_equ")),
+        "q_abs": -ratio(operating - lag(operating, 4) - depreciation, assets),
+        "q_acf": -ratio(
+            ttm("n_income_attr_p") - (ttm("n_cashflow_act") + ttm("n_cashflow_inv_act")) + depreciation, assets
+        ),
+        "q_ato": ratio(revenue, assets),
+        "q_gp": ratio(gross, assets),
+        "q_gpm": ratio(gross, revenue),
+        "q_roa": ratio(ttm("n_income_attr_p"), assets),
+        "y_agro": -five_year_slope(fiscal_year(assets)),
+        "y_igro": -five_year_slope(fiscal_year(value("total_share"))),
+        "y_cxgro": -five_year_slope(annual("c_pay_acq_const_fiolta")),
+        "y_egro": five_year_slope(per_share("n_income_attr_p"), absolute_mean=True),
+        "y_sgro": five_year_slope(per_share("revenue")),
+    }
+    return out
+
+
+def midcap(cap, universe):
+    """MIDCAP over the day's universe members: inputs are the positive cap and the membership flag."""
+    code = """
+    const size_t n = num_stocks;
+    std::vector<double> lc(n), size(n, NAN), cube(n, NAN), residual(n, NAN), clipped(n, NAN);
+    for (size_t i = 0; i < n; ++i) lc[i] = std::log(input_0[i]);
+    auto standardise = [&](const std::vector<double>& v, std::vector<double>& out) {
+        double wsum = 0, vsum = 0; std::vector<double> member;
+        for (size_t i = 0; i < n; ++i)
+            if (input_1[i] > 0 && std::isfinite(v[i]) && std::isfinite(input_0[i])) {
+                member.push_back(v[i]); wsum += input_0[i]; vsum += v[i] * input_0[i];
+            }
+        std::fill(out.begin(), out.end(), NAN);
+        if (member.size() < 3) return;
+        const double mean = vsum / wsum;
+        double plain = 0; for (double z : member) plain += z; plain /= member.size();
+        double squares = 0; for (double z : member) squares += (z - plain) * (z - plain);
+        const double sd = std::sqrt(squares / (member.size() - 1));
+        if (sd > 0) for (size_t i = 0; i < n; ++i) out[i] = (v[i] - mean) / sd;
+    };
+    standardise(lc, size);
+    for (size_t i = 0; i < n; ++i) cube[i] = size[i] * size[i] * size[i];
+    {
+        double sw = 0, sz = 0, sy = 0; size_t count = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double w = std::sqrt(input_0[i]);
+            if (input_1[i] > 0 && std::isfinite(cube[i]) && std::isfinite(w)) { ++count; sw += w; sz += w * size[i];
+                sy += w * cube[i]; }
+        }
+        if (count >= 3) {
+            const double mz = sz / sw, my = sy / sw;
+            double szz = 0, szy = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const double w = std::sqrt(input_0[i]);
+                if (input_1[i] > 0 && std::isfinite(cube[i]) && std::isfinite(w)) {
+                    szz += w * (size[i] - mz) * (size[i] - mz); szy += w * (size[i] - mz) * (cube[i] - my);
+                }
+            }
+            const double slope = szy / szz, intercept = my - slope * mz;
+            for (size_t i = 0; i < n; ++i) residual[i] = cube[i] - intercept - slope * size[i];
+        }
+    }
+    {
+        std::vector<double> member;
+        for (size_t i = 0; i < n; ++i) if (input_1[i] > 0 && std::isfinite(residual[i])) member.push_back(residual[i]);
+        if (member.size() >= 3) {
+            double mean = 0; for (double z : member) mean += z; mean /= member.size();
+            double squares = 0; for (double z : member) squares += (z - mean) * (z - mean);
+            const double sd = std::sqrt(squares / (member.size() - 1));
+            const double low = mean - 3 * sd, high = mean + 3 * sd;
+            for (size_t i = 0; i < n; ++i)
+                clipped[i] = std::isnan(residual[i]) ? NAN : std::min(high, std::max(low, residual[i]));
+        }
+    }
+    std::vector<double> result(n, NAN);
+    standardise(clipped, result);
+    for (size_t i = 0; i < n; ++i) output_0[i] = result[i];
+    """
+    return op.cross(code, cap, universe)
+
+
+def _daily_graph() -> dict[str, Any]:
+    close = op.input_("close")
+    trading = g.isfinite(close)
+    price = op.ffill(close)
+    returns = close / lag(close, 1) - 1.0
+    log_returns = op.scalar("x0 > -1.0 ? std::log1p(x0) : NAN", returns)
+    cap = positive(op.input_("cap"))
+    market = op.input_("mkt")
+    universe = op.input_("universe")
+    turnover = op.input_("basic_turnover_rate")
+
+    def to_price(name: str):
+        return ratio(op.input_(name), cap)
+
+    def log_turnover(window: int, minimum: int, months: int):
+        total = op.trailing(turnover, window, minimum, "sum") / float(months)
+        return g.log(positive(total))
+
+    dastd_code = """
+    if (!s.ready) { s.w.setup(252, 42); s.r.setup(252, 42); s.rr.setup(252, 42); s.n.setup(252, 0.0);
+        s.ready = true; }
+    const bool known = std::isfinite(x0);
+    const double r = known ? x0 : 0.0, weight = known ? 1.0 : 0.0;
+    const double sw = s.w.push(weight), sr = s.r.push(r), srr = s.rr.push(r * r), count = s.n.push(weight);
+    const double mean = sr / sw, variance = srr / sw - mean * mean;
+    y = count > 62.5 && variance > 0 ? std::sqrt(std::max(variance, 0.0)) : NAN;"""
+    atvr_code = """
+    if (!s.ready) { s.v.setup(252, 63); s.n.setup(252, 0.0); s.ready = true; }
+    const bool known = std::isfinite(x0);
+    const double total = s.v.push(known ? x0 : 0.0), count = s.n.push(known ? 1.0 : 0.0);
+    y = count >= 120 ? total : NAN;"""
+    cmra_code = """
+    const bool known = std::isfinite(x0);
+    const double last = s.prefix.empty() ? 0.0 : s.prefix.back();
+    const double seen = s.counts.empty() ? 0.0 : s.counts.back();
+    s.prefix.push_back(last + (known ? x0 : 0.0));
+    s.counts.push_back(seen + (known ? 1.0 : 0.0));
+    const int rows = (int)s.prefix.size();
+    y = NAN;
+    if (rows >= 252) {
+        const double observed = s.counts[rows - 1] - (rows > 252 ? s.counts[rows - 253] : 0.0);
+        if (observed >= 200) {
+            double high = -INFINITY, low = INFINITY;
+            for (int months = 1; months <= 12; ++months) {
+                const int days = 21 * months;
+                const double z = s.prefix[rows - 1] - (rows > days ? s.prefix[rows - 1 - days] : 0.0);
+                high = std::max(high, z); low = std::min(low, z);
+            }
+            y = std::log1p(high) - std::log1p(low);
+        }
+    }"""
+    season_terms = [lag(price, YEAR * k - MONTH) / lag(price, YEAR * k) - 1.0 for k in range(1, 6)]
+    season_known = [g.isfinite(term) for term in season_terms]
+    season_count = sum(season_known)
+    season = sum(g.where(f, t, 0.0) for f, t in zip(season_known, season_terms, strict=True)) / season_count
+    strength = ew_log_return(log_returns, 126, 21, 60)
+    industry = op.group_stat(strength, op.input_("sector"), universe, "mean", g.sqrt(cap))
+    dividend = op.input_("basic_dv_ttm")
+    out = {
+        "lncap": g.log(cap),
+        "midcap": midcap(cap, universe),
+        "hbeta": ew_market_fit(returns, market, YEAR, 63, 63, "beta"),
+        "hsigma": ew_market_fit(returns, market, YEAR, 63, 63, "resid_std"),
+        "dastd": op.state([returns], dastd_code, "rq_cne6::EwSum w, r, rr, n; bool ready;", "s.ready = false;"),
+        "cmra": op.state([log_returns], cmra_code, "std::vector<double> prefix, counts;"),
+        "stom": log_turnover(MONTH, 15, 1),
+        "stoq": log_turnover(3 * MONTH, 40, 3),
+        "stoa": log_turnover(YEAR, 120, 12),
+        "atvr": op.state([turnover], atvr_code, "rq_cne6::EwSum v, n; bool ready;", "s.ready = false;"),
+        "strev": lag_average(ew_log_return(log_returns, MONTH, 5, 15), 1, 3),
+        "season": g.where(season_count >= 2, season, g.nan),
+        "indmom": industry - strength,
+        "rstr": lag_average(ew_log_return(log_returns, YEAR, 126, 120), 11, 21),
+        "ltrstr": -lag_average(ew_log_return(log_returns, LONG_WINDOW, 260, 500), LONG_LAG, LONG_LAG + 10),
+        "lthalpha": -lag_average(
+            ew_market_fit(returns, market, LONG_WINDOW, 260, 500, "alpha"), LONG_LAG, LONG_LAG + 10
+        ),
+        "btop": to_price("q_book"),
+        "etop": to_price("q_earnings_ttm"),
+        "cetop": to_price("q_cash_ttm"),
+        "em": ratio(op.input_("q_ebit_ttm"), positive(cap + op.input_("q_net_debt"))),
+        "mlev": ratio(cap + op.input_("q_other_capital"), cap),
+        "dtop": g.where(
+            g.isfinite(turnover) | g.isfinite(dividend), g.where(g.isfinite(dividend), dividend, 0.0), g.nan
+        ),
+    }
+    return {name: g.where(g.isfinite(value) & trading, value, g.nan) for name, value in out.items()}
+
+
+class BarraCNE6Library(FactorLibrary):
+    """Barra CNE6 style descriptors, re-dated to daily point-in-time panels and computed in KunQuant."""
 
     family = "barra_cne6"
     required_inputs = ("close", "cap", "sector")
+    reference_inputs = (*DAILY_REFERENCE, *STATEMENT_INPUTS)
+    statement_fields = STATEMENT_FIELDS
+    statement_outputs = (*STATEMENT_INPUTS, *STATEMENT_FACTORS.values())
+    statement_factors = STATEMENT_FACTORS
+    strict_float = True
+    cpp_prelude = CNC_PRELUDE + op.CPP_PRELUDE + CPP_PRELUDE
 
     @property
     def specs(self) -> tuple[FactorSpec, ...]:
@@ -126,10 +500,21 @@ class BarraCNE6Library(PanelFactorLibrary):
                 ordinal=ordinal,
                 formula=description,
                 max_lookback=lookback,
-                implementation=f"rquant.factors.libraries.barra_cne6.CNE6Descriptors.{name}",
-                catalog_version=1,
+                implementation=f"rquant.factors.libraries.barra_cne6.{name}",
+                catalog_version=2,
             )
             for ordinal, (name, description, lookback) in enumerate(CNE6_DESCRIPTORS, 1)
+        )
+
+    @property
+    def implementation_fingerprint(self) -> str:
+        """Also pin the statement alignment and the shared expression operators, which live in other modules."""
+        return stable_hash(
+            {
+                "module": super().implementation_fingerprint,
+                "statements": inspect.getsource(statements),
+                "compiled_prelude": self.cpp_prelude,
+            }
         )
 
     def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
@@ -162,24 +547,11 @@ class BarraCNE6Library(PanelFactorLibrary):
         for field, scale in CNE6_DAILY_BASIC.items():
             panel = daily.pivot(index="datetime", columns="instrument", values=field)
             inputs[f"basic_{field}"] = panel.reindex(index=dates, columns=instruments) * scale
-
         factors = pd.read_parquet(root / "market_factors.parquet").set_index("datetime").sort_index()
         inputs["mkt"] = factors["mkt"].reindex(dates)
         fundamentals = pd.read_parquet(root / "fundamentals.parquet")
         inputs["fundamentals"] = fundamentals[fundamentals["instrument"].isin(set(instruments))]
-
-        bar_files = sorted((canonical_root / "bars").glob("year=*/*.parquet"))
-        bar_files = [path for path in bar_files if int(path.parent.name.split("=")[1]) in years]
-        if not bar_files:
-            raise DataContractError(f"Canonical bars do not exist under {canonical_root / 'bars'}")
-        members = pd.concat(
-            [pd.read_parquet(path, columns=["datetime", "instrument", "in_csi300"], filters=wanted)
-             for path in bar_files],
-            ignore_index=True,
-        )
-        members["datetime"] = pd.to_datetime(members["datetime"])
-        membership = members.pivot(index="datetime", columns="instrument", values="in_csi300")
-        inputs["universe"] = membership.reindex(index=dates, columns=instruments).fillna(False).astype(bool)
+        # Cross-sectional descriptors use the research universe's members of each day, which the engine passes in.
         hashes = {
             "barra_cne6_reference": manifest["fingerprint"],
             "barra_cne6_daily_basic": stable_hash({name: files[name] for name in daily_files}),
@@ -188,441 +560,12 @@ class BarraCNE6Library(PanelFactorLibrary):
         }
         return inputs, hashes
 
-    def calculate(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
-        calculator = CNE6Descriptors(inputs)
-        return {name: calculator.calculate(name) for name in CNE6_NAMES}
-
-    def calculate_into(self, inputs: Mapping[str, Any], output_buffers: Mapping[str, Any]) -> None:
-        calculator = CNE6Descriptors(inputs)
-        for spec in self.specs:
-            output_buffers[spec.canonical_name][...] = calculator.calculate(spec.source_name).to_numpy(dtype=float)
-
-
-def decay_rate(half_life: float | None) -> float:
-    return 1.0 if half_life is None else 0.5 ** (1.0 / half_life)
-
-
-def ew_window_sums(values: Mapping[str, np.ndarray], window: int, half_life: float | None) -> dict[str, np.ndarray]:
-    """Exponentially weighted sums over every trailing ``window`` rows; the newest row has weight 1.
-
-    Missing values must already be zero. The recursion ``S_t = d S_{t-1} + x_t - d^window x_{t-window}`` keeps the cost
-    independent of the window length, and row ``t`` only reads rows ``t - window + 1 .. t``.
-    """
-    decay = decay_rate(half_life)
-    tail = decay**window
-    result: dict[str, np.ndarray] = {}
-    for key, x in values.items():
-        out = np.empty(x.shape)
-        running = np.zeros(x.shape[1:])
-        for row in range(len(x)):
-            running = decay * running + x[row]
-            if row >= window:
-                running = running - tail * x[row - window]
-            out[row] = running
-        result[key] = out
-    return result
-
-
-def ew_market_fit(y: np.ndarray, market: np.ndarray, window: int, half_life: float, minimum: int) -> dict:
-    """Weighted least squares of every stock column of ``y`` on a constant and the market over trailing windows."""
-    x = np.broadcast_to(market[:, None], y.shape)
-    mask = np.isfinite(y) & np.isfinite(x)
-    y0 = np.where(mask, y, 0.0)
-    x0 = np.where(mask, x, 0.0)
-    weight = mask.astype(float)
-    sums = ew_window_sums(
-        {"w": weight, "x": x0, "y": y0, "xx": x0 * x0, "xy": x0 * y0, "yy": y0 * y0}, window, half_life
-    )
-    count = ew_window_sums({"n": weight}, window, None)["n"]
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean_x = sums["x"] / sums["w"]
-        mean_y = sums["y"] / sums["w"]
-        var_x = sums["xx"] / sums["w"] - mean_x**2
-        var_y = sums["yy"] / sums["w"] - mean_y**2
-        cov = sums["xy"] / sums["w"] - mean_x * mean_y
-        beta = cov / var_x
-        alpha = mean_y - beta * mean_x
-        residual = var_y - beta * cov
-    valid = (count > minimum - 0.5) & (var_x > 1e-16)
-    return {
-        "beta": np.where(valid, beta, np.nan),
-        "alpha": np.where(valid, alpha, np.nan),
-        # Rounding can leave a tiny negative residual variance for an exact fit.
-        "resid_std": np.where(valid & (residual > 0), np.sqrt(np.maximum(residual, 0.0)), np.nan),
-    }
-
-
-def lag_average(values: np.ndarray, first: int, last: int) -> np.ndarray:
-    """Mean of ``values`` lagged ``first`` through ``last`` rows; missing unless every lag is known."""
-    rows = len(values)
-    stacked = np.full((last - first + 1, *values.shape), np.nan)
-    for position, periods in enumerate(range(first, last + 1)):
-        if periods < rows:
-            stacked[position, periods:] = values[: rows - periods]
-    return stacked.mean(axis=0)
-
-
-def five_year_slope(values: np.ndarray, *, absolute_mean: bool = False) -> np.ndarray:
-    """OLS slope of the last five fiscal-year values on time over their mean (or mean absolute value).
-
-    ``values`` holds fiscal-year values at Q4 quarter columns; at least three of the five years must be known.
-    """
-    stacked = np.stack([lag(values, 4 * (FISCAL_YEARS - 1 - k)) for k in range(FISCAL_YEARS)], axis=2)
-    finite = np.isfinite(stacked)
-    count = finite.sum(axis=2)
-    time = np.broadcast_to(np.arange(1.0, FISCAL_YEARS + 1.0), stacked.shape)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean_t = np.where(finite, time, 0.0).sum(axis=2) / count
-        mean_v = np.where(finite, stacked, 0.0).sum(axis=2) / count
-        centered_t = np.where(finite, time - mean_t[..., None], 0.0)
-        slope = (centered_t * np.where(finite, stacked - mean_v[..., None], 0.0)).sum(axis=2) / (
-            centered_t**2
-        ).sum(axis=2)
-        scale = np.where(finite, np.abs(stacked), 0.0).sum(axis=2) / count if absolute_mean else mean_v
-    return np.where(count >= 3, ratio(slope, scale), np.nan)
-
-
-def five_year_variation(values: np.ndarray) -> np.ndarray:
-    """Sample std of the last five fiscal-year values over their mean absolute value; at least three years."""
-    stacked = np.stack([lag(values, 4 * k) for k in range(FISCAL_YEARS)], axis=2)
-    finite = np.isfinite(stacked)
-    count = finite.sum(axis=2)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = np.where(finite, stacked, 0.0).sum(axis=2) / count
-        squares = np.where(finite, (stacked - mean[..., None]) ** 2, 0.0).sum(axis=2)
-        std = np.sqrt(squares / (count - 1))
-        scale = np.where(finite, np.abs(stacked), 0.0).sum(axis=2) / count
-    return np.where(count >= 3, ratio(std, scale), np.nan)
-
-
-class CNE6Descriptors:
-    """Calculator with shared intermediates; ``calculate`` returns one descriptor panel."""
-
-    def __init__(self, inputs: Mapping[str, Any]) -> None:
-        self.inputs = inputs
-        close = inputs["close"]
-        self.dates = pd.DatetimeIndex(close.index)
-        self.instruments = pd.Index(close.columns)
-        self.trading = close.notna()
-        self.price = close.ffill()
-        self.returns = (close / close.shift(1) - 1.0).to_numpy(dtype=float)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            self.log_returns = np.log1p(np.where(self.returns > -1.0, self.returns, np.nan))
-        self._cache: dict[str, Any] = {}
-        self._grid: QuarterGrid | None = None
-
-    # ------------------------------------------------------------------ infrastructure
-    def calculate(self, name: str) -> Panel:
-        method: Callable[[], Any] = getattr(self, f"_d_{name}")
-        result = method()
-        if isinstance(result, np.ndarray):
-            result = Panel(result, index=self.dates, columns=self.instruments)
-        result = replace_inf(result.astype(float))
-        return result.where(self.trading)
-
-    def _input(self, key: str) -> Any:
-        value = self.inputs.get(key)
-        if value is None:
-            raise DataContractError(f"barra_cne6 input is missing: {key}")
-        return value
-
-    def _market(self) -> np.ndarray:
-        return np.asarray(pd.Series(self._input("mkt")).reindex(self.dates), dtype=float)
-
-    def _cap(self) -> Panel:
-        cap = self._input("cap")
-        return cap.where(cap > 0)
-
-    def _universe(self) -> np.ndarray:
-        universe = self.inputs.get("universe")
-        if universe is None:
-            return np.ones((len(self.dates), len(self.instruments)), dtype=bool)
-        return np.asarray(universe.reindex(index=self.dates, columns=self.instruments).fillna(False), dtype=bool)
-
-    @property
-    def grid(self) -> QuarterGrid:
-        if self._grid is None:
-            self._grid = QuarterGrid(self._input("fundamentals"), self.dates, self.instruments)
-        return self._grid
-
-    def _ew_log_return(self, window: int, half_life: float, minimum: int) -> np.ndarray:
-        observed = np.isfinite(self.log_returns)
-        sums = ew_window_sums({"r": np.where(observed, self.log_returns, 0.0)}, window, half_life)["r"]
-        count = ew_window_sums({"n": observed.astype(float)}, window, None)["n"]
-        return np.where(count > minimum - 0.5, sums, np.nan)
-
-    def _beta_fit(self) -> dict:
-        if "beta" not in self._cache:
-            self._cache["beta"] = ew_market_fit(self.returns, self._market(), YEAR, 63, 63)
-        return self._cache["beta"]
-
-    def _turnover(self) -> Panel:
-        return self._input("basic_turnover_rate")
-
-    def _log_turnover(self, window: int, minimum: int, months: int) -> Panel:
-        total = self._turnover().rolling(window, min_periods=minimum).sum() / months
-        return np.log(total.where(total > 0))
-
-    def _q(self, values: np.ndarray, *, annual: bool = False) -> Panel:
-        return self.grid.panel(values, annual=annual)
-
-    def _to_price(self, numerator: Panel) -> Panel:
-        return safe_div(numerator, self._cap())
-
-    def _common_equity(self) -> np.ndarray:
-        g = self.grid
-        return g.value("total_hldr_eqy_exc_min_int") - g.value("oth_eqt_tools_p_shr")
-
-    def _long_term_debt(self) -> np.ndarray:
-        g = self.grid
-        return g.value("lt_borr") + g.value("bond_payable")
-
-    def _total_debt(self) -> np.ndarray:
-        g = self.grid
-        return g.value("st_borr") + g.value("non_cur_liab_due_1y") + self._long_term_debt()
-
-    def _fiscal_year(self, values: np.ndarray) -> np.ndarray:
-        """Balance-sheet values at fiscal year ends (Q4 columns) only."""
-        return np.where(self.grid.quarter_index[None, :] == 3, values, np.nan)
-
-    def _standardise(self, values: np.ndarray, universe: np.ndarray, weights: np.ndarray) -> np.ndarray:
-        """Cap-weighted mean zero and unit equal-weighted std over each day's universe members."""
-        result = np.full(values.shape, np.nan)
-        for row in range(len(values)):
-            members = universe[row] & np.isfinite(values[row]) & np.isfinite(weights[row])
-            if members.sum() < 3:
-                continue
-            mean = np.average(values[row, members], weights=weights[row, members])
-            std = values[row, members].std(ddof=1)
-            if std > 0:
-                result[row] = (values[row] - mean) / std
-        return result
-
-    # ------------------------------------------------------------------ size
-    def _d_lncap(self) -> Panel:
-        return np.log(self._cap())
-
-    def _d_midcap(self) -> np.ndarray:
-        cap = self._cap().to_numpy(dtype=float)
-        universe = self._universe()
-        size = self._standardise(np.log(cap), universe, cap)
-        cube = size**3
-        weights = np.sqrt(cap)
-        residual = np.full(cube.shape, np.nan)
-        for row in range(len(cube)):
-            members = universe[row] & np.isfinite(cube[row]) & np.isfinite(weights[row])
-            if members.sum() < 3:
-                continue
-            design = np.column_stack([np.ones(members.sum()), size[row, members]])
-            root = np.sqrt(weights[row, members])
-            coefficients, *_ = np.linalg.lstsq(design * root[:, None], cube[row, members] * root, rcond=None)
-            residual[row] = cube[row] - coefficients[0] - coefficients[1] * size[row]
-        # Winsorise at three standard deviations of the members, then standardise again.
-        clipped = np.full(residual.shape, np.nan)
-        for row in range(len(residual)):
-            members = universe[row] & np.isfinite(residual[row])
-            if members.sum() < 3:
-                continue
-            mean = residual[row, members].mean()
-            std = residual[row, members].std(ddof=1)
-            clipped[row] = np.clip(residual[row], mean - 3.0 * std, mean + 3.0 * std)
-        return self._standardise(clipped, universe, cap)
-
-    # ------------------------------------------------------------------ beta and residual volatility
-    def _d_hbeta(self) -> np.ndarray:
-        return self._beta_fit()["beta"]
-
-    def _d_hsigma(self) -> np.ndarray:
-        return self._beta_fit()["resid_std"]
-
-    def _d_dastd(self) -> np.ndarray:
-        observed = np.isfinite(self.returns)
-        r = np.where(observed, self.returns, 0.0)
-        sums = ew_window_sums({"w": observed.astype(float), "r": r, "rr": r * r}, YEAR, 42)
-        count = ew_window_sums({"n": observed.astype(float)}, YEAR, None)["n"]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            mean = sums["r"] / sums["w"]
-            variance = sums["rr"] / sums["w"] - mean**2
-        return np.where((count > 62.5) & (variance > 0), np.sqrt(np.maximum(variance, 0.0)), np.nan)
-
-    def _d_cmra(self) -> np.ndarray:
-        observed = np.isfinite(self.log_returns)
-        prefix = np.concatenate([np.zeros((1, observed.shape[1])), np.cumsum(np.where(observed, self.log_returns,
-                                                                                         0.0), axis=0)])
-        counts = np.concatenate([np.zeros((1, observed.shape[1])), np.cumsum(observed, axis=0)])
-        rows = len(observed)
-        cumulative = np.full((12, *observed.shape), np.nan)
-        for months in range(1, 13):
-            days = months * MONTH
-            if days > rows:
-                continue
-            cumulative[months - 1, days - 1 :] = prefix[days:] - prefix[:-days]
-        enough = np.full(observed.shape, False)
-        if rows >= YEAR:
-            enough[YEAR - 1 :] = (counts[YEAR:] - counts[:-YEAR]) >= 200
-        with np.errstate(invalid="ignore", divide="ignore"):
-            high = np.log1p(np.max(cumulative, axis=0))
-            low = np.log1p(np.min(cumulative, axis=0))
-        return np.where(enough, high - low, np.nan)
-
-    # ------------------------------------------------------------------ liquidity
-    def _d_stom(self) -> Panel:
-        return self._log_turnover(MONTH, 15, 1)
-
-    def _d_stoq(self) -> Panel:
-        return self._log_turnover(3 * MONTH, 40, 3)
-
-    def _d_stoa(self) -> Panel:
-        return self._log_turnover(YEAR, 120, 12)
-
-    def _d_atvr(self) -> np.ndarray:
-        turnover = self._turnover().to_numpy(dtype=float)
-        observed = np.isfinite(turnover)
-        total = ew_window_sums({"v": np.where(observed, turnover, 0.0)}, YEAR, 63)["v"]
-        count = ew_window_sums({"n": observed.astype(float)}, YEAR, None)["n"]
-        return np.where(count >= 120, total, np.nan)
-
-    # ------------------------------------------------------------------ momentum
-    def _d_strev(self) -> np.ndarray:
-        return lag_average(self._ew_log_return(MONTH, 5, 15), 1, 3)
-
-    def _d_season(self) -> np.ndarray:
-        price = self.price
-        # The month that starts k years ago ends 252 k - 21 rows ago, so every term is known on row t.
-        stacked = np.stack(
-            [(price.shift(YEAR * k - MONTH) / price.shift(YEAR * k) - 1.0).to_numpy(dtype=float) for k in range(1, 6)]
-        )
-        finite = np.isfinite(stacked)
-        count = finite.sum(axis=0)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            mean = np.where(finite, stacked, 0.0).sum(axis=0) / count
-        return np.where(count >= 2, mean, np.nan)
-
-    def _d_indmom(self) -> np.ndarray:
-        strength = self._ew_log_return(126, 21, 60)
-        sector = np.asarray(self._input("sector").reindex(index=self.dates, columns=self.instruments), dtype=float)
-        weights = np.sqrt(self._cap().to_numpy(dtype=float))
-        universe = self._universe()
-        result = np.full(strength.shape, np.nan)
-        for row in range(len(strength)):
-            codes = sector[row]
-            members = universe[row] & np.isfinite(strength[row]) & np.isfinite(weights[row]) & np.isfinite(codes)
-            for code in np.unique(codes[members]):
-                peers = members & (codes == code)
-                industry = np.average(strength[row, peers], weights=weights[row, peers])
-                in_industry = codes == code
-                result[row, in_industry] = industry - strength[row, in_industry]
-        return result
-
-    def _d_rstr(self) -> np.ndarray:
-        return lag_average(self._ew_log_return(YEAR, 126, 120), 11, 21)
-
-    # ------------------------------------------------------------------ long-term reversal
-    def _d_ltrstr(self) -> np.ndarray:
-        return -lag_average(self._ew_log_return(LONG_WINDOW, 260, 500), LONG_LAG, LONG_LAG + 10)
-
-    def _d_lthalpha(self) -> np.ndarray:
-        fit = ew_market_fit(self.returns, self._market(), LONG_WINDOW, 260, 500)
-        return -lag_average(fit["alpha"], LONG_LAG, LONG_LAG + 10)
-
-    # ------------------------------------------------------------------ value and earnings yield
-    def _d_btop(self) -> Panel:
-        return self._to_price(self._q(self._common_equity()))
-
-    def _d_etop(self) -> Panel:
-        return self._to_price(self._q(self.grid.ttm("n_income_attr_p")))
-
-    def _d_cetop(self) -> Panel:
-        return self._to_price(self._q(self.grid.ttm("n_cashflow_act")))
-
-    def _d_em(self) -> Panel:
-        g = self.grid
-        ebit = self._q(g.ttm("total_profit") + g.ttm("fin_exp"))
-        enterprise = self._cap() + self._q(self._total_debt() - g.value("money_cap"))
-        return safe_div(ebit, enterprise.where(enterprise > 0))
-
-    # ------------------------------------------------------------------ leverage
-    def _d_mlev(self) -> Panel:
-        other = self._q(self.grid.value("oth_eqt_tools_p_shr") + self._long_term_debt())
-        return safe_div(self._cap() + other, self._cap())
-
-    def _d_blev(self) -> Panel:
-        equity = self._common_equity()
-        total = equity + self.grid.value("oth_eqt_tools_p_shr") + self._long_term_debt()
-        return self._q(ratio(total, np.where(equity > 0, equity, np.nan)))
-
-    def _d_dtoa(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.value("total_liab"), g.value("total_assets")))
-
-    # ------------------------------------------------------------------ earnings variability
-    def _d_vsal(self) -> Panel:
-        return self._q(five_year_variation(self.grid.annual("revenue")), annual=True)
-
-    def _d_vern(self) -> Panel:
-        return self._q(five_year_variation(self.grid.annual("n_income_attr_p")), annual=True)
-
-    def _d_vflo(self) -> Panel:
-        return self._q(five_year_variation(self.grid.annual("n_incr_cash_cash_equ")), annual=True)
-
-    # ------------------------------------------------------------------ earnings quality
-    def _d_abs(self) -> Panel:
-        g = self.grid
-        assets = g.value("total_assets")
-        operating = (assets - g.value("money_cap")) - (g.value("total_liab") - self._total_debt())
-        depreciation = g.ttm("depr_fa_coga_dpba") + g.ttm("amort_intang_assets") + g.ttm("lt_amort_deferred_exp")
-        accruals = operating - lag(operating, 4) - depreciation
-        return self._q(-ratio(accruals, assets))
-
-    def _d_acf(self) -> Panel:
-        g = self.grid
-        depreciation = g.ttm("depr_fa_coga_dpba") + g.ttm("amort_intang_assets") + g.ttm("lt_amort_deferred_exp")
-        cash_flow = g.ttm("n_cashflow_act") + g.ttm("n_cashflow_inv_act")
-        accruals = g.ttm("n_income_attr_p") - cash_flow + depreciation
-        return self._q(-ratio(accruals, g.value("total_assets")))
-
-    # ------------------------------------------------------------------ profitability
-    def _d_ato(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.ttm("revenue"), g.value("total_assets")))
-
-    def _d_gp(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.ttm("revenue") - g.ttm("oper_cost"), g.value("total_assets")))
-
-    def _d_gpm(self) -> Panel:
-        g = self.grid
-        revenue = g.ttm("revenue")
-        return self._q(ratio(revenue - g.ttm("oper_cost"), revenue))
-
-    def _d_roa(self) -> Panel:
-        g = self.grid
-        return self._q(ratio(g.ttm("n_income_attr_p"), g.value("total_assets")))
-
-    # ------------------------------------------------------------------ investment quality
-    def _d_agro(self) -> Panel:
-        return self._q(-five_year_slope(self._fiscal_year(self.grid.value("total_assets"))), annual=True)
-
-    def _d_igro(self) -> Panel:
-        return self._q(-five_year_slope(self._fiscal_year(self.grid.value("total_share"))), annual=True)
-
-    def _d_cxgro(self) -> Panel:
-        return self._q(-five_year_slope(self.grid.annual("c_pay_acq_const_fiolta")), annual=True)
-
-    # ------------------------------------------------------------------ growth
-    def _per_share(self, flow: str) -> np.ndarray:
-        g = self.grid
-        shares = self._fiscal_year(g.value("total_share"))
-        return ratio(g.annual(flow), np.where(shares > 0, shares, np.nan))
-
-    def _d_egro(self) -> Panel:
-        return self._q(five_year_slope(self._per_share("n_income_attr_p"), absolute_mean=True), annual=True)
-
-    def _d_sgro(self) -> Panel:
-        return self._q(five_year_slope(self._per_share("revenue")), annual=True)
-
-    # ------------------------------------------------------------------ dividend yield
-    def _d_dtop(self) -> Panel:
-        # Tushare leaves dv_ttm empty for stocks that paid nothing over the last year.
-        dividend = self._input("basic_dv_ttm")
-        return dividend.fillna(0.0).where(self._turnover().notna() | dividend.notna())
+    def build_statements(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        memo: dict[int, Any] = {}
+        graph = _statement_graph()
+        return {name: op.lower(graph[name], inputs, memo) for name in self.statement_outputs}
+
+    def build(self, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        memo: dict[int, Any] = {}
+        graph = _daily_graph()
+        return {name: op.lower(graph[name], inputs, memo) for name in CNE6_NAMES if name not in STATEMENT_FACTORS}

@@ -1,23 +1,61 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 import tempfile
 import unittest
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from rquant.factors.catalog import get_catalog
-from rquant.factors.engine import FactorBuildConfig, PanelFactorEngine, create_factor_engine
-from rquant.factors.libraries.barra_cne6 import (
-    CNE6_NAMES,
-    BarraCNE6Library,
+from rquant.factors.engine import (
+    FactorBuildConfig,
+    KunQuantFactorEngine,
+    cpp_compiler_available,
+    create_factor_engine,
+)
+from rquant.factors.libraries.barra_cne6 import CNE6_NAMES, BarraCNE6Library
+from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from panel_reference.barra_cne6 import BarraCNE6Library as ReferenceLibrary  # noqa: E402
+from panel_reference.barra_cne6 import (  # noqa: E402
     CNE6Descriptors,
     ew_market_fit,
     ew_window_sums,
     five_year_slope,
 )
-from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+KUNQUANT_READY = importlib.util.find_spec("KunQuant") is not None and cpp_compiler_available()
+
+
+@lru_cache(maxsize=1)
+def compiled():
+    # Windows cannot delete a JIT-compiled DLL while this process still has it loaded.
+    temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    engine = KunQuantFactorEngine(temporary.name, FactorBuildConfig(factor_set="barra_cne6", workers=2))
+    return temporary, engine, engine.compile(), engine.compile_statements()
+
+
+def calculate(inputs: dict[str, object]) -> dict[str, pd.DataFrame]:
+    """KunQuant outputs by source name, as panels shaped like the inputs."""
+    _, engine, module, statement_modules = compiled()
+    close = inputs["close"]
+    statements = engine.run_statements(inputs, close.index, close.columns, statement_modules)
+    arrays = {}
+    for name in engine.input_fields:
+        value = statements.daily(name) if name in statements else inputs[name]
+        if isinstance(value, pd.Series):
+            value = np.repeat(value.to_numpy()[:, None], len(close.columns), axis=1)
+        arrays[name] = np.ascontiguousarray(value, dtype=float)
+    output = engine.run(arrays, module=module, statements=statements)
+    return {
+        spec.source_name: pd.DataFrame(output[spec.canonical_name], index=close.index, columns=close.columns)
+        for spec in BarraCNE6Library().specs
+    }
 
 FLOWS = ("revenue", "oper_cost", "fin_exp", "total_profit", "n_income_attr_p", "n_cashflow_act", "n_cashflow_inv_act",
          "c_pay_acq_const_fiolta", "n_incr_cash_cash_equ", "depr_fa_coga_dpba", "amort_intang_assets",
@@ -107,11 +145,19 @@ class BarraCNE6CatalogTests(unittest.TestCase):
             self.assertTrue(hasattr(CNE6Descriptors, f"_d_{name}"), name)
 
 
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class BarraCNE6CalculationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.inputs = synthetic_inputs()
-        cls.outputs = BarraCNE6Library().calculate(cls.inputs)
+        cls.outputs = calculate(cls.inputs)
+
+    # Break caught: a KunQuant formula, window or cross-sectional step that drifts from the pandas reference.
+    def test_every_descriptor_matches_the_pandas_reference(self) -> None:
+        expected = ReferenceLibrary().calculate(self.inputs)
+        for name in CNE6_NAMES:
+            np.testing.assert_allclose(self.outputs[name].to_numpy(), expected[name].to_numpy(), rtol=1e-7,
+                                       atol=1e-10, equal_nan=True, err_msg=name)
 
     def test_all_descriptors_are_aligned_and_populated(self) -> None:
         close = self.inputs["close"]
@@ -127,7 +173,7 @@ class BarraCNE6CalculationTests(unittest.TestCase):
         dates = self.inputs["close"].index
         for cut in (900, 1450):
             last = dates[cut]
-            past = BarraCNE6Library().calculate(truncated(self.inputs, last))
+            past = calculate(truncated(self.inputs, last))
             for name in CNE6_NAMES:
                 expected = self.outputs[name].loc[:last].to_numpy()
                 np.testing.assert_allclose(past[name].to_numpy(), expected, rtol=1e-8, atol=1e-11, equal_nan=True,
@@ -173,7 +219,7 @@ class BarraCNE6CalculationTests(unittest.TestCase):
         changed = self.inputs.copy()
         changed["cap"] = self.inputs["cap"].copy()
         changed["cap"].iloc[:400, 0] *= 50.0
-        moved = BarraCNE6Library().calculate(changed)["indmom"]
+        moved = calculate(changed)["indmom"]
         np.testing.assert_allclose(moved.iloc[200:400, 2].to_numpy(), indmom.iloc[200:400, 2].to_numpy(),
                                    equal_nan=True)
 
@@ -223,6 +269,7 @@ class BarraCNE6HelperTests(unittest.TestCase):
         self.assertTrue(np.isnan(slope[0, 11]))
 
 
+@unittest.skipUnless(KUNQUANT_READY, "KunQuant and a C++ compiler are required")
 class BarraCNE6EngineTests(unittest.TestCase):
     def test_engine_reads_audited_reference_files(self) -> None:
         inputs = synthetic_inputs(days=300, stocks=4)
@@ -263,14 +310,17 @@ class BarraCNE6EngineTests(unittest.TestCase):
             atomic_write_json(reference / "manifest.json", manifest)
 
             engine = create_factor_engine(root / "cache", FactorBuildConfig(factor_set="barra_cne6"))
-            self.assertIsInstance(engine, PanelFactorEngine)
+            self.assertIsInstance(engine, KunQuantFactorEngine)
+            _, _, module, statement_modules = compiled()
+            engine.compile = lambda: module
+            engine.compile_statements = lambda: statement_modules
             result = engine.build_from_canonical(canonical, root / "factors")
             self.assertEqual(38, result["columns"])
             self.assertEqual(manifest["fingerprint"], result["reference_inputs"]["barra_cne6_reference"])
             store = root / "factors" / "barra_cne6"
             stored = pd.concat([pd.read_parquet(path) for path in sorted(store.glob("year=*/*.parquet"))])
             stored = stored.set_index(["datetime", "instrument"])
-            direct = BarraCNE6Library().calculate(inputs)
+            direct = ReferenceLibrary().calculate(inputs)
             for canonical_name, name in (("cne6_001", "lncap"), ("cne6_003", "hbeta"), ("cne6_017", "btop"),
                                          ("cne6_038", "dtop")):
                 expected = direct[name].stack(future_stack=True).reindex(stored.index)
