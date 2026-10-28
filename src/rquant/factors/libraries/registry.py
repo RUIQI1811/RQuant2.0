@@ -136,6 +136,7 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.jkp153 import JKP153Library
     from rquant.factors.libraries.jq240 import JQ240Library
     from rquant.factors.libraries.oap import OAPLibrary
+    from rquant.factors.libraries.oap_jq_cnc import OAP_JQ_CNC_SELECTION
     from rquant.factors.libraries.recent import RECENT_SELECTION
     from rquant.factors.libraries.recent_sh_main import RECENT_SH_MAIN_SELECTION
     from rquant.factors.libraries.remove_duplicates import REMOVE_DUPLICATES_SELECTION
@@ -160,6 +161,7 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(JKP153Library())
     registry.register_factor_selection(RECENT_SH_MAIN_SELECTION)
     registry.register_factor_selection(REMOVE_DUPLICATES_SELECTION)
+    registry.register_factor_selection(OAP_JQ_CNC_SELECTION)
     return registry
 
 
