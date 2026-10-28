@@ -138,6 +138,7 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.oap import OAPLibrary
     from rquant.factors.libraries.recent import RECENT_SELECTION
     from rquant.factors.libraries.recent_sh_main import RECENT_SH_MAIN_SELECTION
+    from rquant.factors.libraries.remove_duplicates import REMOVE_DUPLICATES_SELECTION
     from rquant.factors.libraries.size_value_china import SizeValueChinaLibrary
     from rquant.factors.libraries.talib_indicators import TALibLibrary
     from rquant.factors.libraries.tushare_tech import TushareTechLibrary
@@ -158,6 +159,7 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(TushareTechLibrary())
     registry.register_library(JKP153Library())
     registry.register_factor_selection(RECENT_SH_MAIN_SELECTION)
+    registry.register_factor_selection(REMOVE_DUPLICATES_SELECTION)
     return registry
 
 

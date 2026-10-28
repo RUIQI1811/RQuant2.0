@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算全部十二个公式因子集；Hquality、recent 和 recent_sh_main 从已构建的源因子集选列。
+- KunQuant 编译并计算全部十二个公式因子集；Hquality、recent、recent_sh_main 和 remove_duplicates 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -356,6 +356,8 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
 - `recent_sh_main`：用 recent 的规则加做多端条件在沪市主板（`sh_main`）上从全部十二个库中筛出的 140 列，只用于 `sh_main`，
   成员与方向锁定在 `src/rquant/factors/libraries/recent_sh_main.py`（见下文“沪市主板近期有效因子集 recent_sh_main”）。
+- `remove_duplicates`：全部十二个库的 1696 个因子不设任何 IC 或稳定性门槛，只按截面秩相关 0.5 去重后剩下的 345 列，
+  只用于 `sh_main`，成员锁定在 `src/rquant/factors/libraries/remove_duplicates.py`（见下文“去重因子集 remove_duplicates”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
 - `oap`：`oap_001` 至 `oap_142`，共 142 列，Open Source Asset Pricing（Chen-Zimmermann）212 个预测信号中能用 Tushare
@@ -403,6 +405,7 @@ src/rquant/factors/
     ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
     ├── recent.py                        # recent（2020 年以后仍有效）选择型因子集的锁定成员与方向
     ├── recent_sh_main.py                # recent_sh_main（沪市主板上 2020 年以后仍有效）的锁定成员与方向
+    ├── remove_duplicates.py             # remove_duplicates（十二个库只去重）的锁定成员与方向
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
@@ -636,6 +639,31 @@ sh_main 上的 LGB 1d walk-forward（2013-2026，top 50 每 5 天调仓）：
 
 加入做多端条件后预测 RankIC 从 0.093 降到 0.081，组合年化却从 25.3% 升到 28.2%：对只做多的组合，做多端的区分能力
 比整体排序相关性更重要。
+
+### 去重因子集 remove_duplicates
+
+`remove_duplicates` 不按单因子效果筛人，只去掉重复：候选是全部十二个库因子集的 1696 个因子，同类因子只留一个。
+
+```bash
+rquant --universe sh_main factors build --factor-set remove_duplicates
+rquant --universe sh_main factors validate --factor-set remove_duplicates
+rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set remove_duplicates
+```
+
+口径（锁定在 `remove_duplicates.py` 的 `criteria`，脚本在 `scripts/remove_duplicates/`）：
+
+- 相似度：两两因子的截面 Spearman 相关系数绝对值，在 sh_main 因子库上从 2008-05-12 到 2026-10-20 每 5 个交易日取一天
+  （897 天）求平均。1696 列的成对相关用 `rquant.factors.selection.RankCorrelationAccumulator` 的矩阵乘法计算，
+  结果与 pandas 的逐对 Spearman 一致，按年分块读取，Windows 上约 9 分钟、峰值约 5.5 GB；
+- 同类里留哪个：按 recent_sh_main 所用的 sh_main 2020-2026 1d 评估中的做多端年均超额（按因子方向取最好 20%，
+  相对全池等权）从高到低排序，没有评估值的排最后；
+- 阈值 0.5：与已保留因子的相关系数绝对值达到 0.5 就剔除，保留 345 个：talib 63、wq_alpha101 57、oap 44、gtja191 41、
+  jq240 39、qlib_alpha158 28、jkp153 26、china_chars 25、barra_cne6 7、qlib_alpha360 5、size_value_china 5、
+  tushare_tech 5。阈值 0.8 时会保留 672 个，sh_main 上 walk-forward 的内存（16 GB 机器）放不下；0.7、0.6 时分别为
+  530、420 个。阈值越低，保留因子的平均做多端超额越高（0.5 时 1.25%，0.8 时 0.75%）。
+
+没有门槛，所以单因子做多端为负的因子只要不与已保留因子重复也会留下。排序用到了 2020 年以后的收益，2020 年及以后的
+测试年份对“同类里留哪个”这一步是样本内。
 
 ### 中国 A 股股票特征 china_chars
 

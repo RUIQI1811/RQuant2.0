@@ -8,7 +8,7 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算全部十二个公式因子集；Hquality、recent 和 recent_sh_main 从源因子集选列；
+- KunQuant 用于编译和计算全部十二个公式因子集；Hquality、recent、recent_sh_main 和 remove_duplicates 从源因子集选列；
   talib 将仓库内的 TA-Lib 0.8.1 C 函数编译到 KunQuant 图中，锁定的 `TA-Lib==0.8.2` 包用于对照测试；
 - 所有因子集的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
   不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；
@@ -160,6 +160,10 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   2020-01-02 至 2026-10-21 的 1d 评估，要求 |RankIC| >= 0.01、|t| >= 3、7 年中至少 5 年定向 RankIC 为正、覆盖率 >= 80%，
   且做多端（方向为正取最高 20%，为负取最低 20%）7 年中至少 5 年、平均也跑赢全池等权收益，再按做多端年均超额排序、
   截面秩相关 0.8 去重。成员只适用于 `sh_main`，构建前十二个源因子集都必须已在该股票池上按当前代码构建；
+- `remove_duplicates` 是第四个选择型因子集，成员与方向锁定在 `src/rquant/factors/libraries/remove_duplicates.py`（当前 345 列）：
+  全部十二个库的 1696 个因子不设 IC、t 值、年度或做多端门槛，只按 sh_main 2008-2026 每 5 个交易日的平均截面秩相关
+  0.5 去重；同类里按 recent_sh_main 那次 2020-2026 评估的做多端年均超额留最高的。脚本在 `scripts/remove_duplicates/`，
+  成员只适用于 `sh_main`，构建前十二个源因子集都必须已在该股票池上按当前代码构建；
 - `china_chars` 列名为 `cnc_001` 至 `cnc_109`，来源名为特征简称；它是按 Quantactix/ChinaAShareEquityCharacteristics
   公布定义独立重写的日频版本（未使用其 GPL 代码），读取参考数据中的 daily_basic、市场因子和财报。财报必须是
   首次披露值，报告期从公告日起且所有更早报告期都已公告后才可用；任何特征都不得使用当日之后的行情、市场收益或
@@ -241,7 +245,7 @@ python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); prin
 ```
 
 当前预期为唯一目录（unique catalog）`1696`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`Hquality=137`、`china_chars=109`、`size_value_china=21`、`talib=125`、`recent=117`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`recent_sh_main=140`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+`qlib_alpha360=360`、`Hquality=137`、`china_chars=109`、`size_value_china=21`、`talib=125`、`recent=117`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`recent_sh_main=140`、`remove_duplicates=345`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：
@@ -309,6 +313,8 @@ rquant factors build --factor-set recent
 rquant factors validate --factor-set recent
 rquant --universe sh_main factors build --factor-set recent_sh_main
 rquant --universe sh_main factors validate --factor-set recent_sh_main
+rquant --universe sh_main factors build --factor-set remove_duplicates
+rquant --universe sh_main factors validate --factor-set remove_duplicates
 rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
 rquant report RUN_ID
 ```
