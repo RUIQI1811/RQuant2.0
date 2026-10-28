@@ -18,11 +18,31 @@ four of them at once.
 from __future__ import annotations
 
 import gc
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from rquant.errors import DataContractError
 from rquant.qlib_ext.processors import DropnaLabel, Fillna, ProcessInf, ZScoreNorm
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _log_memory(stage: str) -> None:
+    """Log the process memory at a step of the window, so a run's log shows where the peak builds up."""
+    try:
+        import psutil
+    except ImportError:
+        return
+    info = psutil.Process().memory_info()
+    private = getattr(info, "private", None)
+    LOGGER.info(
+        "lgb window %s: rss %.2f GB%s",
+        stage,
+        info.rss / 1e9,
+        "" if private is None else f", private {private / 1e9:.2f} GB",
+    )
 
 
 @dataclass(frozen=True)
@@ -95,7 +115,7 @@ def move_rows_to_front(block: Any, rows: slice, width: int) -> Any:
 
 def fit_lgb_window(
     model: Any,
-    panel: Any,
+    load_panel: Callable[[], Any],
     *,
     fit_start: str,
     fit_end: str,
@@ -104,14 +124,18 @@ def fit_lgb_window(
     test: Segment | None,
     log_metrics: Any,
 ) -> Any:
-    """Fit ``model`` (a Qlib ``LGBModel``) on ``panel`` and return the test predictions (None without a test segment).
+    """Fit ``model`` (a Qlib ``LGBModel``) on the panel ``load_panel`` returns and return the test predictions (None
+    without a test segment).
 
-    ``panel`` is consumed: its buffer is reused for the training rows and released before boosting starts.
+    The panel is loaded here so that no caller keeps a reference to it: its buffer is reused for the training rows and
+    released before boosting starts.
     """
     import lightgbm as lgb
     import numpy as np
     import pandas as pd
 
+    panel = load_panel()
+    _log_memory("loaded")
     label, keep = process_panel(panel, fit_start=fit_start, fit_end=fit_end)
     index = panel.index
     dates = index.get_level_values("datetime").to_numpy()
@@ -120,6 +144,7 @@ def fit_lgb_window(
         raise DataContractError("Walk-forward panel must be a single float32 block")
     block = panel.to_numpy()
     del panel
+    _log_memory("processed")
 
     test_rows = segment_rows(dates, test) if test is not None else None
     x_test = take_features(block, test_rows, width) if test_rows is not None else None
@@ -134,12 +159,15 @@ def fit_lgb_window(
     for name, x in (("train", x_train), ("valid", x_valid)):
         if len(x) == 0:
             raise ValueError(f"Empty {name} segment, please check the walk-forward windows.")
+    _log_memory("segments copied")
 
     # Bin the training rows with the model's parameters, as lgb.train would, then drop the panel buffer.
     train_set = lgb.Dataset(x_train, label=y_train, params=model.params)
     train_set.construct()
+    _log_memory("training rows binned")
     del x_train, block
     gc.collect()
+    _log_memory("panel released")
     valid_set = lgb.Dataset(x_valid, label=y_valid)
 
     evals_result: dict[str, Any] = {}
@@ -156,6 +184,7 @@ def fit_lgb_window(
             lgb.record_evaluation(evals_result),
         ],
     )
+    _log_memory("trained")
     for name in names:
         for key, values in evals_result[name].items():
             metric = f"{key}.{name}".replace("@", "_")

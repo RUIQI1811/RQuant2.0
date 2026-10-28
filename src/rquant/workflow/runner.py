@@ -195,11 +195,10 @@ class RollingWorkflowRunner:
         """
         if self.model_name == "lgb":
             loader = KunQuantDataLoader(str(self.factor_root), self.factor_set, self.horizon)
-            panel = loader.load(self.universe, fit_start.isoformat(), data_end.isoformat())
             test = segments.get("test")
             return fit_lgb_window(
                 model,
-                panel,
+                lambda: loader.load(self.universe, fit_start.isoformat(), data_end.isoformat()),
                 fit_start=fit_start.isoformat(),
                 fit_end=fit_end.isoformat(),
                 train=Segment(*segments["train"]),
