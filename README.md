@@ -1000,7 +1000,7 @@ sed -n '1,240p' runs/walk-forward/RUN_ID/report.md
 
 ```bash
 python scripts/analysis/window_metrics.py runs 2019-01-01 2026-10-21 \
-  jq240=20261027T202921Z-41fb3dde jq240_drop5=20261027T202921Z-41fb3dde-top50-drop5
+  jq240_5d=20261028T222815Z-b7072fd9 jq240_1d_drop5=20261027T202921Z-41fb3dde-top50-drop5
 ```
 
 每个 `标签=目录` 指向 `runs/walk-forward/` 下已经运行过 `report` 的目录，结束日期可以省略。输出按夏普排序，包含年化、夏普、最大回撤、Calmar、累计收益、相对基准的年化超额和信息比率、日均换手和年化成本。口径与报告相同：每日净收益为 `return - cost`，夏普为日均收益 × 252 / (日收益标准差 × √252)。
