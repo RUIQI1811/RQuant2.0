@@ -18,8 +18,10 @@ from rquant.factors.libraries.recent import RECENT_SELECTION
 from rquant.factors.libraries.recent_sh_main import RECENT_SH_MAIN_SELECTION
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
 from rquant.factors.selection import (
+    RankCorrelationAccumulator,
     StabilityCriteria,
     compound_by_year,
+    cross_section_rank_correlation,
     factor_coverage,
     mean_rank_correlation,
     prune_correlated,
@@ -357,6 +359,30 @@ class FactorDeduplicationTests(unittest.TestCase):
         frame = self._frame()
         correlation = mean_rank_correlation(frame, ["base", "noisy"], min_cross_section=31)
         self.assertTrue(np.isnan(correlation.loc["base", "noisy"]))
+
+    # Break caught: a matrix-product correlation that drifts from pandas' pairwise-complete Spearman on gaps and ties.
+    def test_matrix_rank_correlation_matches_pandas_pairwise_spearman(self) -> None:
+        rng = np.random.default_rng(11)
+        values = rng.normal(size=(80, 6))
+        values[:, 1] = np.round(values[:, 0] * 2) + rng.normal(scale=0.1, size=80)
+        values[:, 2] = np.round(values[:, 2])  # heavy ties
+        values[:, 4] = 3.0  # constant
+        values[rng.random(size=values.shape) < 0.2] = np.nan
+        values[:70, 5] = np.nan  # too few rows to pair with anything
+        expected = pd.DataFrame(values).rank(axis=0).corr(method="pearson", min_periods=20).to_numpy()
+
+        actual = cross_section_rank_correlation(values, min_cross_section=20)
+
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-10, equal_nan=True)
+
+    def test_accumulator_over_chunks_matches_one_pass(self) -> None:
+        frame = self._frame()
+        names = ["base", "mirror", "noisy"]
+        accumulator = RankCorrelationAccumulator(names)
+        dates = sorted(frame["datetime"].unique())
+        accumulator.add(frame[frame["datetime"].isin(dates[:2])])
+        accumulator.add(frame[frame["datetime"].isin(dates[2:])])
+        pd.testing.assert_frame_equal(mean_rank_correlation(frame, names), accumulator.mean())
 
     def test_locked_hquality_has_no_pair_above_its_correlation_limit(self) -> None:
         dropped = HQUALITY_SELECTION.provenance["deduplicated"]

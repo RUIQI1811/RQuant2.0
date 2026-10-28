@@ -152,6 +152,83 @@ def compound_by_year(daily_returns: Any) -> Any:
     return (1.0 + returns).groupby(index.year).prod() - 1.0
 
 
+def cross_section_rank_correlation(values: Any, *, min_cross_section: int = 20) -> Any:
+    """Return the Spearman correlation matrix of one cross-section (rows are instruments, columns factors).
+
+    Every column is ranked over its own finite values (ties get the average rank), then each pair is correlated with
+    Pearson over the rows where both are finite, which is what ``DataFrame.rank().corr(min_periods=...)`` computes.
+    Pairs with fewer than ``min_cross_section`` such rows, or without variance on them, are NaN. The pairwise sums are
+    matrix products, so a cross-section of a few thousand factors takes a fraction of a second.
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+    except ImportError as exc:
+        raise DependencyError("pandas and NumPy are required for factor selection") from exc
+    ranked = pd.DataFrame(np.asarray(values, dtype=float)).rank(axis=0).to_numpy()
+    valid = np.isfinite(ranked)
+    mask = valid.astype(float)
+    # Centering each column on its own mean rank keeps the products small; Pearson is invariant to the shift.
+    centered = np.where(valid, ranked - np.nanmean(np.where(valid, ranked, np.nan), axis=0, keepdims=True), 0.0)
+    count = mask.T @ mask
+    sum_x = centered.T @ mask
+    sum_xx = (centered * centered).T @ mask
+    sum_xy = centered.T @ centered
+    with np.errstate(invalid="ignore", divide="ignore"):
+        covariance = sum_xy - sum_x * sum_x.T / count
+        variance_x = sum_xx - sum_x * sum_x / count
+        correlation = covariance / np.sqrt(variance_x * variance_x.T)
+    tolerance = 1e-9 * np.maximum(sum_xx, 1.0)
+    degenerate = (count < min_cross_section) | (variance_x <= tolerance) | (variance_x.T <= tolerance.T)
+    correlation[degenerate] = np.nan
+    return np.clip(correlation, -1.0, 1.0)
+
+
+class RankCorrelationAccumulator:
+    """Average cross-sectional Spearman correlations over dates that arrive in chunks of rows.
+
+    Feeding the rows of a long sample one chunk at a time (for example one store year) keeps only that chunk in memory;
+    each date must arrive in a single chunk.
+    """
+
+    def __init__(self, factor_names: list[str] | tuple[str, ...], *, min_cross_section: int = 20) -> None:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise DependencyError("NumPy is required for factor selection") from exc
+        self.names = list(factor_names)
+        self.min_cross_section = min_cross_section
+        self._total = np.zeros((len(self.names), len(self.names)))
+        self._counts = np.zeros((len(self.names), len(self.names)))
+
+    def add(self, frame: Any) -> None:
+        """Add every date of ``frame``, which holds ``datetime`` plus one column per factor."""
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise DependencyError("NumPy is required for factor selection") from exc
+        missing = sorted({"datetime", *self.names} - set(frame.columns))
+        if missing:
+            raise DataContractError(f"Factor frame is missing columns: {missing}")
+        for _, group in frame.groupby("datetime", sort=True):
+            matrix = cross_section_rank_correlation(
+                group[self.names].to_numpy(dtype=float), min_cross_section=self.min_cross_section
+            )
+            valid = np.isfinite(matrix)
+            self._total[valid] += matrix[valid]
+            self._counts[valid] += 1
+
+    def mean(self) -> Any:
+        try:
+            import numpy as np
+            import pandas as pd
+        except ImportError as exc:
+            raise DependencyError("pandas and NumPy are required for factor selection") from exc
+        counts = self._counts
+        mean = np.divide(self._total, counts, out=np.full_like(self._total, np.nan), where=counts > 0)
+        return pd.DataFrame(mean, index=self.names, columns=self.names)
+
+
 def mean_rank_correlation(frame: Any, factor_names: list[str] | tuple[str, ...], *, min_cross_section: int = 20) -> Any:
     """Return the mean over dates of the cross-sectional Spearman correlation between every pair of factors.
 
@@ -159,25 +236,9 @@ def mean_rank_correlation(frame: Any, factor_names: list[str] | tuple[str, ...],
     correlated pairwise over the instruments where both factors are finite; dates with fewer than
     ``min_cross_section`` such instruments do not count for that pair.
     """
-    try:
-        import numpy as np
-        import pandas as pd
-    except ImportError as exc:
-        raise DependencyError("pandas and NumPy are required for factor selection") from exc
-    names = list(factor_names)
-    missing = sorted({"datetime", *names} - set(frame.columns))
-    if missing:
-        raise DataContractError(f"Factor frame is missing columns: {missing}")
-    total = np.zeros((len(names), len(names)))
-    counts = np.zeros((len(names), len(names)))
-    for _, group in frame.groupby("datetime", sort=True):
-        ranked = group[names].rank(axis=0)
-        matrix = ranked.corr(method="pearson", min_periods=min_cross_section).to_numpy()
-        valid = np.isfinite(matrix)
-        total[valid] += matrix[valid]
-        counts[valid] += 1
-    mean = np.divide(total, counts, out=np.full_like(total, np.nan), where=counts > 0)
-    return pd.DataFrame(mean, index=names, columns=names)
+    accumulator = RankCorrelationAccumulator(factor_names, min_cross_section=min_cross_section)
+    accumulator.add(frame)
+    return accumulator.mean()
 
 
 def prune_correlated(
