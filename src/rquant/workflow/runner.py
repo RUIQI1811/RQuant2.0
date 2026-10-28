@@ -12,6 +12,7 @@ from rquant.factors.catalog import FactorSet, get_catalog
 from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.loader import KunQuantDataLoader
 from rquant.qlib_ext.runtime import qlib_init_kwargs
+from rquant.workflow.lgb_window import Segment, fit_lgb_window
 from rquant.workflow.rolling import generate_rolling_windows, previous_trading_day
 
 ModelName = Literal["lgb", "double-ensemble"]
@@ -88,52 +89,46 @@ class RollingWorkflowRunner:
             usable_inner_end = previous_trading_day(calendar, window.validation_start, window.purge_trading_days)
             usable_refit_end = previous_trading_day(calendar, window.test_start, window.purge_trading_days)
 
-            tune_handler = self._handler(
-                DataHandlerLP,
-                fit_start=window.train_start,
-                fit_end=usable_inner_end,
-                data_end=window.validation_end,
-            )
-            tune_dataset = DatasetH(
-                handler=tune_handler,
-                segments={
-                    "train": (window.train_start.isoformat(), usable_inner_end.isoformat()),
-                    "valid": (window.validation_start.isoformat(), window.validation_end.isoformat()),
-                },
-            )
+            tune_segments = {
+                "train": (window.train_start.isoformat(), usable_inner_end.isoformat()),
+                "valid": (window.validation_start.isoformat(), window.validation_end.isoformat()),
+            }
+            refit_segments = {
+                "train": (window.train_start.isoformat(), usable_refit_end.isoformat()),
+                # DoubleEnsemble requires a validation segment. It remains inside the training window.
+                "valid": (window.validation_start.isoformat(), usable_refit_end.isoformat()),
+                "test": (window.test_start.isoformat(), window.test_end.isoformat()),
+            }
+            experiment_name = f"rquant-{self.factor_set}-{self.horizon}-{self.model_name}"
             tuning_model = self._model()
-            with R.start(
-                experiment_name=f"rquant-{self.factor_set}-{self.horizon}-{self.model_name}",
-                recorder_name=f"tune-{window.prediction_year}",
-            ):
-                tuning_model.fit(tune_dataset)
+            with R.start(experiment_name=experiment_name, recorder_name=f"tune-{window.prediction_year}"):
+                self._fit(
+                    tuning_model,
+                    DataHandlerLP,
+                    DatasetH,
+                    R,
+                    fit_start=window.train_start,
+                    fit_end=usable_inner_end,
+                    data_end=window.validation_end,
+                    segments=tune_segments,
+                )
             chosen_iterations = _best_iterations(tuning_model)
             # Release the tuning panel before the refit panel is loaded so the two never sit in memory together.
-            del tune_dataset, tune_handler, tuning_model
+            del tuning_model
             gc.collect()
 
-            final_handler = self._handler(
-                DataHandlerLP,
-                fit_start=window.train_start,
-                fit_end=usable_refit_end,
-                data_end=window.test_end,
-            )
-            final_dataset = DatasetH(
-                handler=final_handler,
-                segments={
-                    "train": (window.train_start.isoformat(), usable_refit_end.isoformat()),
-                    # DoubleEnsemble requires a validation segment. It remains inside the training window.
-                    "valid": (window.validation_start.isoformat(), usable_refit_end.isoformat()),
-                    "test": (window.test_start.isoformat(), window.test_end.isoformat()),
-                },
-            )
             final_model = self._model(iterations=chosen_iterations, refit=True)
-            with R.start(
-                experiment_name=f"rquant-{self.factor_set}-{self.horizon}-{self.model_name}",
-                recorder_name=f"refit-{window.prediction_year}",
-            ):
-                final_model.fit(final_dataset)
-                prediction = final_model.predict(final_dataset, segment="test").rename("score")
+            with R.start(experiment_name=experiment_name, recorder_name=f"refit-{window.prediction_year}"):
+                prediction = self._fit(
+                    final_model,
+                    DataHandlerLP,
+                    DatasetH,
+                    R,
+                    fit_start=window.train_start,
+                    fit_end=usable_refit_end,
+                    data_end=window.test_end,
+                    segments=refit_segments,
+                ).rename("score")
             prediction_frame = prediction.reset_index()
             if self.horizon == "5d":
                 global_positions = pd.to_datetime(prediction_frame["datetime"]).dt.date.map(calendar_positions)
@@ -157,7 +152,7 @@ class RollingWorkflowRunner:
             atomic_write_json(window_dir / "window.json", window_manifest)
             window_manifests.append(window_manifest)
             all_predictions.append(prediction_frame)
-            del final_dataset, final_handler, final_model, prediction
+            del final_model, prediction
             gc.collect()
 
         combined = pd.concat(all_predictions, ignore_index=True).sort_values(["datetime", "instrument"])
@@ -180,6 +175,42 @@ class RollingWorkflowRunner:
         }
         atomic_write_json(self.run_directory / "walk_forward.json", manifest)
         return manifest
+
+    def _fit(
+        self,
+        model: Any,
+        DataHandlerLP: Any,
+        DatasetH: Any,
+        R: Any,
+        *,
+        fit_start: date,
+        fit_end: date,
+        data_end: date,
+        segments: dict[str, tuple[str, str]],
+    ) -> Any:
+        """Fit ``model`` on one window and return its test predictions (None without a test segment).
+
+        LightGBM goes through ``fit_lgb_window``, which gives the same predictions as the Qlib dataset path below while
+        holding one copy of the panel instead of up to four; DoubleEnsemble keeps the Qlib path.
+        """
+        if self.model_name == "lgb":
+            loader = KunQuantDataLoader(str(self.factor_root), self.factor_set, self.horizon)
+            panel = loader.load(self.universe, fit_start.isoformat(), data_end.isoformat())
+            test = segments.get("test")
+            return fit_lgb_window(
+                model,
+                panel,
+                fit_start=fit_start.isoformat(),
+                fit_end=fit_end.isoformat(),
+                train=Segment(*segments["train"]),
+                valid=Segment(*segments["valid"]),
+                test=Segment(*test) if test is not None else None,
+                log_metrics=R.log_metrics,
+            )
+        handler = self._handler(DataHandlerLP, fit_start=fit_start, fit_end=fit_end, data_end=data_end)
+        dataset = DatasetH(handler=handler, segments=segments)
+        model.fit(dataset)
+        return model.predict(dataset, segment="test") if "test" in segments else None
 
     def _handler(self, DataHandlerLP: Any, *, fit_start: date, fit_end: date, data_end: date) -> Any:
         loader = KunQuantDataLoader(str(self.factor_root), self.factor_set, self.horizon)

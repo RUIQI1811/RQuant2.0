@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from rquant.qlib_ext.loader import _partitions_in_range, _read_partition, _single_precision
+from rquant.errors import DataContractError
+from rquant.qlib_ext.loader import _load_feature_block, _partitions_in_range
 from rquant.qlib_ext.processors import DropnaLabel, Fillna, ProcessInf, ZScoreNorm
 from rquant.workflow.backtest import PortfolioConfig, _metrics, _rebalance_dates, _rebalance_description
 
@@ -20,15 +21,6 @@ class LoaderPartitionTests(unittest.TestCase):
         selected = _partitions_in_range(paths, pd, "2012-07-01", "2014-12-31")
         self.assertEqual(["year=2012", "year=2013", "year=2014"], [path.parent.name for path in selected])
         self.assertEqual(paths, _partitions_in_range(paths, pd, None, None))
-
-    def test_factor_columns_are_read_in_single_precision(self) -> None:
-        frame = pd.DataFrame(
-            {"datetime": pd.to_datetime(["2024-01-02"]), "instrument": ["SH600000"], "f1": [1.5], "f2": [np.nan]}
-        )
-        converted = _single_precision(frame)
-        self.assertEqual(["float32", "float32"], [str(converted[name].dtype) for name in ("f1", "f2")])
-        self.assertEqual(frame["instrument"].dtype, converted["instrument"].dtype)
-        self.assertEqual(frame["datetime"].dtype, converted["datetime"].dtype)
 
 
 class BacktestMetricTests(unittest.TestCase):
@@ -131,21 +123,52 @@ class ProcessorTests(unittest.TestCase):
 
 
 class PartitionReadTests(unittest.TestCase):
-    def test_partition_is_filtered_and_read_in_single_precision(self) -> None:
+    # Break caught: a block whose rows, order or single-precision rounding differ from reading, filtering, concatenating
+    # and sorting the partitions with pandas.
+    def test_feature_block_matches_the_pandas_read_of_the_partitions(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        rng = np.random.default_rng(3)
+        names = [f"f{position}" for position in range(5)]
+        paths = []
+        for year, dates in ((2023, ["2023-12-28", "2023-12-29"]), (2024, ["2024-01-02", "2024-01-03"])):
+            # Instruments out of order inside each date, so the block has to be sorted.
+            keys = [(date, code) for date in dates for code in ("SH600004", "SH600000", "SH600006")]
+            values = rng.normal(size=(len(keys), len(names))) * 1e3
+            values[0, 1], values[4, 2], values[5, 0] = np.nan, np.inf, 1.0000000001
+            frame = pd.DataFrame(values, columns=names)
+            frame.insert(0, "instrument", [code for _, code in keys])
+            frame.insert(0, "datetime", pd.to_datetime([date for date, _ in keys]))
+            path = Path(directory.name) / f"year={year}" / "factors.parquet"
+            path.parent.mkdir()
+            frame.to_parquet(path, index=False)
+            paths.append(path)
+
+        index, block = _load_feature_block(
+            pd, paths, names, "2023-12-29", "2024-01-02", ["SH600000", "SH600004"], columns_per_read=2
+        )
+
+        expected = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
+        expected = expected[
+            expected["datetime"].between(pd.Timestamp("2023-12-29"), pd.Timestamp("2024-01-02"))
+            & expected["instrument"].isin(["SH600000", "SH600004"])
+        ]
+        expected = expected.set_index(["datetime", "instrument"]).sort_index().astype("float32")
+        pd.testing.assert_index_equal(expected.index, index)
+        self.assertEqual((len(expected), len(names) + 1), block.shape)
+        self.assertTrue(block.flags["F_CONTIGUOUS"])
+        self.assertEqual(np.float32, block.dtype)
+        np.testing.assert_array_equal(expected.to_numpy(), block[:, :-1])
+
+    def test_store_with_other_columns_is_refused(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "factors.parquet"
-        pd.DataFrame(
-            {
-                "datetime": pd.to_datetime(["2024-01-02", "2024-01-02", "2024-01-03", "2024-01-04"]),
-                "instrument": ["SH600000", "SH600004", "SH600000", "SH600000"],
-                "f1": [1.0, 2.0, 3.0, 4.0],
-            }
-        ).to_parquet(path, index=False)
-        frame = _read_partition(pd, path, "2024-01-02", "2024-01-03", ["SH600000"])
-        self.assertEqual([1.0, 3.0], frame["f1"].tolist())
-        self.assertEqual("float32", str(frame["f1"].dtype))
-        self.assertEqual(4, len(_read_partition(pd, path, None, None, None)))
+        pd.DataFrame({"datetime": pd.to_datetime(["2024-01-02"]), "instrument": ["SH600000"], "f2": [1.0]}).to_parquet(
+            path, index=False
+        )
+        with self.assertRaisesRegex(DataContractError, "locked catalog"):
+            _load_feature_block(pd, [path], ["f1"], None, None, None)
 
 
 if __name__ == "__main__":

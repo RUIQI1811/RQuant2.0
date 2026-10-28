@@ -300,6 +300,10 @@ rquant report RUN_ID   # 自动按该滚动训练的股票池回测
 ```
 
 `walk-forward` 会检查因子库的股票池与当前股票池一致；`report` 从滚动训练清单读取股票池，与配置无关。
+`--model lgb` 的每个窗口只在内存里保留一份面板：处理器直接改写加载好的 float32 块，验证与测试行先复制出来，
+训练行原地挪到缓冲区前部交给 LightGBM（列主序，免复制），分箱后即释放面板（`src/rquant/workflow/lgb_window.py`）。
+得到的树和预测与经 Qlib `DataHandlerLP`/`DatasetH`/`LGBModel` 的原流程逐位相同（`tests/test_models.py`），峰值内存
+从约 4.8 份面板降到约 2.6 份；sh_main 上 672 列的最大窗口一份面板约 4.2 GB。`double-ensemble` 仍走 Qlib 流程。
 `main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
 `rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
 
@@ -356,7 +360,7 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
   筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
 - `recent_sh_main`：用 recent 的规则加做多端条件在沪市主板（`sh_main`）上从全部十二个库中筛出的 140 列，只用于 `sh_main`，
   成员与方向锁定在 `src/rquant/factors/libraries/recent_sh_main.py`（见下文“沪市主板近期有效因子集 recent_sh_main”）。
-- `remove_duplicates`：全部十二个库的 1696 个因子不设任何 IC 或稳定性门槛，只按截面秩相关 0.5 去重后剩下的 345 列，
+- `remove_duplicates`：全部十二个库的 1696 个因子不设任何 IC 或稳定性门槛，只按截面秩相关 0.8 去重后剩下的 672 列，
   只用于 `sh_main`，成员锁定在 `src/rquant/factors/libraries/remove_duplicates.py`（见下文“去重因子集 remove_duplicates”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
@@ -657,10 +661,10 @@ rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set rem
   结果与 pandas 的逐对 Spearman 一致，按年分块读取，Windows 上约 9 分钟、峰值约 5.5 GB；
 - 同类里留哪个：按 recent_sh_main 所用的 sh_main 2020-2026 1d 评估中的做多端年均超额（按因子方向取最好 20%，
   相对全池等权）从高到低排序，没有评估值的排最后；
-- 阈值 0.5：与已保留因子的相关系数绝对值达到 0.5 就剔除，保留 345 个：talib 63、wq_alpha101 57、oap 44、gtja191 41、
-  jq240 39、qlib_alpha158 28、jkp153 26、china_chars 25、barra_cne6 7、qlib_alpha360 5、size_value_china 5、
-  tushare_tech 5。阈值 0.8 时会保留 672 个，sh_main 上 walk-forward 的内存（16 GB 机器）放不下；0.7、0.6 时分别为
-  530、420 个。阈值越低，保留因子的平均做多端超额越高（0.5 时 1.25%，0.8 时 0.75%）。
+- 阈值 0.8（与 Hquality、recent 相同）：与已保留因子的相关系数绝对值达到 0.8 就剔除，保留 672 个：jq240 95、gtja191 94、
+  talib 85、wq_alpha101 75、qlib_alpha158 66、oap 65、jkp153 58、china_chars 57、qlib_alpha360 43、tushare_tech 13、
+  barra_cne6 11、size_value_china 10。阈值越低剩得越少（0.7 为 530 个，0.6 为 420 个，0.5 为 345 个），保留因子的平均
+  做多端超额反而越高（0.5 时 1.25%，0.8 时 0.75%）。
 
 没有门槛，所以单因子做多端为负的因子只要不与已保留因子重复也会留下。排序用到了 2020 年以后的收益，2020 年及以后的
 测试年份对“同类里留哪个”这一步是样本内。
