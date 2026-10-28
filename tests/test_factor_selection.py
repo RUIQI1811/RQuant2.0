@@ -181,7 +181,7 @@ class FactorSelectionRegistryTests(unittest.TestCase):
 
         self.assertIs(REMOVE_DUPLICATES_SELECTION, selection)
         self.assertEqual(REMOVE_DUPLICATES_SELECTION.canonical_names, catalog.canonical_names("remove_duplicates"))
-        self.assertEqual(345, len(selection.canonical_names))
+        self.assertEqual(672, len(selection.canonical_names))
         self.assertEqual(12, len(selection.source_factor_sets))
         sources = {registry.source_factor_set(selection, name) for name in selection.canonical_names}
         self.assertEqual(set(selection.source_factor_sets), sources)
@@ -435,11 +435,11 @@ class FactorDeduplicationTests(unittest.TestCase):
             for library in get_library_registry().select(source)
             for spec in library.specs
         }
-        self.assertEqual(345, len(kept))
+        self.assertEqual(672, len(kept))
         self.assertFalse(kept & set(dropped))
         self.assertTrue(set(dropped.values()) <= kept)
         self.assertEqual(library_factors, kept | set(dropped))
-        self.assertEqual(0.5, REMOVE_DUPLICATES_SELECTION.criteria["max_abs_rank_correlation"])
+        self.assertEqual(0.8, REMOVE_DUPLICATES_SELECTION.criteria["max_abs_rank_correlation"])
 
 
 if __name__ == "__main__":
