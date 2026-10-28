@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -57,24 +57,28 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
             raise DataContractError(f"No factor partitions for {self.factor_set}: {self.factor_root}")
         instrument_list = _resolve_instruments(D, instruments, start_time, end_time)
         expected = list(self.catalog.canonical_names(self.factor_set))
+
+        def load_labels(index: Any) -> Any:
+            labels = D.features(
+                sorted(index.get_level_values("instrument").unique()),
+                [LABEL_EXPRESSIONS[self.horizon]],
+                start_time=start_time,
+                end_time=end_time,
+                freq="day",
+            )
+            labels.columns = ["LABEL0"]
+            labels = labels.swaplevel().sort_index()
+            labels.index = labels.index.set_names(["datetime", "instrument"])
+            return labels["LABEL0"].reindex(index).to_numpy(dtype=np.float32)
+
         # One float32 block for features and label, filled column by column straight from the partitions: no
         # concatenated copy of the store and no float64 frame of a whole year exist next to it. DataHandlerLP copies
         # the panel for its processors, and copying a frame of several blocks consolidates them through extra
         # full-size temporaries.
         with _system_arrow_allocator():
-            index, panel = _load_feature_block(pd, paths, expected, start_time, end_time, instrument_list)
-        query_instruments = sorted(index.get_level_values("instrument").unique())
-        labels = D.features(
-            query_instruments,
-            [LABEL_EXPRESSIONS[self.horizon]],
-            start_time=start_time,
-            end_time=end_time,
-            freq="day",
-        )
-        labels.columns = ["LABEL0"]
-        labels = labels.swaplevel().sort_index()
-        labels.index = labels.index.set_names(["datetime", "instrument"])
-        panel[:, -1] = labels["LABEL0"].reindex(index).to_numpy(dtype=np.float32)
+            index, panel = _load_feature_block(
+                pd, paths, expected, start_time, end_time, instrument_list, labels=load_labels
+            )
         columns = pd.MultiIndex.from_tuples([("feature", column) for column in expected] + [("label", "LABEL0")])
         return pd.DataFrame(panel, index=index, columns=columns, copy=False)
 
@@ -87,10 +91,15 @@ def _load_feature_block(
     end_time: Any,
     instruments: list[str] | None,
     *,
+    labels: Callable[[Any], Any] | None = None,
     columns_per_read: int = 32,
 ) -> tuple[Any, Any]:
     """Return the sorted <datetime, instrument> index and a Fortran-ordered float32 block of the factor columns plus
-    one trailing column for the label (left uninitialised).
+    one trailing column for the label: ``labels(index)`` when given, else left uninitialised.
+
+    ``labels`` runs before the block is allocated. Qlib evaluates the label in a pool of worker processes, fresh
+    interpreters that took about 6.7 GB together on Windows; with the block already committed next to them, a
+    672-factor sh_main window left 0.2 GB of a 16 GB machine free.
 
     Rows are filtered by date range and instruments. Factor stores are written in double precision; models train on
     single precision, which halves the memory of every copy DataHandlerLP and LightGBM make of a multi-year panel.
@@ -117,7 +126,11 @@ def _load_feature_block(
         index = index[order]
         destination = np.empty_like(order)
         destination[order] = np.arange(len(order))
+    label = labels(index) if labels is not None else None
     panel = np.empty((len(index), len(expected) + 1), dtype=np.float32, order="F")
+    if label is not None:
+        panel[:, -1] = label
+        del label
     offset = 0
     for path, keep, frame in keys:
         mask = keep.to_numpy()

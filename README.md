@@ -305,7 +305,8 @@ rquant report RUN_ID   # 自动按该滚动训练的股票池回测
 得到的树和预测与经 Qlib `DataHandlerLP`/`DatasetH`/`LGBModel` 的原流程逐位相同（`tests/test_models.py`）。合成的 300 列
 四年窗口上峰值从 6.1 GB 降到 3.1 GB；剩下的峰值在分箱那一刻：面板、验证与测试副本，加上 LightGBM 为确定分箱抽样的
 20 万行（672 列时约 1.6 GB，用完即释放）。sh_main 上 672 列的最大窗口一份面板约 4.2 GB；每个窗口各阶段的进程内存
-写在日志里（`rquant.workflow.lgb_window`，需要 psutil）。`double-ensemble` 仍走 Qlib 流程。
+写在日志里（`rquant.workflow.lgb_window`，需要 psutil）。标签由 Qlib 的多进程池计算（Windows 上 4 个子进程合计约 6.7 GB），
+因此先算标签、再分配面板，两者不会同时占用内存。`double-ensemble` 仍走 Qlib 流程。
 `main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
 `rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
 

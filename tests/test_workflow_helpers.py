@@ -144,8 +144,21 @@ class PartitionReadTests(unittest.TestCase):
             frame.to_parquet(path, index=False)
             paths.append(path)
 
+        seen = []
+
+        def labels(index: pd.MultiIndex) -> np.ndarray:
+            seen.append(index)
+            return np.arange(len(index), dtype=np.float32)
+
         index, block = _load_feature_block(
-            pd, paths, names, "2023-12-29", "2024-01-02", ["SH600000", "SH600004"], columns_per_read=2
+            pd,
+            paths,
+            names,
+            "2023-12-29",
+            "2024-01-02",
+            ["SH600000", "SH600004"],
+            labels=labels,
+            columns_per_read=2,
         )
 
         expected = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
@@ -159,6 +172,10 @@ class PartitionReadTests(unittest.TestCase):
         self.assertTrue(block.flags["F_CONTIGUOUS"])
         self.assertEqual(np.float32, block.dtype)
         np.testing.assert_array_equal(expected.to_numpy(), block[:, :-1])
+        # The label is evaluated on the sorted index and lands in the trailing column.
+        self.assertEqual(1, len(seen))
+        pd.testing.assert_index_equal(index, seen[0])
+        np.testing.assert_array_equal(np.arange(len(index), dtype=np.float32), block[:, -1])
 
     def test_store_with_other_columns_is_refused(self) -> None:
         directory = tempfile.TemporaryDirectory()
