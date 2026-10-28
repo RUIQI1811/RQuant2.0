@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算全部十二个公式因子集；Hquality、recent 和 recent_sh_main 从已构建的源因子集选列。
+- KunQuant 编译并计算全部十二个公式因子集；oap_jq_cnc 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -35,8 +35,6 @@ rquant data build-qlib
 rquant factors build --factor-set qlib_alpha158
 rquant factors build --factor-set wq_alpha101
 rquant factors build --factor-set gtja191
-rquant factors build --factor-set Hquality
-rquant factors validate --factor-set Hquality
 rquant data sync-fundamentals --through 2026-08-04   # china_chars、jq240、oap、barra_cne6、jkp153 需要
 rquant data build-reference
 rquant factors build --factor-set china_chars
@@ -49,7 +47,7 @@ rquant factors build --factor-set jkp153
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
-rquant walk-forward --model lgb --horizon 1d --factor-set Hquality \
+rquant walk-forward --model lgb --horizon 1d --factor-set jq240 \
   --first-year 2013 --last-year 2026 --through 2026-08-04
   
 rquant report RUN_ID
@@ -148,7 +146,7 @@ rquant doctor --skip-permission-check
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `data.fundamentals_start_year`   |       `2004` | `data sync-fundamentals` 抓取财报的最早公告年份 |
 | `data.fundamentals_window_years` |          `6` | 财报按公告日分窗抓取的年数；已结束的窗口会缓存复用 |
-| `factors.factor_set`             |   `Hquality` | 默认因子集                   |
+| `factors.factor_set`             |      `jq240` | 默认因子集                   |
 | `factors.workers`                |          `4` | KunQuant 执行线程数          |
 | `factors.graph_outputs`          |         `20` | 每个 KunQuant 图最多编译的因子数；每个中间结果都要一块“日期 × 股票”的缓冲区，分图计算可大幅降低内存，结果逐位不变；只作用于严格浮点的因子集（qlib_alpha158/360、wq_alpha101 始终一张图）；`0` 表示整个因子集一张图 |
 | `workflow.train_years`           |          `3` | 每个预测年使用的历史训练年数 |
@@ -300,6 +298,13 @@ rquant report RUN_ID   # 自动按该滚动训练的股票池回测
 ```
 
 `walk-forward` 会检查因子库的股票池与当前股票池一致；`report` 从滚动训练清单读取股票池，与配置无关。
+`--model lgb` 的每个窗口只在内存里保留一份面板：处理器直接改写加载好的 float32 块，验证与测试行先复制出来，
+训练行原地挪到缓冲区前部交给 LightGBM（列主序，免复制），分箱后即释放面板（`src/rquant/workflow/lgb_window.py`）。
+得到的树和预测与经 Qlib `DataHandlerLP`/`DatasetH`/`LGBModel` 的原流程逐位相同（`tests/test_models.py`）。合成的 300 列
+四年窗口上峰值从 6.1 GB 降到 3.1 GB；剩下的峰值在分箱那一刻：面板、验证与测试副本，加上 LightGBM 为确定分箱抽样的
+20 万行（672 列时约 1.6 GB，用完即释放）。sh_main 上 672 列的最大窗口一份面板约 4.2 GB；每个窗口各阶段的进程内存
+写在日志里（`rquant.workflow.lgb_window`，需要 psutil）。标签由 Qlib 的多进程池计算（Windows 上 5 个子进程合计约 6.3 GB），
+因此先算标签、再分配面板，两者不会同时占用内存。`double-ensemble` 仍走 Qlib 流程。
 `main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
 `rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
 
@@ -328,14 +333,14 @@ rquant factors catalog --factor-set qlib_alpha158
 rquant factors catalog --factor-set wq_alpha101
 rquant factors catalog --factor-set gtja191
 rquant factors catalog --factor-set qlib_alpha360
-rquant factors catalog --factor-set Hquality
+rquant factors catalog --factor-set jq240
 ```
 
 导出机器可读目录：
 
 ```bash
-rquant factors catalog --factor-set Hquality --format json --output factor_catalog.json
-rquant factors catalog --factor-set Hquality --format csv --output factor_catalog.csv
+rquant factors catalog --factor-set jq240 --format json --output factor_catalog.json
+rquant factors catalog --factor-set jq240 --format csv --output factor_catalog.csv
 ```
 
 因子集：
@@ -345,17 +350,13 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
 - `gtja191`：`gtja_001` 至 `gtja_191`（暂时排除 `gtja_030`），共 190 列；
 - `qlib_alpha360`：`a360_001` 至 `a360_360`，共 360 列；它是 Qlib Alpha360 的六组归一化
   OHLC、VWAP 与成交量字段各取 60 个滞后期，而非 360 条手工设计的独立信号；
-- `Hquality`：从上述因子中按年度 RankIC 稳定性筛出并按相关性去重后的 137 列，来自 Alpha158、Alpha101 与 GTJA191（不含 Alpha360），
-  成员、方向与筛选口径锁定在 `src/rquant/factors/libraries/hquality.py`（见下文“高质量因子集 Hquality”）；
 - `china_chars`：`cnc_001` 至 `cnc_109`，共 109 列中国 A 股股票特征（流动性、风险、动量、盈利、价值、投资等），
   见下文“中国 A 股股票特征 china_chars”；
 - `size_value_china`：`svc_001` 至 `svc_021`，共 21 列，Liu-Stambaugh-Yuan“Size and Value in China”的
   规模、EP、异常换手率以及 CH-3/CH-4 因子载荷，见下文“Size and Value in China 因子集 size_value_china”；
 - `talib`：`ta_001` 至 `ta_125`，共 125 列，TA-Lib 经典技术指标（64 列）与 K 线形态（61 列），见下文“TA-Lib 因子集 talib”。
-- `recent`：从上述七个库中挑出 2020 年以后单因子 RankIC 依然显著且稳定的因子，按相关性去重后共 117 列，成员、方向与
-  筛选口径锁定在 `src/rquant/factors/libraries/recent.py`（见下文“近期有效因子集 recent”）。
-- `recent_sh_main`：用 recent 的规则加做多端条件在沪市主板（`sh_main`）上从全部十二个库中筛出的 140 列，只用于 `sh_main`，
-  成员与方向锁定在 `src/rquant/factors/libraries/recent_sh_main.py`（见下文“沪市主板近期有效因子集 recent_sh_main”）。
+- `oap_jq_cnc`：oap、jq240、china_chars 三个库的 484 个因子按截面秩相关 0.8 去重后剩下的 254 列，同类里按覆盖率留，
+  不用任何收益信息，只用于 `sh_main`，成员锁定在 `src/rquant/factors/libraries/oap_jq_cnc.py`（见下文“合并去重因子集 oap_jq_cnc”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
 - `oap`：`oap_001` 至 `oap_142`，共 142 列，Open Source Asset Pricing（Chen-Zimmermann）212 个预测信号中能用 Tushare
@@ -400,9 +401,7 @@ src/rquant/factors/
     ├── alpha101.py                      # 101 条本地 Alpha101 公式
     ├── alpha360.py                      # 6 个归一化字段各 60 个滞后期的 Alpha360 图
     ├── gtja191.py                       # 190 条 GTJA191 KunQuant 公式与语义说明
-    ├── hquality.py                      # Hquality 选择型因子集的锁定成员与方向
-    ├── recent.py                        # recent（2020 年以后仍有效）选择型因子集的锁定成员与方向
-    ├── recent_sh_main.py                # recent_sh_main（沪市主板上 2020 年以后仍有效）的锁定成员与方向
+    ├── oap_jq_cnc.py                    # oap_jq_cnc（oap、jq240、china_chars 只去重，按覆盖率）的锁定成员
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
@@ -426,7 +425,7 @@ Alpha360 的迁入公式基于 Qlib 0.9.7 的 MIT 源码。两项来源与许可
 
 ### 添加自己的因子库
 
-迁移会改变各因子集的实现指纹，旧因子库需要按正式构建命令重建，再重建依赖它们的 Hquality 和 recent。
+迁移会改变各因子集的实现指纹，旧因子库需要按正式构建命令重建，再重建依赖它们的 oap_jq_cnc。
 截断数据的数值对照测试使用临时目录，不替换已有因子库；完整历史数据上的性能和结果须另行验证。
 
 在 `src/rquant/factors/libraries/` 中新建独立模块。小型因子库可直接使用 `CustomFactorLibrary`：
@@ -513,38 +512,6 @@ rquant factors validate --factor-set qlib_alpha360
 完整构建会在完成 staging 后原子替换整个 `data/factors/qlib_alpha360/` 目录，而不是向既有年度分区追加；本文
 不执行该构建。
 
-### 高质量因子集 Hquality
-
-`Hquality` 不重算公式，而是从已构建的 `qlib_alpha158`、`wq_alpha101`、`gtja191` 复制所选列，因此必须先构建
-这三个源因子集。构建会核对每个源清单的状态、目录指纹、引擎指纹、标准数据指纹与分区哈希，任一过期即失败：
-
-```bash
-rquant factors build --factor-set Hquality
-rquant factors validate --factor-set Hquality
-rquant walk-forward --model lgb --horizon 1d --factor-set Hquality
-```
-
-筛选口径（锁定在 `hquality.py` 的 `criteria`，基于 2010-01-01 至 2026-10-19 的 1d 单因子评估）：
-
-- 方向取全区间日均 Rank IC 的符号，年度统计都按该方向定向，稳定为负的因子以 `direction=-1` 反向保留；
-- 只统计评估日数不少于 120 天的年份；
-- 定向年度 Rank IC 为正的年份占比不低于 70%；
-- 不要求年度多空收益为正：要求 75% 年份为正时只剩 43 个因子，LGB 回测年化 10.1%，明显低于 Alpha158 加 Alpha101 的 18.7%；
-- 全区间 |Rank IC| 不低于 0.01；
-- 排除全部 Alpha360：保留其 42 个滞后特征时回测年化 16.2%、夏普 0.74，去掉后为 19.1%、0.83；
-- 覆盖率（各交易日有效观测数之和除以当日覆盖最好的因子观测数之和）不低于 80%；
-- 去重：通过以上条件的 268 个因子按 |Rank IC| 从强到弱排序，若与已保留因子的日均截面 Spearman 相关系数（每隔
-  5 个交易日取样）绝对值不低于 0.8 就剔除，最终保留 137 个；被剔除因子与其对应的保留因子记在 `DEDUPLICATED`。
-
-成员保留源规范列名与原值，`direction=-1` 只标记反向使用，存储值不取负；树模型不受符号影响。
-
-完整研究先构建各个源因子集，再构建 Hquality：
-
-```bash
-rquant factors build --factor-set qlib_alpha158
-rquant factors build --factor-set Hquality
-```
-
 如需进行限定日期的诊断构建，可以指定：
 
 ```bash
@@ -563,79 +530,41 @@ data/factors/qlib_alpha158/manifest.json
 
 限定日期构建不能代替完整研究所需的全历史因子。开始滚动训练前，要确认因子清单覆盖所有训练、验证、测试和标签所需日期。
 
-### 近期有效因子集 recent
+### 合并去重因子集 oap_jq_cnc
 
-所有因子集的 LGB 预测 RankIC 在 2022、2023 年都衰减到 0.01-0.02。`recent` 只保留 2020 年以后单因子依然有效的因子，
-同样不重算公式，而是从已构建的 `qlib_alpha158`、`wq_alpha101`、`gtja191`、`qlib_alpha360`、`china_chars`、
-`size_value_china`、`talib` 复制所选列，因此必须先构建这七个源因子集：
+`oap_jq_cnc` 是唯一的选择型因子集：不重算公式，从已构建的 `oap`、`jq240`、`china_chars` 复制所选列，因此必须先在
+`sh_main` 上构建这三个库。候选是这三个 2020 年以后表现最好的基础库的全部 484 个因子（oap 142、jq240 233、
+china_chars 109），只去掉重复：
 
-```bash
-rquant factors build --factor-set recent
-rquant factors validate --factor-set recent
-rquant walk-forward --model lgb --horizon 1d --factor-set recent
-```
+- 相似度：两两因子的截面 Spearman 相关系数绝对值，在 sh_main 因子库上从 2008-05-12 到 2026-10-20 每 5 个交易日取
+  一天（897 天）求平均（`scripts/remove_duplicates/select_remove_duplicates.py`，用
+  `rquant.factors.selection.RankCorrelationAccumulator` 的矩阵乘法计算，与 pandas 的逐对 Spearman 一致）；
+- 同类里留哪个：先留覆盖率高的（保留两位小数），再按因子库顺序，不用任何收益、IC 或做多端信息，所以 2020 年及
+  以后对它仍是样本外；
+- 阈值 0.8：与已保留因子的相关系数绝对值达到 0.8 就剔除，剩 254 个：oap 103、jq240 107、china_chars 44（0.7 时
+  214 个，0.9 时 332 个）。
 
-筛选口径（锁定在 `recent.py` 的 `criteria`，基于 2020-01-02 至 2026-10-21 对七个库分别执行的
-`rquant factors evaluate --horizon 1d --start 2020-01-01 --end 2026-10-21`）：
-
-- 方向取 2020 年以来日均 Rank IC 的符号，年度统计都按该方向定向；
-- 只统计评估日数不少于 120 天的年份（2020-2026 共 7 年，2026 年为 189 天）；
-- 定向年度 Rank IC 为正的年份不少于 80%（7 年中至少 6 年）；
-- 2020 年以来 |Rank IC| 不低于 0.01，且其 t 统计量（日 Rank ICIR 乘以天数的平方根）绝对值不低于 3；
-- 与 Hquality 一样不要求年度多空收益为正；
-- 覆盖率（七个评估合并后，各交易日有效观测数之和除以当日覆盖最好的因子观测数之和）不低于 80%；
-- 去重：通过以上条件的 213 个因子按 |Rank IC| 从强到弱排序，与已保留因子的日均截面 Spearman 相关系数（每隔 5 个
-  交易日取样）绝对值不低于 0.8 就剔除，最终保留 117 个（gtja191 27、qlib_alpha158 21、wq_alpha101 21、
-  china_chars 20、qlib_alpha360 20、size_value_china 4、talib 4）。
-
-成员选择用到了 2020 年以后的收益：walk-forward 中 2020 年及以后的测试年份对选择而言是样本内，结果偏乐观；
-2013-2019 年虽未用到当年收益，但用的是事后才知道的“哪些因子 2020 年后仍有效”，同样不是干净的历史回测。
-
-LGB 1d walk-forward（2013-2026，run `20261024T100453Z-6304df62`）：预测 RankIC 全区间 0.074、2022 年以来 0.042，
-都高于 Hquality（0.072 / 0.036）和 Alpha158（0.067 / 0.032），但 2022 年只有 0.005；组合年化 18.5%、夏普 0.80、
-最大回撤 -44.5%，仍低于 Hquality 的 19.1% / 0.83 和 Alpha158 的 19.5% / 0.86。2022 年以来累计收益 -3.4%（2022 年 -26.2%），
-Hquality 为 +3.0%，Alpha158 为 +24.8%。此前按 2022 年以后筛选的 96 因子版本（run `20261024T092049Z-405a155f`）年化 17.9%、
-夏普 0.79，2022 年以来累计 +26.9%。
-
-### 沪市主板近期有效因子集 recent_sh_main
-
-`recent` 是在沪深 300 上挑的。`recent_sh_main` 用同样的方法在沪市主板（`sh_main`）股票池上重新筛选，候选为全部
-十二个库因子集（1696 个因子），因此必须先在该股票池上构建这十二个源因子集：
+成员锁定在 `oap_jq_cnc.py`，由 `scripts/remove_duplicates/select_by_coverage.py` 生成。
 
 ```bash
-rquant --universe sh_main factors build --factor-set recent_sh_main
-rquant --universe sh_main factors validate --factor-set recent_sh_main
-rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set recent_sh_main
+rquant --universe sh_main factors build --factor-set oap_jq_cnc
+rquant --universe sh_main factors validate --factor-set oap_jq_cnc
+rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set oap_jq_cnc
 ```
 
-筛选口径（锁定在 `recent_sh_main.py` 的 `criteria`，基于对十二个库分别执行的
-`rquant --universe sh_main factors evaluate --horizon 1d --start 2020-01-01 --end 2026-10-21`）：
+sh_main 上的 LGB 1d walk-forward（top 50 每 5 天调仓；年化 / 夏普 / 最大回撤）：
 
-- 与 recent 相同的 IC 条件：2020 年以来 |Rank IC| >= 0.01、t >= 3、覆盖率 >= 80%，定向年度 Rank IC 为正的年份放宽到
-  不少于 70%（7 年中至少 5 年）；
-- 做多端条件：按因子方向做多的那一档（方向为正取最高 20%，为负取最低 20%）的年收益要跑赢 sh_main 全池等权收益，
-  7 年中至少 5 年做到（`min_positive_long_excess_year_ratio=0.7`），且 2020 年以来平均跑赢。组合只做多 top 50，
-  而 sh_main 上通过 IC 条件的 1078 个因子中，做多端每年只比全池多赚中位数 1.6%，做空端却少赚 14.7%，IC 大多来自
-  识别会跌的股票；全池等权年收益记在 `provenance["universe_annual_returns"]`；
-- 去重：491 个因子通过以上条件，按做多端年均超额从强到弱排序，与已保留因子的截面 Spearman 相关系数绝对值不低于 0.8
-  就剔除，保留 140 个：gtja191 27、wq_alpha101 26、qlib_alpha158 24、jq240 13、qlib_alpha360 11、talib 9、oap 9、
-  china_chars 7、jkp153 7、tushare_tech 3、barra_cne6 2、size_value_china 2。
+| 因子集 | run | 2013-2026 | 2020-2026 | 2022 年以后 | 2022 年以后去掉 2025 年的夏普 | 2020 年以来 / 2022 年以来累计 |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| oap_jq_cnc（254） | `20261028T191159Z-0a324a7c` | 30.5% / 1.06 / -42.6% | 19.3% / 0.79 / -39.5% | 15.3% / 0.65 / -39.5% | 0.33 | +217% / +92% |
+| jq240 | `20261027T202921Z-41fb3dde` | 29.1% / 1.02 / -44.1% | 22.5% / 0.88 / -33.0% | 19.1% / 0.76 / -33.0% | 0.43 | +277% / +123% |
+| oap | `20261027T185453Z-39c99759` | 23.2% / 0.87 / -50.0% | 22.5% / 0.89 / -42.6% | 18.9% / 0.76 / -42.6% | 0.42 | +277% / +122% |
+| china_chars | `20261027T183236Z-2e1c2526` | 23.4% / 0.88 / -45.4% | 19.0% / 0.80 / -40.3% | 12.4% / 0.57 / -40.3% | 0.29 | +212% / +71% |
 
-同 recent 一样，2020 年及以后的测试年份对成员选择而言是样本内。
+全期是做过的所有因子集里最好的（2018 年 +6.0%，另外三个都亏），但提升集中在 2013-2019 年；2020 年以后不如单独的 jq240。
 
-sh_main 上的 LGB 1d walk-forward（2013-2026，top 50 每 5 天调仓）：
-
-| 因子集 | run | 预测 RankIC 全区间 / 2022+ | 年化 / 夏普 / 最大回撤 | 2020 年以来累计 |
-| :--- | :--- | ---: | ---: | ---: |
-| recent_sh_main（140，做多端规则） | `20261028T033032Z-61dc64d6` | 0.081 / 0.045 | 28.2% / 0.98 / -49.0% | +177% |
-| 只按 IC 筛的版本（291） | `20261028T012626Z-1a05c1e7` | 0.093 / 0.045 | 25.3% / 0.92 / -44.9% | +98% |
-| recent 2020 版（117） | `20261028T021454Z-78c51396` | 0.085 / 0.044 | 24.6% / 0.90 / -47.9% | +103% |
-| recent 2022 版（96） | `20261027T192107Z-b2944c54` | 0.084 / 0.047 | 27.4% / 0.97 / -47.2% | +179% |
-| jq240 | `20261027T202921Z-41fb3dde` | 0.073 / 0.042 | 29.1% / 1.02 / -44.1% | +277% |
-| Hquality | `20261027T174016Z-18ae32b0` | 0.085 / 0.041 | 24.1% / 0.90 / -41.8% | +121% |
-
-加入做多端条件后预测 RankIC 从 0.093 降到 0.081，组合年化却从 25.3% 升到 28.2%：对只做多的组合，做多端的区分能力
-比整体排序相关性更重要。
+成员保留源规范列名与原值，`direction` 是 sh_main 2020 年以后 RankIC 的符号，只作元数据，存储值不取负；树模型不受符号影响。
+此前的 Hquality、recent、recent_sh_main、remove_duplicates 等按单因子效果或收益挑选的因子集已删除，需要时可从 git 历史找回。
 
 ### 中国 A 股股票特征 china_chars
 
@@ -863,8 +792,8 @@ rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 ### 验证因子
 
 ```bash
-rquant factors validate --factor-set Hquality
-python -m json.tool data/factors/Hquality/manifest.json
+rquant factors validate --factor-set jq240
+python -m json.tool data/factors/jq240/manifest.json
 ```
 
 验证会检查所有分区的因子列是否完整、无重复、顺序固定，并拒绝暴露上游原始列名。清单中的
@@ -876,7 +805,7 @@ python -m json.tool data/factors/Hquality/manifest.json
 
 ```bash
 rquant factors evaluate \
-  --factor-set Hquality \
+  --factor-set jq240 \
   --horizon 1d \
   --start 2010-01-01 \
   --end 2026-08-03
@@ -933,7 +862,7 @@ rquant rdagent export --mining-end 2021-12-31
 rquant walk-forward \
   --model lgb \
   --horizon 1d \
-  --factor-set Hquality \
+  --factor-set jq240 \
   --first-year 2013 \
   --last-year 2026 \
   --through 2026-08-04
@@ -1025,9 +954,6 @@ rquant report RUN_ID --n-drop 5 --rebalance-days 1
 | Alpha158 | 1d | 每日最多换 5 只 | 19.5% | 0.86 | -48.5% | 51 | 3.8% | `20261023T094024Z-2c596001` |
 | Alpha158 | 1d | 每 5 日全量换 top50 | 18.8% | 0.83 | -48.6% | 72 | 5.4% | `20261023T094024Z-2c596001-top50-every5` |
 | Alpha158 | 5d | 每 5 日全量换 top50 | 14.8% | 0.71 | -49.3% | 59 | 4.4% | `20261024T200621Z-88ba61b4` |
-| Hquality | 1d | 每日最多换 5 只 | 19.1% | 0.83 | -45.1% | 52 | 3.8% | `20261023T085832Z-73d29b01` |
-| Hquality | 1d | 每 5 日全量换 top50 | 13.2% | 0.63 | -49.9% | 73 | 5.4% | `20261023T085832Z-73d29b01-top50-every5` |
-| Hquality | 5d | 每 5 日全量换 top50 | 17.2% | 0.80 | -45.3% | 61 | 4.6% | `20261024T203527Z-283c0442` |
 
 `-top50-every5` 目录只复制了原 1d 运行的预测，用新组合重新回测。
 

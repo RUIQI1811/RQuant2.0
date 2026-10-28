@@ -24,10 +24,10 @@ class CliTests(unittest.TestCase):
             ["data", "sync", "--through", "2025-01-01", "--no-progress"],
             ["data", "build-qlib"],
             ["factors", "catalog"],
-            ["factors", "build", "--factor-set", "Hquality"],
+            ["factors", "build", "--factor-set", "oap_jq_cnc"],
             ["factors", "validate", "--factor-set", "wq_alpha101"],
-            ["factors", "evaluate", "--factor-set", "Hquality", "--horizon", "20d"],
-            ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "Hquality"],
+            ["factors", "evaluate", "--factor-set", "oap_jq_cnc", "--horizon", "20d"],
+            ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "oap_jq_cnc"],
             ["report", "run-id"],
             ["rdagent", "export", "--mining-end", "2021-12-31"],
         ]
@@ -38,10 +38,10 @@ class CliTests(unittest.TestCase):
     def test_research_commands_have_run_categories(self) -> None:
         parser = build_parser()
         factor_args = parser.parse_args(
-            ["factors", "evaluate", "--factor-set", "Hquality", "--horizon", "20d"]
+            ["factors", "evaluate", "--factor-set", "oap_jq_cnc", "--horizon", "20d"]
         )
         walk_args = parser.parse_args(
-            ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "Hquality"]
+            ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "oap_jq_cnc"]
         )
         report_args = parser.parse_args(["report", "run-id"])
         doctor_args = parser.parse_args(["doctor", "--skip-permission-check"])

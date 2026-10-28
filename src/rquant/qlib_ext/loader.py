@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -28,7 +28,7 @@ HORIZON_STEPS = {"1d": 1, "5d": 5, "20d": 20}
 class KunQuantDataLoader(_QlibDataLoaderBase):
     """Load a registered RQuant factor store and a Qlib-evaluated next-open label."""
 
-    def __init__(self, factor_root: str, factor_set: FactorSet = "Hquality", horizon: str = "1d") -> None:
+    def __init__(self, factor_root: str, factor_set: FactorSet = "jq240", horizon: str = "1d") -> None:
         if horizon not in LABEL_EXPRESSIONS:
             raise DataContractError(f"Unsupported horizon: {horizon}")
         self.factor_root = Path(factor_root)
@@ -56,48 +56,100 @@ class KunQuantDataLoader(_QlibDataLoaderBase):
         if not paths:
             raise DataContractError(f"No factor partitions for {self.factor_set}: {self.factor_root}")
         instrument_list = _resolve_instruments(D, instruments, start_time, end_time)
-        # Filter each yearly partition as it is read, so at most one year is held twice.
-        with _system_arrow_allocator():
-            frame = pd.concat(
-                [_read_partition(pd, path, start_time, end_time, instrument_list) for path in paths], ignore_index=True
-            )
         expected = list(self.catalog.canonical_names(self.factor_set))
-        factor_columns = [column for column in frame.columns if column not in {"datetime", "instrument"}]
-        if factor_columns != expected:
-            raise DataContractError("Factor store columns do not match the locked catalog")
 
-        # DataHandlerLP follows QlibDataLoader's canonical <datetime, instrument> index order. Moving the key columns
-        # into the index in place keeps the factor block as it is; set_index and join would each copy it.
-        frame.index = pd.MultiIndex.from_arrays(
-            [frame.pop("datetime"), frame.pop("instrument")], names=["datetime", "instrument"]
-        )
-        if not frame.index.is_monotonic_increasing:
-            frame = frame.sort_index()
-        query_instruments = sorted(frame.index.get_level_values("instrument").unique())
-        labels = D.features(
-            query_instruments,
-            [LABEL_EXPRESSIONS[self.horizon]],
-            start_time=start_time,
-            end_time=end_time,
-            freq="day",
-        )
-        labels.columns = ["LABEL0"]
-        labels = labels.swaplevel().sort_index()
-        labels.index = labels.index.set_names(["datetime", "instrument"])
-        # One float32 block for features and label: DataHandlerLP copies the panel for its processors, and copying a
-        # frame of several blocks consolidates them through extra full-size temporaries.
-        panel = np.empty((len(frame), len(expected) + 1), dtype=np.float32, order="F")
-        panel[:, :-1] = frame.to_numpy(dtype=np.float32)
-        panel[:, -1] = labels["LABEL0"].reindex(frame.index).to_numpy(dtype=np.float32)
+        def load_labels(index: Any) -> Any:
+            labels = D.features(
+                sorted(index.get_level_values("instrument").unique()),
+                [LABEL_EXPRESSIONS[self.horizon]],
+                start_time=start_time,
+                end_time=end_time,
+                freq="day",
+            )
+            labels.columns = ["LABEL0"]
+            labels = labels.swaplevel().sort_index()
+            labels.index = labels.index.set_names(["datetime", "instrument"])
+            return labels["LABEL0"].reindex(index).to_numpy(dtype=np.float32)
+
+        # One float32 block for features and label, filled column by column straight from the partitions: no
+        # concatenated copy of the store and no float64 frame of a whole year exist next to it. DataHandlerLP copies
+        # the panel for its processors, and copying a frame of several blocks consolidates them through extra
+        # full-size temporaries.
+        with _system_arrow_allocator():
+            index, panel = _load_feature_block(
+                pd, paths, expected, start_time, end_time, instrument_list, labels=load_labels
+            )
         columns = pd.MultiIndex.from_tuples([("feature", column) for column in expected] + [("label", "LABEL0")])
-        return pd.DataFrame(panel, index=frame.index, columns=columns, copy=False)
+        return pd.DataFrame(panel, index=index, columns=columns, copy=False)
 
 
-def _read_partition(pd: Any, path: Path, start_time: Any, end_time: Any, instruments: list[str] | None) -> Any:
-    # Factor stores are written in double precision; models train on single precision, which halves the memory of
-    # every copy DataHandlerLP and LightGBM make of a multi-year sh_main/main panel.
-    frame = _single_precision(pd.read_parquet(path))
-    frame["datetime"] = pd.to_datetime(frame["datetime"])
+def _load_feature_block(
+    pd: Any,
+    paths: list[Path],
+    expected: list[str],
+    start_time: Any,
+    end_time: Any,
+    instruments: list[str] | None,
+    *,
+    labels: Callable[[Any], Any] | None = None,
+    columns_per_read: int = 32,
+) -> tuple[Any, Any]:
+    """Return the sorted <datetime, instrument> index and a Fortran-ordered float32 block of the factor columns plus
+    one trailing column for the label: ``labels(index)`` when given, else left uninitialised.
+
+    ``labels`` runs before the block is allocated. Qlib evaluates the label in a pool of worker processes, fresh
+    interpreters that took about 6.3 GB together on Windows; with the block already committed next to them, a
+    672-factor sh_main window left 0.2 GB of a 16 GB machine free (1.3 GB with the label first).
+
+    Rows are filtered by date range and instruments. Factor stores are written in double precision; models train on
+    single precision, which halves the memory of every copy DataHandlerLP and LightGBM make of a multi-year panel.
+    Each partition is read a few columns at a time, and every column is rounded as it is written into the block.
+    """
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    keys = []
+    for path in paths:
+        names = [name for name in pq.ParquetFile(path).schema_arrow.names if name not in {"datetime", "instrument"}]
+        if names != expected:
+            raise DataContractError("Factor store columns do not match the locked catalog")
+        frame = pd.read_parquet(path, columns=["datetime", "instrument"])
+        frame["datetime"] = pd.to_datetime(frame["datetime"])
+        keep = _row_filter(pd, frame, start_time, end_time, instruments)
+        keys.append((path, keep, frame[keep]))
+    rows = pd.concat([frame for _, _, frame in keys], ignore_index=True)
+    index = pd.MultiIndex.from_arrays([rows.pop("datetime"), rows.pop("instrument")], names=["datetime", "instrument"])
+    # Destination row of every source row; the identity when the partitions are already in index order.
+    destination = None
+    if not index.is_monotonic_increasing:
+        order = index.argsort()
+        index = index[order]
+        destination = np.empty_like(order)
+        destination[order] = np.arange(len(order))
+    label = labels(index) if labels is not None else None
+    panel = np.empty((len(index), len(expected) + 1), dtype=np.float32, order="F")
+    if label is not None:
+        panel[:, -1] = label
+        del label
+    offset = 0
+    for path, keep, frame in keys:
+        mask = keep.to_numpy()
+        target = slice(offset, offset + len(frame))
+        if destination is not None:
+            target = destination[target]
+        parquet = pq.ParquetFile(path)
+        for first in range(0, len(expected), columns_per_read):
+            names = expected[first : first + columns_per_read]
+            table = parquet.read(columns=names)
+            for position, name in enumerate(names, first):
+                values = table.column(name).to_numpy()
+                panel[target, position] = values[mask] if not mask.all() else values
+            del table
+        offset += len(frame)
+    return index, panel
+
+
+def _row_filter(pd: Any, frame: Any, start_time: Any, end_time: Any, instruments: list[str] | None) -> Any:
     keep = pd.Series(True, index=frame.index)
     if start_time is not None:
         keep &= frame["datetime"] >= pd.Timestamp(start_time)
@@ -105,7 +157,7 @@ def _read_partition(pd: Any, path: Path, start_time: Any, end_time: Any, instrum
         keep &= frame["datetime"] <= pd.Timestamp(end_time)
     if instruments:
         keep &= frame["instrument"].isin(instruments)
-    return frame if keep.all() else frame[keep]
+    return keep
 
 
 @contextmanager
@@ -120,10 +172,6 @@ def _system_arrow_allocator() -> Iterator[None]:
         yield
     finally:
         pyarrow.set_memory_pool(previous)
-
-
-def _single_precision(frame: Any) -> Any:
-    return frame.astype({column: "float32" for column in frame.columns if column not in {"datetime", "instrument"}})
 
 
 def _partitions_in_range(paths: list[Path], pd: Any, start_time: Any, end_time: Any) -> list[Path]:

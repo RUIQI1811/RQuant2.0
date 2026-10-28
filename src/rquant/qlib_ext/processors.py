@@ -29,15 +29,16 @@ class ProcessInf(_QlibProcessorBase):
         import numpy as np
 
         positions = [position for position in range(df.shape[1]) if np.isinf(df.iloc[:, position].to_numpy()).any()]
-        if not positions:
-            return df
-        block = df.iloc[:, positions]
-        infinite = np.isinf(block.to_numpy())
-        finite = block.mask(infinite)
-        daily_mean = finite.groupby(level="datetime", sort=False).transform("mean")
-        # Written back by position so the frame keeps a single block; replacing columns by label would split it, and
-        # DataHandlerLP's next copy would consolidate the pieces through full-size temporaries.
-        df.iloc[:, positions] = np.where(infinite, daily_mean.to_numpy(), block.to_numpy())
+        # A few columns at a time: the masked copy and the daily means are full-length temporaries per column.
+        for first in range(0, len(positions), 16):
+            chunk = positions[first : first + 16]
+            block = df.iloc[:, chunk]
+            infinite = np.isinf(block.to_numpy())
+            finite = block.mask(infinite)
+            daily_mean = finite.groupby(level="datetime", sort=False).transform("mean")
+            # Written back by position so the frame keeps a single block; replacing columns by label would split it,
+            # and DataHandlerLP's next copy would consolidate the pieces through full-size temporaries.
+            df.iloc[:, chunk] = np.where(infinite, daily_mean.to_numpy(), block.to_numpy())
         return df
 
 

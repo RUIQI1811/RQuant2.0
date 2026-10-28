@@ -80,7 +80,9 @@ def synthetic_inputs(days: int = 1700, stocks: int = 6, seed: int = 21) -> dict[
     high = close * np.exp(np.abs(rng.normal(0.0, 0.01, close.shape)))
     low = close * np.exp(-np.abs(rng.normal(0.0, 0.01, close.shape)))
     shares = rng.uniform(1e8, 1e9, stocks)
-    cap = close * shares
+    # Issued shares drift at a different rate per stock: with a constant count, eqnpo_12m (price growth minus market
+    # value growth) cancels to rounding noise for every stock, and ranking that noise differs between log builds.
+    cap = close * shares * np.linspace(1.0, 1.2, days)[:, None] ** np.linspace(0.5, 1.5, stocks)
     amount = cap * rng.uniform(0.002, 0.03, close.shape)
     turnover = pd.DataFrame(rng.uniform(0.002, 0.04, close.shape), index=dates, columns=instruments)
     dividend = pd.DataFrame(rng.uniform(0.0, 0.03, close.shape), index=dates, columns=instruments)
