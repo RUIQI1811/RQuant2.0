@@ -1,7 +1,7 @@
 """Reselect recent_sh_main by |IC| and |Rank IC| alone and write its locked module.
 
 Usage: python select_by_ic.py <project_root> <factor_stability.csv> <rank_correlation.parquet> <sampled selection.json>
-       <output.py> [min_abs_ic] [min_abs_rank_ic] [max_abs_rank_correlation] [stability]
+       <output.py> [min_abs_ic] [min_abs_rank_ic] [max_abs_rank_correlation] [stability|plain] [name] [prefix]
 
 Pass ``stability`` to also keep the earlier recent_sh_main checks (|t| >= 3, oriented Rank IC positive in >= 70% of
 years, long side beating the universe in >= 70% of years and on average, coverage >= 0.8); ``min_abs_ic`` 0 drops
@@ -41,6 +41,8 @@ def main() -> None:
     min_rank_ic = float(sys.argv[7]) if len(sys.argv) > 7 else 0.02
     max_corr = float(sys.argv[8]) if len(sys.argv) > 8 else 0.8
     stability = len(sys.argv) > 9 and sys.argv[9] == "stability"
+    name = sys.argv[10] if len(sys.argv) > 10 else "recent_sh_main"
+    prefix = sys.argv[11] if len(sys.argv) > 11 else "RECENT_SH_MAIN"
     provenance = dict(RECENT_SH_MAIN_SELECTION.provenance)
 
     summaries = []
@@ -81,23 +83,33 @@ def main() -> None:
     print("kept mean long excess", float(passing.loc[kept, "mean_long_excess"].mean()))
 
     members = []
-    for name in kept:
-        row = passing.loc[name]
+    for factor in kept:
+        row = passing.loc[factor]
         direction = int(row["direction"]) or 1
         members.append(
-            f'    SelectedFactor("{name}", {direction}),  # IC {row["ic_mean"]:+.4f}, '
+            f'    SelectedFactor("{factor}", {direction}),  # IC {row["ic_mean"]:+.4f}, '
             f"RankIC {row['rank_ic_mean']:+.4f}, long excess {row['mean_long_excess'] * 100:+.1f}%, "
             f"cov {row['coverage']:.3f}"
         )
     paragraphs = [
-        "Locked membership of the recent_sh_main factor set.",
-        "recent_sh_main keeps the factors whose single-factor Rank IC on the Shanghai main-board universe "
-        "(``sh_main``) is large since 2020, then removes duplicates. It was selected from the 1d evaluations "
-        "listed in ``provenance`` (``rquant --universe sh_main factors evaluate --horizon 1d --start 2020-01-01 "
-        "--end 2026-10-21`` on each of the twelve library factor sets):",
+        f"Locked membership of the {name} factor set.",
+        f"{name} keeps the factors whose single-factor results on the Shanghai main-board universe "
+        "(``sh_main``) are still significant and stable since 2020, then removes duplicates. It was selected from "
+        "the 1d evaluations listed in ``provenance`` (``rquant --universe sh_main factors evaluate --horizon 1d "
+        "--start 2020-01-01 --end 2026-10-21`` on each of the twelve library factor sets):",
         (
-            f"- the absolute 2020+ mean daily Rank IC is at least ``min_abs_rank_ic`` ({min_rank_ic})"
-            + (f" and the absolute mean daily IC at least ``min_abs_ic`` ({min_ic})" if min_ic > 0 else "")
+            "- "
+            + " and ".join(
+                text
+                for text, limit in (
+                    (f"the absolute 2020+ mean daily IC is at least ``min_abs_ic`` ({min_ic})", min_ic),
+                    (
+                        f"the absolute 2020+ mean daily Rank IC is at least ``min_abs_rank_ic`` ({min_rank_ic})",
+                        min_rank_ic,
+                    ),
+                )
+                if limit > 0
+            )
             + (
                 "; its t-statistic (daily Rank ICIR times the square root of the number of days) is at least 3 in "
                 "absolute value, the oriented annual Rank IC is positive in at least 70% of the counted years "
@@ -154,7 +166,7 @@ from __future__ import annotations
 
 from rquant.factors.libraries.base import FactorSelection, SelectedFactor
 
-RECENT_SH_MAIN_MEMBERS = (
+{prefix}_MEMBERS = (
 {chr(10).join(members)}
 )
 
@@ -162,12 +174,12 @@ DEDUPLICATED = {{
 {dropped_lines}
 }}
 
-RECENT_SH_MAIN_SELECTION = FactorSelection(
-    name="recent_sh_main",
+{prefix}_SELECTION = FactorSelection(
+    name="{name}",
     source_factor_sets=(
 {sources}
     ),
-    members=RECENT_SH_MAIN_MEMBERS,
+    members={prefix}_MEMBERS,
     criteria={{
         "universe": "sh_main",
         "min_abs_ic": {min_ic},
