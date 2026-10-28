@@ -14,6 +14,7 @@ from rquant.factors.engine import FactorBuildConfig, SelectionFactorEngine, crea
 from rquant.factors.libraries.base import FactorSelection, FactorSpec, PanelFactorLibrary, SelectedFactor
 from rquant.factors.libraries.custom import CustomFactor, CustomFactorLibrary
 from rquant.factors.libraries.hquality import HQUALITY_SELECTION
+from rquant.factors.libraries.oap_jq_cnc import OAP_JQ_CNC_SELECTION
 from rquant.factors.libraries.recent import RECENT_SELECTION
 from rquant.factors.libraries.recent_sh_main import RECENT_SH_MAIN_SELECTION
 from rquant.factors.libraries.registry import FactorLibraryRegistry, get_library_registry
@@ -440,6 +441,28 @@ class FactorDeduplicationTests(unittest.TestCase):
         self.assertTrue(set(dropped.values()) <= kept)
         self.assertEqual(library_factors, kept | set(dropped))
         self.assertEqual(0.8, REMOVE_DUPLICATES_SELECTION.criteria["max_abs_rank_correlation"])
+
+    # Break caught: an oap_jq_cnc module that drops non-duplicates, takes a factor from another library, or lets
+    # returns choose among duplicates.
+    def test_locked_oap_jq_cnc_only_drops_duplicates_of_its_three_libraries(self) -> None:
+        registry = get_library_registry()
+        dropped = OAP_JQ_CNC_SELECTION.provenance["deduplicated"]
+        kept = set(OAP_JQ_CNC_SELECTION.canonical_names)
+        library_factors = {
+            spec.canonical_name
+            for source in OAP_JQ_CNC_SELECTION.source_factor_sets
+            for library in registry.select(source)
+            for spec in library.specs
+        }
+        self.assertIs(OAP_JQ_CNC_SELECTION, registry.selection("oap_jq_cnc"))
+        self.assertEqual(("oap", "jq240", "china_chars"), OAP_JQ_CNC_SELECTION.source_factor_sets)
+        self.assertEqual(484, len(library_factors))
+        self.assertEqual(254, len(kept))
+        self.assertFalse(kept & set(dropped))
+        self.assertTrue(set(dropped.values()) <= kept)
+        self.assertEqual(library_factors, kept | set(dropped))
+        self.assertEqual(0.8, OAP_JQ_CNC_SELECTION.criteria["max_abs_rank_correlation"])
+        self.assertFalse(OAP_JQ_CNC_SELECTION.criteria["returns_used"])
 
 
 if __name__ == "__main__":

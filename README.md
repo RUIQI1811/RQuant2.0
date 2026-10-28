@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算全部十二个公式因子集；Hquality、recent、recent_sh_main 和 remove_duplicates 从已构建的源因子集选列。
+- KunQuant 编译并计算全部十二个公式因子集；Hquality、recent、recent_sh_main、remove_duplicates 和 oap_jq_cnc 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -365,6 +365,8 @@ rquant factors catalog --factor-set Hquality --format csv --output factor_catalo
   成员与方向锁定在 `src/rquant/factors/libraries/recent_sh_main.py`（见下文“沪市主板近期有效因子集 recent_sh_main”）。
 - `remove_duplicates`：全部十二个库的 1696 个因子不设任何 IC 或稳定性门槛，只按截面秩相关 0.8 去重后剩下的 672 列，
   只用于 `sh_main`，成员锁定在 `src/rquant/factors/libraries/remove_duplicates.py`（见下文“去重因子集 remove_duplicates”）。
+- `oap_jq_cnc`：oap、jq240、china_chars 三个库的 484 个因子按截面秩相关 0.8 去重后剩下的 254 列，同类里按覆盖率留，
+  不用任何收益信息，只用于 `sh_main`，成员锁定在 `src/rquant/factors/libraries/oap_jq_cnc.py`（见下文“去重因子集 remove_duplicates”）。
 - `jq240`：`jq_001` 至 `jq_233`，共 233 列，按聚宽因子库公开定义重写的质量、基础科目、情绪、成长、风险、每股、技术、
   动量与风格因子，见下文“聚宽因子集 jq240”。
 - `oap`：`oap_001` 至 `oap_142`，共 142 列，Open Source Asset Pricing（Chen-Zimmermann）212 个预测信号中能用 Tushare
@@ -413,6 +415,7 @@ src/rquant/factors/
     ├── recent.py                        # recent（2020 年以后仍有效）选择型因子集的锁定成员与方向
     ├── recent_sh_main.py                # recent_sh_main（沪市主板上 2020 年以后仍有效）的锁定成员与方向
     ├── remove_duplicates.py             # remove_duplicates（十二个库只去重）的锁定成员与方向
+    ├── oap_jq_cnc.py                    # oap_jq_cnc（oap、jq240、china_chars 只去重，按覆盖率）的锁定成员
     ├── china_chars.py                   # 109 个日频 point-in-time 中国 A 股股票特征
     ├── size_value_china.py              # 21 个 CH-3/CH-4 特征与因子载荷
     ├── talib_indicators.py              # 125 个 TA-Lib 技术指标与 K 线形态
@@ -698,6 +701,30 @@ sh_main 上的 LGB 1d walk-forward（2013-2026，top 50 每 5 天调仓）：
 
 预测 RankIC 是本表最高的，组合收益却主要来自 2013-2019 年；2022 年以后明显落后（2022-2024 年依次为 -9.9%、+0.2%、-3.1%）。
 列数从 345 加到 672，排序更准，做多端没有更好。
+
+#### oap、jq240、china_chars 合并去重 oap_jq_cnc
+
+`oap_jq_cnc` 用同样的全期秩相关矩阵，只在 2020 年以后表现最好的三个基础库（oap 142、jq240 233、china_chars 109，共
+484 个）里按 0.8 去重，剩 254 个：oap 103、jq240 107、china_chars 44（0.7 时 214 个，0.9 时 332 个）。同类里先留覆盖率
+高的（保留两位小数），再按因子库顺序，不用任何收益、IC 或做多端信息，所以 2020 年及以后对它仍是样本外。成员锁定在
+`oap_jq_cnc.py`，由 `scripts/remove_duplicates/select_by_coverage.py` 生成。
+
+```bash
+rquant --universe sh_main factors build --factor-set oap_jq_cnc
+rquant --universe sh_main factors validate --factor-set oap_jq_cnc
+rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set oap_jq_cnc
+```
+
+sh_main 上的 LGB 1d walk-forward（top 50 每 5 天调仓；年化 / 夏普 / 最大回撤）：
+
+| 因子集 | run | 2013-2026 | 2020-2026 | 2022 年以后 | 2022 年以后去掉 2025 年的夏普 | 2020 年以来 / 2022 年以来累计 |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| oap_jq_cnc（254） | `20261028T191159Z-0a324a7c` | 30.5% / 1.06 / -42.6% | 19.3% / 0.79 / -39.5% | 15.3% / 0.65 / -39.5% | 0.33 | +217% / +92% |
+| jq240 | `20261027T202921Z-41fb3dde` | 29.1% / 1.02 / -44.1% | 22.5% / 0.88 / -33.0% | 19.1% / 0.76 / -33.0% | 0.43 | +277% / +123% |
+| oap | `20261027T185453Z-39c99759` | 23.2% / 0.87 / -50.0% | 22.5% / 0.89 / -42.6% | 18.9% / 0.76 / -42.6% | 0.42 | +277% / +122% |
+| china_chars | `20261027T183236Z-2e1c2526` | 23.4% / 0.88 / -45.4% | 19.0% / 0.80 / -40.3% | 12.4% / 0.57 / -40.3% | 0.29 | +212% / +71% |
+
+全期是目前所有因子集里最好的（2018 年 +6.0%，另外三个都亏），但提升集中在 2013-2019 年；2020 年以后不如单独的 jq240。
 
 ### 中国 A 股股票特征 china_chars
 
