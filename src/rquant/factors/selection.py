@@ -28,6 +28,10 @@ class StabilityCriteria:
     min_abs_rank_ic_t_stat: float = 0.0
     # Published factor values divided by the largest observation count of any factor, summed over dates.
     min_coverage: float = 0.9
+    # Share of counted years in which the oriented long quantile (top for direction +1, bottom for -1) beats the
+    # equal-weight universe return. A long-only portfolio can only use this side of the spread. Needs
+    # ``universe_returns``; when the share is required, the mean yearly long excess must also be positive.
+    min_positive_long_excess_year_ratio: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -54,8 +58,14 @@ def factor_coverage(daily: Any) -> Any:
     return coverage.rename("coverage").fillna(0.0)
 
 
-def score_factor_stability(summary: Any, annual: Any, coverage: Any, criteria: StabilityCriteria) -> Any:
-    """Return one row per factor with its oriented yearly statistics and the selection decision."""
+def score_factor_stability(
+    summary: Any, annual: Any, coverage: Any, criteria: StabilityCriteria, *, universe_returns: Any = None
+) -> Any:
+    """Return one row per factor with its oriented yearly statistics and the selection decision.
+
+    ``universe_returns`` maps calendar years to the compounded equal-weight return of the evaluated universe over the
+    same days and horizon as the annual quantile returns (see ``compound_by_year``).
+    """
     try:
         import numpy as np
         import pandas as pd
@@ -94,6 +104,22 @@ def score_factor_stability(summary: Any, annual: Any, coverage: Any, criteria: S
     result["positive_rank_ic_year_ratio"] = (result["positive_rank_ic_years"] / denominator).fillna(0.0)
     result["positive_long_short_year_ratio"] = (result["positive_long_short_years"] / denominator).fillna(0.0)
     result["coverage"] = coverage.reindex(result.index).fillna(0.0)
+    if universe_returns is not None:
+        if not {"top_return", "bottom_return"}.issubset(years.columns):
+            raise DataContractError("Annual frame needs top_return and bottom_return to score the long side")
+        universe = years["year"].map(universe_returns)
+        if universe.isna().any():
+            missing = sorted(years.loc[universe.isna(), "year"].unique())
+            raise DataContractError(f"Universe returns are missing counted years: {missing}")
+        long_leg = years["top_return"].where(years["direction"] > 0, years["bottom_return"])
+        years["long_excess"] = long_leg - universe
+        long_grouped = years.groupby("factor")["long_excess"]
+        positive_long = long_grouped.apply(lambda values: int((values > 0.0).sum()))
+        result["positive_long_excess_years"] = positive_long.reindex(result.index).fillna(0).astype(int)
+        result["positive_long_excess_year_ratio"] = (result["positive_long_excess_years"] / denominator).fillna(0.0)
+        result["mean_long_excess"] = long_grouped.mean().reindex(result.index)
+    elif criteria.min_positive_long_excess_year_ratio > 0.0:
+        raise DataContractError("min_positive_long_excess_year_ratio needs universe_returns")
 
     checks = {
         "direction": result["direction"] != 0,
@@ -104,11 +130,26 @@ def score_factor_stability(summary: Any, annual: Any, coverage: Any, criteria: S
         >= criteria.min_positive_long_short_year_ratio,
         "coverage": result["coverage"] >= criteria.min_coverage,
     }
+    if criteria.min_positive_long_excess_year_ratio > 0.0:
+        checks["long_excess_years"] = (
+            result["positive_long_excess_year_ratio"] >= criteria.min_positive_long_excess_year_ratio
+        ) & (result["mean_long_excess"].fillna(0.0) > 0.0)
     result["selected"] = np.logical_and.reduce([check.to_numpy() for check in checks.values()])
     result["failed_checks"] = [
         ",".join(name for name, check in checks.items() if not bool(check.loc[factor])) for factor in result.index
     ]
     return result.reset_index()
+
+
+def compound_by_year(daily_returns: Any) -> Any:
+    """Compound a date-indexed series of daily returns within each calendar year."""
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise DependencyError("pandas is required for factor selection") from exc
+    returns = daily_returns.dropna()
+    index = pd.DatetimeIndex(returns.index)
+    return (1.0 + returns).groupby(index.year).prod() - 1.0
 
 
 def mean_rank_correlation(frame: Any, factor_names: list[str] | tuple[str, ...], *, min_cross_section: int = 20) -> Any:
