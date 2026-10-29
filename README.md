@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算全部十二个公式因子集；oap_jq_cnc 从已构建的源因子集选列。
+- KunQuant 编译并计算全部十三个公式因子集；oap_jq_cnc 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -44,6 +44,7 @@ rquant factors build --factor-set oap
 rquant factors build --factor-set barra_cne6
 rquant factors build --factor-set tushare_tech        # 只用 OHLCV
 rquant factors build --factor-set jkp153
+rquant factors build --factor-set jkp406
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -119,8 +120,8 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 1696 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
-  barra_cne6、tushare_tech、jkp153）；
+- 2058 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
+  barra_cne6、tushare_tech、jkp153、jkp406）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -368,6 +369,8 @@ rquant factors catalog --factor-set jq240 --format csv --output factor_catalog.c
   见下文“Tushare 技术因子集 tushare_tech”。
 - `jkp153`：`jkp_001` 至 `jkp_144`，共 144 列，Jensen-Kelly-Pedersen 153 个全球因子特征中能用 Tushare 构建的部分，
   见下文“JKP 因子集 jkp153”。
+- `jkp406`：`jkpx_001` 至 `jkpx_362`，共 362 列，JKP 扩展特征的 Tushare 日频版本，包含原 144 个定义及 218 个新增定义；
+  可核实清单、42 个排除项和官方名称数量差异见下文。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -789,6 +792,38 @@ rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 ```
 
 `barra_cne6`、`tushare_tech` 与 `jkp153` 与其他库一样在 KunQuant 中计算：财报公式在季度图中计算并按公告日发布，指数加权窗口、滚动回归、截面排名与标准化由逐股或逐日 C++ 算子完成，`tushare_tech` 的指标是逐股序列 C++ 内核；原 Pandas 实现保留在 `tests/panel_reference/` 中，测试逐列对齐。
+
+### JKP 扩展因子集 jkp406
+
+新增的 `jkp406` 独立注册，保留 `jkp153` 的 144 个定义、列名及历史结果契约。扩展库用 `jkpx_001` 至
+`jkpx_362` 编号；新增 218 个定义主要覆盖财报增长、资产变化、盈利与偿债比率、营运周期、估值及长短期收益。
+全部通过 KunQuant 计算，不新增依赖、Tushare 接口或财报字段。已有参考数据若满足 `jkp153` 即可复用。
+上市日文件始终记录实际读取哈希；参考清单若包含该文件则额外比对，兼容旧参考清单未列入该文件的格式。
+
+清单锁定在 `src/rquant/factors/libraries/jkp406_catalog.py`，公式在 `jkp406.py`。
+来源为 [JKP 官方说明](https://jkpfactors-data.s3.amazonaws.com/documents/Documentation.pdf)及
+[官方源码版本 67174c7](https://github.com/bkelly-lab/ReplicationCrisis/tree/67174c7f170bf8b952b3c86876f187fd9970b5ba/GlobalFactors)，
+并与官方 Python 版本 `c1762b9` 交叉核对。官方文档称 406 项，但该版本的明确导出清单为 315 个财报特征、
+46 个月度市场特征、31 个日度市场特征、11 个组合特征，加上核心清单中的 `prc`，合计 404 个唯一名称。
+`SOURCE_COUNT_DISCREPANCY=2` 记录未能对应到名称的差异；没有用额外变量凑满 406。
+
+404 个具名项目中实现 362 个，另 42 个在 `JKP406_SKIPPED` 逐项记录原因，包括员工数、独立回购现金流、
+年度/短窗口/特殊分红、特殊和非常损益、广告和人工费用、HXZ 模型收益，以及超出现有历史起点的 15–20 年季节性。
+这些是当前数据接口的支持边界，单元测试不代表真实数据有完整覆盖或有预测收益。
+
+口径沿用 `jkp153`：一个月 21 个交易日、一年 252 个交易日；财报取首次披露值，按真实公告日及连续可用季度发布；
+年度流量用 TTM，年度滞后为四个季度；停牌日输出为空；截面排序使用引擎传入的当日研究股票池。
+新增的长/短债务发行分别使用官方允许的长/短债务余额年度变化回退口径，不能解释为直接披露的发行现金流。
+新增现金周转天数使用 365 个自然日和年初年末余额均值；`ivol_capm_60m` 用不重叠的 21 日收益估计，至少 36 个月有效值。
+新增 `rvolhl_21d` 在计算高低价波动率之前校正隔夜跳空；保留原 `bidaskhl_21d` 定义。
+继承的 144 个定义保留原有假设（包括 `dv_ttm` 分红近似及不单列回购），没有在这次扩展中重新定义。
+测试参考保存在 `tests/panel_reference/jkp406.py`，按列比较数值及 NaN 掩码，并验证截断重算、停牌和比率边界。
+
+```bash
+rquant factors catalog --factor-set jkp406
+rquant factors build --factor-set jkp406
+rquant factors validate --factor-set jkp406
+```
 
 ### 验证因子
 

@@ -133,6 +133,7 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.china_chars import ChinaCharsLibrary
     from rquant.factors.libraries.gtja191 import GTJA191Library
     from rquant.factors.libraries.jkp153 import JKP153Library
+    from rquant.factors.libraries.jkp406 import JKP406Library
     from rquant.factors.libraries.jq240 import JQ240Library
     from rquant.factors.libraries.oap import OAPLibrary
     from rquant.factors.libraries.oap_jq_cnc import OAP_JQ_CNC_SELECTION
@@ -153,6 +154,7 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(BarraCNE6Library())
     registry.register_library(TushareTechLibrary())
     registry.register_library(JKP153Library())
+    registry.register_library(JKP406Library())
     registry.register_factor_selection(OAP_JQ_CNC_SELECTION)
     return registry
 

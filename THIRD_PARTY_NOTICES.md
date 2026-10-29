@@ -1,5 +1,33 @@
 # Third-party notices
 
+## Jensen-Kelly-Pedersen extended characteristic definitions
+
+`src/rquant/factors/libraries/jkp406.py` and `jkp406_catalog.py` independently
+implement the supported A-share adaptation of the extended Global Factor Data
+definitions from Jensen, Kelly and Pedersen, "Is There a Replication Crisis in
+Finance?", The Journal of Finance 78(5), 2465-2518 (2023).
+
+Sources: https://jkpfactors.com/ and
+https://jkpfactors-data.s3.amazonaws.com/documents/Documentation.pdf;
+the explicit source inventory is pinned to `bkelly-lab/ReplicationCrisis`
+commit `67174c7f170bf8b952b3c86876f187fd9970b5ba` (GlobalFactors accounting,
+market and combined characteristic exports), cross-checked against
+`bkelly-lab/jkp-data` commit `c1762b9272f2743d8191561aa371d1101d37536c`.
+
+No upstream executable code or datasets are copied, translated or bundled.
+Characteristic identifiers and published mathematical definitions are used as
+metadata and specifications. The current Python project's code is MIT licensed;
+the authors' distributed data are CC BY-NC 4.0. This implementation uses only
+Tushare inputs and does not distribute the authors' data.
+
+Modifications include 21-trading-day months, quarterly TTM statement flows,
+actual first-announcement alignment, research-universe composites and explicit
+data-availability omissions. The 144 inherited `jkp153` definitions are retained.
+The advertised 406 count is reconciled as 404 explicitly named characteristics
+plus a two-name documentation/source discrepancy; 362 named characteristics are
+implemented and 42 are excluded with reasons. See the module and README for
+the exact adaptation and omissions.
+
 ## KunQuant 0.1.11
 
 RQuant's local Alpha101 and Alpha158 formula modules contain modified portions
