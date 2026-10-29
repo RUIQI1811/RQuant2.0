@@ -1,5 +1,14 @@
 # Third-party notices
 
+## China A-Share anomalies (published definitions)
+
+`china469_pit.py` independently implements the Cop, Cla and Claq definitions
+from Li, Liu, Liu and Wei, "Replicating and Digesting Anomalies in the Chinese
+A-Share Market", Management Science, https://doi.org/10.1287/mnsc.2023.4904,
+supplement A.4.18–20. No author code or CSMAR data is bundled. Tushare fields,
+point-in-time release handling, daily output and missing-prior-report fallback
+are project adaptations; cross-vendor numerical equivalence is not established.
+
 ## Jensen-Kelly-Pedersen extended characteristic definitions
 
 `src/rquant/factors/libraries/jkp406.py` and `jkp406_catalog.py` independently

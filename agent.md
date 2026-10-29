@@ -8,7 +8,7 @@ RQuant 是个人、非商业用途的 A 股日频研究框架：
 
 - Tushare 是唯一市场数据源；
 - Qlib 用于数据集、模型、记录器与组合回测；
-- KunQuant 用于编译和计算全部十三个公式因子集；oap_jq_cnc 从源因子集选列；
+- KunQuant 用于编译和计算全部十四个公式因子集；oap_jq_cnc 从源因子集选列；
   talib 将仓库内的 TA-Lib 0.8.1 C 函数编译到 KunQuant 图中，锁定的 `TA-Lib==0.8.2` 包用于对照测试；
 - 所有因子集的公式定义由本仓库维护；KunQuant 只提供公共算子、图优化、代码生成与运行时，
   不得重新依赖 `KunQuant.predefined.Alpha158/Alpha101`；
@@ -146,8 +146,8 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   `a101_101`，GTJA191 当前为 `gtja_001` 至 `gtja_191` 中除 `gtja_030` 外的 190 列，Alpha360 为
   `a360_001` 至 `a360_360` 的 360 列；不得暴露上游原始名称。Alpha360 是六组归一化 OHLC、VWAP 与成交量字段
   各取 60 个滞后期，不是 360 条手工设计信号；
-- 当前注册表共有 2060 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-  `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=364`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
+- 当前注册表共有 2063 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+  `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`china469_pit=3`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
   应注册一个新的、名称稳定的因子集；
 - `oap_jq_cnc` 是唯一的选择型因子集，成员锁定在 `src/rquant/factors/libraries/oap_jq_cnc.py`（当前 254 列）：oap、jq240、
   china_chars 的 484 个因子用同一个 sh_main 全期秩相关矩阵按 0.8 去重，同类里按覆盖率、再按因子库顺序留，不用收益信息；
@@ -192,6 +192,9 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   新增长/短债务发行用对应余额年度变化的官方回退定义；继承的 144 个定义保留已有分红近似等假设。
   指纹须含继承的 `jkp153` 源码和算子依赖，季度输出命名空间不得与 `jkp153` 冲突；上市日文件若已列入参考清单则须比对，
   旧清单兼容加载且构建始终记录实际读取的上市日文件哈希；
+- `china469_pit` 的 `cnax_001`–`cnax_003` 是 Cop、Cla、Claq 的 Tushare 形成时点改写；年度六月冻结、季度月初且报告期满四自然月并已公告。
+  必须使用完整且可审计的 SSE 交易日历，年度缺年清空、季度依赖缺报时回退旧合格季度；仅同名或相关列不能当作等价。
+  与 CSMAR 的财报字段逐值一致性、形成日后下一开盘执行的差异，以及新增列的真实数据覆盖都应保留为限制。
 - `gtja_030` 虽保留完整公式实现，但在获得可审计的逐日 `mkt`、`smb`、`hml` 风格收益前必须排除在
   `gtja191` 构建目录外；不得用常数、横截面均值或未来数据伪造这些输入；
 - `gtja_075`、`gtja_149`、`gtja_181`、`gtja_182` 依赖 `data/canonical/reference/index_daily.parquet`
@@ -241,8 +244,8 @@ python -m ruff check src tests
 python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
 ```
 
-当前预期为唯一目录（unique catalog）`2060`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`oap_jq_cnc=254`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+当前预期为唯一目录（unique catalog）`2063`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+`qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`china469_pit=3`、`oap_jq_cnc=254`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：

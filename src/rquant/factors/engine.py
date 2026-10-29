@@ -388,7 +388,7 @@ class KunQuantFactorEngine:
         self, inputs: dict[str, Any], dates: Any, instruments: Any, modules: dict[str, Any] | None = None
     ) -> StatementResults:
         """Run every library's statement graph over its first-reported statements in ``inputs["fundamentals"]``."""
-        from rquant.factors.statements import QuarterGrid, StatementResults
+        from rquant.factors.statements import StatementResults
 
         results = StatementResults()
         if not self.statement_libraries:
@@ -407,7 +407,7 @@ class KunQuantFactorEngine:
         executor = kr.createMultiThreadExecutor(self.config.workers)
         dates, instruments = pd.DatetimeIndex(dates), pd.Index(instruments)
         for library in self.statement_libraries:
-            grid = QuarterGrid(library.prepare_statements(inputs["fundamentals"]), dates, instruments)
+            grid = library.make_statement_grid(inputs, dates, instruments)
             module = modules[library.family]
             pad = (-len(instruments)) % int(module.blocking_len)
             arrays = {

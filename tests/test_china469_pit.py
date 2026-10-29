@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import tempfile
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from rquant.errors import DataContractError
+from rquant.factors.catalog import get_catalog
+from rquant.factors.engine import FactorBuildConfig, KunQuantFactorEngine
+from rquant.io import atomic_write_json, sha256_file, stable_hash
+
+
+@pytest.fixture(scope="module")
+def tiny_engine():
+    with tempfile.TemporaryDirectory(prefix="c469-", ignore_cleanup_errors=True) as directory:
+        yield KunQuantFactorEngine(directory, FactorBuildConfig(factor_set="china469_pit", universe="all", workers=1))
+
+
+def test_registered_three_source_timing_factors() -> None:
+    catalog = get_catalog()
+    specs = catalog.select("china469_pit")
+    assert [(s.canonical_name, s.source_name) for s in specs] == [
+        ("cnax_001", "Cop"), ("cnax_002", "Cla"), ("cnax_003", "Claq")
+    ]
+
+
+def test_reference_loader_pins_and_checks_calendar_and_fundamentals(tmp_path) -> None:
+    from rquant.factors.libraries.china469_pit import load_reference
+
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    fundamentals = pd.DataFrame({
+        "instrument": ["S1"], "end_date": ["2023-12-31"], "ann_date": ["2024-04-01"],
+        "total_assets": [10.], "operate_profit": [3.], "n_income": [2.], "n_cashflow_act": [1.],
+    })
+    fundamentals.to_parquet(reference / "fundamentals.parquet", index=False)
+    days = pd.date_range("2024-05-01", "2024-08-10")
+    calendar = pd.DataFrame({"exchange": "SSE", "cal_date": days.strftime("%Y%m%d"),
+                             "is_open": (days.dayofweek < 5).astype(int)})
+    calendar.to_parquet(reference / "trade_cal.parquet", index=False)
+    atomic_write_json(tmp_path / "manifest.json", {"status": "complete", "raw_fingerprint": "raw"})
+    manifest = {"status": "complete", "raw_fingerprint": "raw", "files": {
+        "fundamentals.parquet": sha256_file(reference / "fundamentals.parquet"),
+        "trade_cal.parquet": sha256_file(reference / "trade_cal.parquet"),
+    }}
+    manifest["fingerprint"] = stable_hash(manifest)
+    atomic_write_json(reference / "manifest.json", manifest)
+    loaded, hashes = load_reference(tmp_path, pd.bdate_range("2024-05-01", "2024-07-31"), ["S1"])
+    assert len(loaded["fundamentals"]) == 1
+    assert hashes["china469_trade_calendar"] == sha256_file(reference / "trade_cal.parquet")
+    calendar[calendar.cal_date <= "20240630"].to_parquet(reference / "trade_cal.parquet", index=False)
+    with pytest.raises(DataContractError, match="differs"):
+        load_reference(tmp_path, pd.bdate_range("2024-05-01", "2024-07-31"), ["S1"])
+    manifest["files"]["trade_cal.parquet"] = sha256_file(reference / "trade_cal.parquet")
+    manifest.pop("fingerprint")
+    manifest["fingerprint"] = stable_hash(manifest)
+    atomic_write_json(reference / "manifest.json", manifest)
+    with pytest.raises(DataContractError, match="next-month open"):
+        load_reference(tmp_path, pd.bdate_range("2024-05-01", "2024-06-28"), ["S1"])
+
+
+def test_legacy_calendar_is_checked_against_hashed_raw_tushare_partition(tmp_path) -> None:
+    from rquant.factors.libraries.china469_pit import load_reference
+
+    canonical, raw = tmp_path / "canonical", tmp_path / "raw"
+    reference, partition = canonical / "reference", raw / "trade_cal" / "range=fixture"
+    reference.mkdir(parents=True)
+    partition.mkdir(parents=True)
+    records = pd.DataFrame({"instrument": ["S1"], "end_date": ["2023-12-31"], "ann_date": ["2024-04-01"],
+                            "total_assets": [1.], "operate_profit": [1.], "n_income": [1.], "n_cashflow_act": [1.]})
+    records.to_parquet(reference / "fundamentals.parquet", index=False)
+    days = pd.date_range("2024-04-01", "2024-06-30")
+    calendar = pd.DataFrame({"exchange": "SSE", "cal_date": days.strftime("%Y%m%d"),
+                             "is_open": (days.dayofweek < 5).astype(int)})
+    calendar.loc[calendar.cal_date.eq("20240501"), "is_open"] = 0
+    calendar.to_parquet(partition / "data.parquet", index=False)
+    calendar.to_parquet(reference / "trade_cal.parquet", index=False)
+    atomic_write_json(partition / "manifest.json", {"status": "complete", "endpoint": "trade_cal",
+                                                    "sha256": sha256_file(partition / "data.parquet")})
+    atomic_write_json(raw / "sync_manifest.json", {"status": "complete", "fingerprint": "raw"})
+    atomic_write_json(canonical / "manifest.json", {"status": "complete", "raw_fingerprint": "raw"})
+    manifest = {"status": "complete", "raw_fingerprint": "raw",
+                "files": {"fundamentals.parquet": sha256_file(reference / "fundamentals.parquet")}}
+    manifest["fingerprint"] = stable_hash(manifest)
+    atomic_write_json(reference / "manifest.json", manifest)
+    output = pd.DatetimeIndex(["2024-05-02"])
+    load_reference(canonical, output, ["S1"])
+    calendar.loc[calendar.cal_date.eq("20240501"), "is_open"] = 1
+    calendar.to_parquet(reference / "trade_cal.parquet", index=False)
+    with pytest.raises(DataContractError, match="raw trade calendar"):
+        load_reference(canonical, output, ["S1"])
+
+
+def test_statement_graph_matches_hand_calculation_and_frozen_formation(tiny_engine) -> None:
+    frame = pd.DataFrame([
+        ("S1", "2021-12-31", "2022-04-01", 100., 20., 10., 20.),
+        ("S1", "2022-12-31", "2023-04-01", 200., 40., 20., 30.),
+        ("S1", "2023-09-30", "2023-10-20", 220., 30., 9., 15.),
+        ("S1", "2023-12-31", "2024-04-10", 240., 50., 15., 30.),
+        ("S1", "2024-03-31", "2024-05-10", 250., 12., 4., 6.),
+        ("S2", "2022-12-31", "2023-04-01", 150., 30., 15., 15.),
+        ("S2", "2023-12-31", "2024-07-01", 180., 35., 15., 20.),
+    ], columns=["instrument", "end_date", "ann_date", "total_assets", "operate_profit", "n_income", "n_cashflow_act"])
+    frame["end_date"] = pd.to_datetime(frame.end_date)
+    frame["ann_date"] = pd.to_datetime(frame.ann_date)
+    calendar = pd.bdate_range("2020-01-01", "2025-12-31")
+    dates = calendar[(calendar >= "2023-01-01") & (calendar <= "2025-01-31")]
+    instruments = pd.Index(["S1", "S2"])
+    engine = tiny_engine
+    modules = engine.compile_statements()
+    results = engine.run_statements({"fundamentals": frame, "formation_calendar": calendar},
+                                    dates, instruments, modules)
+    cop = pd.DataFrame(results.daily("y_cnax_cop"), index=dates, columns=instruments)
+    cla = pd.DataFrame(results.daily("y_cnax_cla"), index=dates, columns=instruments)
+    claq = pd.DataFrame(results.daily("q_cnax_claq"), index=dates, columns=instruments)
+    assert np.isclose(cop.loc["2023-06-30", "S1"], 50 / 200)
+    assert np.isclose(cla.loc["2023-06-30", "S1"], 50 / 100)
+    assert np.isclose(cop.loc["2023-06-30", "S2"], 30 / 150)
+    assert pd.isna(cla.loc["2023-06-30", "S2"])
+    assert pd.isna(cop.loc["2024-06-28", "S2"])
+    assert pd.isna(cop.loc["2024-07-02", "S2"])
+    assert np.isclose(claq.loc["2024-05-01", "S1"], (20 - 6 + 15) / 220)
+    assert np.isclose(claq.loc["2024-08-01", "S1"], (12 - 4 + 6) / 240)
+    for cutoff in ("2023-06-29", "2023-06-30", "2024-05-01", "2024-06-28", "2024-08-01"):
+        prefix = dates[dates <= cutoff]
+        short_frame = frame[frame.ann_date <= pd.Timestamp(cutoff)]
+        shortened = engine.run_statements(
+            {"fundamentals": short_frame, "formation_calendar": calendar}, prefix, instruments, modules
+        )
+        for name in ("y_cnax_cop", "y_cnax_cla", "q_cnax_claq"):
+            expected = results.daily(name)[:len(prefix)]
+            actual = shortened.daily(name)
+            np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+            np.testing.assert_allclose(actual, expected, equal_nan=True)
+
+
+def test_real_engine_path_builds_three_factors_from_small_canonical_fixture(tmp_path, tiny_engine) -> None:
+    canonical, reference = tmp_path / "canonical", tmp_path / "canonical" / "reference"
+    reference.mkdir(parents=True)
+    dates = pd.bdate_range("2024-05-01", "2024-07-31")
+    path = canonical / "bars" / "year=2024"
+    path.mkdir(parents=True)
+    bars = pd.DataFrame({"datetime": dates, "instrument": "SH600000", "close": 10.})
+    bars.loc[bars.datetime.eq(pd.Timestamp("2024-07-01")), "close"] = np.inf
+    bars.to_parquet(path / "bars.parquet", index=False)
+    frame = pd.DataFrame([
+        ("SH600000", "2022-12-31", "2023-04-01", 200., 40., 20., 30.),
+        ("SH600000", "2023-09-30", "2023-10-20", 220., 30., 9., 15.),
+        ("SH600000", "2023-12-31", "2024-04-10", 240., 50., 15., 30.),
+    ], columns=["instrument", "end_date", "ann_date", "total_assets", "operate_profit", "n_income", "n_cashflow_act"])
+    frame.to_parquet(reference / "fundamentals.parquet", index=False)
+    days = pd.date_range("2020-01-01", "2025-12-31")
+    pd.DataFrame({"exchange": "SSE", "cal_date": days.strftime("%Y%m%d"),
+                  "is_open": (days.dayofweek < 5).astype(int)}).to_parquet(reference / "trade_cal.parquet", index=False)
+    atomic_write_json(canonical / "manifest.json", {"status": "complete", "raw_fingerprint": "raw"})
+    manifest = {"status": "complete", "raw_fingerprint": "raw",
+                "files": {"fundamentals.parquet": sha256_file(reference / "fundamentals.parquet"),
+                          "trade_cal.parquet": sha256_file(reference / "trade_cal.parquet")}}
+    manifest["fingerprint"] = stable_hash(manifest)
+    atomic_write_json(reference / "manifest.json", manifest)
+    result = tiny_engine.build_from_canonical(canonical, tmp_path / "factors")
+    assert result["columns"] == 3
+    values = pd.read_parquet(tmp_path / "factors" / "china469_pit" / "year=2024" / "factors.parquet")
+    june = values.set_index("datetime").loc["2024-06-28"]
+    assert np.isclose(june["cnax_001"], 65 / 240)
+    assert np.isclose(june["cnax_002"], 65 / 200)
+    assert np.isclose(june["cnax_003"], 29 / 220)
+    invalid_quote = values.set_index("datetime").loc["2024-07-01"]
+    assert invalid_quote[["cnax_001", "cnax_002", "cnax_003"]].isna().all()
