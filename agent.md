@@ -111,6 +111,7 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
 - 路径必须经项目根目录解析，运行数据不得逃出项目根目录；
 - 写入清单和关键产物应保持原子性；失败必须留下明确的 `failed` 状态与异常信息；
 - 保留配置、数据、因子、编译和运行指纹，任何会改变结果的参数都必须进入可审计输入；
+- 新增因子集的完整步骤、模板、测试要求与交接命令见 `docs/adding-factor-sets.md`；
 - 新增因子库应实现 `FactorLibrary` 或 `PanelFactorLibrary`，并只通过
   `src/rquant/factors/libraries/registry.py` 注册；CLI 的 `--factor-set` 选项、目录和执行后端应由注册表派生，
   不要在 CLI、加载器和引擎中重复硬编码新名称；
