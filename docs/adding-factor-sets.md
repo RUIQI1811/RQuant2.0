@@ -77,7 +77,7 @@ Windows 机器上跑，你只负责把命令写清楚。
 
 **新增财报字段**：在 `FUNDAMENTAL_ENDPOINT_FIELDS` 对应报表里追加，并像现有代码一样加注释
 `# <name> (...) items.`；只追加，不删、不改已有字段。代价是用户要重新 `data sync-fundamentals` 与
-`data build-reference`，并重建所有读财报的因子集（`china_chars`、`jq240`、`oap`、`barra_cne6`、`jkp153`，
+`data build-reference`，并重建所有读财报的因子集（`china_chars`、`jq240`、`oap`、`barra_cne6`、`jkp153`、`jkp406`，
 以及 sh_main 上的 `oap_jq_cnc`）。能不加就不加；加了必须在 PR 描述里写明。
 
 **新增 Tushare 接口**（例如分析师预期、北向持股、龙虎榜）：需要改采集器、契约和账户积分，属于大改动。默认不做，
@@ -86,7 +86,7 @@ Windows 机器上跑，你只负责把命令写清楚。
 ## 5. 实现步骤清单
 
 以下 `<name>` 是因子集名（小写蛇形，如 `xyz123`），`<prefix>` 是列名前缀。已占用的前缀：`a158_ a101_ gtja_ a360_
-cnc_ svc_ ta_ jq_ oap_ cne6_ tst_ jkp_`，新前缀不能和它们冲突。
+cnc_ svc_ ta_ jq_ oap_ cne6_ tst_ jkp_ jkpx_`，新前缀不能和它们冲突。
 
 1. **因子库模块** `src/rquant/factors/libraries/<name>.py`：
    - 模块 docstring：来源、版本/日期、独立重写声明、日频改造规则、与原定义的差异；
@@ -99,14 +99,14 @@ cnc_ svc_ ta_ jq_ oap_ cne6_ tst_ jkp_`，新前缀不能和它们冲突。
      catalog_version=1)`，列名从 001 连续编号；
    - `build(inputs)` 返回 `{source_name: KunQuant 表达式}`，键必须覆盖全部 `specs`（由 `statement_factors` 直接发布的除外）。
 2. **注册**：在 `registry.py` 的 `_default_registry()` 里 import 并 `registry.register_library(<Name>Library())`，
-   放在 `JKP153Library()` 之后、`register_factor_selection(OAP_JQ_CNC_SELECTION)` 之前。CLI 的 `--factor-set`
+   放在 `JKP406Library()` 之后、`register_factor_selection(OAP_JQ_CNC_SELECTION)` 之前。CLI 的 `--factor-set`
    选项、目录和引擎都由注册表派生，不要在别处硬编码新名字。
-3. **目录计数**：总数当前是 1696，新增 N 列后改成 1696+N。用 `grep -rn 1696 src tests agent.md README.md`
+3. **目录计数**：总数当前是 2060，新增 N 列后改成 2060+N。用 `rg -n 2060 src tests agent.md README.md`
    找全，目前在：`src/rquant/cli.py`（doctor 检查）、`tests/test_catalog.py`、`tests/test_cli.py`、
    `tests/test_china_chars.py`、`tests/test_jq240.py`、`tests/test_size_value_china.py`、
    `tests/test_talib_indicators.py`、`agent.md`、`README.md`。另外 `tests/test_factor_libraries.py` 的
    `test_default_registry_keeps_locked_factor_sets_and_input_contracts` 要把新名字加进 `factor_sets()` 元组
-   （在 `jkp153` 和 `oap_jq_cnc` 之间），并加一行它的 `required_inputs` 断言。
+   （在 `jkp406` 和 `oap_jq_cnc` 之间），并加一行它的 `required_inputs` 断言。
 4. **测试** `tests/test_<name>.py`：见第 6 节。
 5. **文档**：
    - `agent.md` 第 5 节加一条新因子集说明（列名范围、来源、读哪些数据、截面口径、回归测试文件），更新第 5、6 节
@@ -154,9 +154,9 @@ rquant factors catalog --factor-set <name>
 python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
 ```
 
-最后一条的输出应为总数 1696+N，且原有各因子集的列数不变：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+最后一条的输出应为总数 2060+N，且原有各因子集的列数不变：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
 `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、
-`tushare_tech=75`、`jkp153=144`、`oap_jq_cnc=254`。
+`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`oap_jq_cnc=254`。
 
 你没有 Tushare token，也没有本地数据，**不要**运行 `rquant data ...`、`rquant factors build/validate`、
 `rquant walk-forward`、`rquant report`，也不要在 PR 里声称真实数据构建或回测已经验证。
@@ -186,11 +186,11 @@ rquant --universe sh_main factors validate --factor-set <name>
 
 # 回测：sh_main、LightGBM、1 日标签，数据截止日与 jq240 基准一致
 rquant --universe sh_main walk-forward --model lgb --horizon 1d --factor-set <name> --through 2026-10-21
-# 默认组合：top 50，每 5 个交易日全量调仓（n_drop 50、rebalance_days 5）
+# 1d 默认组合：top 50，每日最多换出 5 只
 rquant --universe sh_main report <RUN_ID>
-# 每日换 5 只的口径：复制一份运行目录再跑，避免覆盖上一份回测
-Copy-Item -Recurse runs\walk-forward\<RUN_ID> runs\walk-forward\<RUN_ID>-daily5
-rquant --universe sh_main report <RUN_ID>-daily5 --n-drop 5 --rebalance-days 1
+# 5d 标签另行训练，默认每 5 个交易日调整到最新前 50 名
+rquant --universe sh_main walk-forward --model lgb --horizon 5d --factor-set <name> --through 2026-10-21
+rquant --universe sh_main report <RUN_ID_5D>
 ```
 
 说明：
@@ -207,7 +207,7 @@ jq240 是当前默认、也是表现最好的基础因子集，sh_main、LGB 1d�
 
 | 口径 | 2013–2026 Sharpe | 2020–2026 Sharpe | 2022 年以后 年化 / Sharpe / 最大回撤 |
 |---|---|---|---|
-| 每 5 天全换（默认） | 1.02 | 0.88 | 19.1% / 0.76 / -33.0% |
+| 每 5 天全换（历史 1d 标签运行） | 1.02 | 0.88 | 19.1% / 0.76 / -33.0% |
 | 每日换 5 只 | 1.26 | 1.11 | 28.8% / 1.03 / -35.5% |
 
 新因子集要报告同样的指标，外加预测 RankIC。基础因子库没有用收益挑过，2022 年以后是真正的样本外区间，

@@ -55,6 +55,26 @@ class RebalanceScheduleTests(unittest.TestCase):
 
 
 class ProcessorTests(unittest.TestCase):
+    def test_zscore_large_finite_values_keep_signal_and_use_only_fit_period(self) -> None:
+        dates = pd.date_range("2024-01-01", periods=3)
+        index = pd.MultiIndex.from_product([dates, range(100)], names=["datetime", "instrument"])
+        values = np.full((300, 2), 7.0, dtype=np.float32)
+        values[:200, 0] = np.tile(np.array([-3.6e18, 3.6e18], dtype=np.float32), 100)
+        values[0, 0] = np.nan
+        values[200:, 0] = 1e30  # Must not enter fitted statistics.
+        frame = pd.DataFrame(np.asfortranarray(values), index=index, columns=["ratio", "constant"], copy=False)
+        fit = values[:200, 0].astype(np.float64)
+        expected = ((values[:, 0].astype(np.float64) - np.nanmean(fit)) / np.nanstd(fit)).astype(np.float32)
+        processor = ZScoreNorm(fit_start_time=dates[0], fit_end_time=dates[1])
+        with np.errstate(over="raise"):
+            processor.fit(frame)
+            result = processor(frame)
+        self.assertTrue(np.isfinite(processor.std_train).all())
+        np.testing.assert_allclose(result["ratio"], expected, rtol=1e-6, equal_nan=True)
+        np.testing.assert_array_equal(result["constant"], values[:, 1])
+        self.assertEqual([np.dtype("float32")] * 2, list(result.dtypes))
+        self.assertEqual(1, len(result._mgr.blocks))
+
     def _panel(self) -> pd.DataFrame:
         dates = pd.bdate_range("2024-01-29", periods=6)
         instruments = ["SH600000", "SH600004", "SH600006", "SH600007"]

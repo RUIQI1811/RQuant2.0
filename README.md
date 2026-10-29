@@ -4,7 +4,7 @@ RQuant 是一个个人、非商业用途的 A 股日频量化研究框架，使�
 
 - Tushare 作为唯一市场数据源；
 - Qlib 管理数据集、模型、实验记录和组合回测；
-- KunQuant 编译并计算全部十二个公式因子集；oap_jq_cnc 从已构建的源因子集选列。
+- KunQuant 编译并计算全部十三个公式因子集；oap_jq_cnc 从已构建的源因子集选列。
 
 完整工作流概览
 
@@ -44,6 +44,7 @@ rquant factors build --factor-set oap
 rquant factors build --factor-set barra_cne6
 rquant factors build --factor-set tushare_tech        # 只用 OHLCV
 rquant factors build --factor-set jkp153
+rquant factors build --factor-set jkp406
 rquant factors evaluate --factor-set qlib_alpha158 \
   --horizon 1d --start 2010-01-01 --end 2026-08-04
   
@@ -119,8 +120,8 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 1696 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
-  barra_cne6、tushare_tech、jkp153）；
+- 2060 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
+  barra_cne6、tushare_tech、jkp153、jkp406）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
 
@@ -141,7 +142,7 @@ rquant doctor --skip-permission-check
 | `data.formal_start`              | `2010-01-01` | 正式研究起点                 |
 | `data.warmup_trading_days`       |        `300` | 正式研究前预热交易日数       |
 | `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
-| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）、`main`（沪深主板，见下文）、`sh_main`（沪市主板）或 `all` |
+| `data.universe`                  |     `sh_main` | 默认沪市主板（逐日剔除 ST、上市不足 60 个交易日）；也支持 `csi300`、`main` 或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `data.fundamentals_start_year`   |       `2004` | `data sync-fundamentals` 抓取财报的最早公告年份 |
@@ -156,6 +157,7 @@ rquant doctor --skip-permission-check
 | `backtest.topk`                  |         `50` | 目标持股数量                 |
 | `backtest.n_drop`                |         `50` | 每次调仓最多换出数量；等于 `topk` 时全量调整到最新前 `topk` 名 |
 | `backtest.rebalance_days`        |          `5` | 每隔多少个交易日调仓一次（从第一个预测日起算），其余交易日不下单 |
+| `backtest.by_horizon`            | 见下文 | 按训练标签覆盖公共组合参数；命令行参数优先 |
 | `backtest.impact_cost`           |        `0.0` | Qlib 二次冲击成本系数，按成交额占当日成交额比例的平方计费 |
 
 如需使用其他配置文件，所有命令都可以在主命令前指定：
@@ -367,6 +369,8 @@ rquant factors catalog --factor-set jq240 --format csv --output factor_catalog.c
   见下文“Tushare 技术因子集 tushare_tech”。
 - `jkp153`：`jkp_001` 至 `jkp_144`，共 144 列，Jensen-Kelly-Pedersen 153 个全球因子特征中能用 Tushare 构建的部分，
   见下文“JKP 因子集 jkp153”。
+- `jkp406`：`jkpx_001` 至 `jkpx_364`，共 364 列，JKP 扩展特征的 Tushare 日频版本，包含原 144 个定义及 220 个扩展定义；
+  可核实清单、40 个排除项和官方名称数量差异见下文。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -664,7 +668,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set talib
   均线、EMA、布林带、MACD 按聚宽口径除以收盘价，ATR 与多空力道也除以收盘价，`price_no_fq` 是 daily_basic 的不复权收盘价；
   成交量是标准数据的复权成交量，成交额为元，换手率为 daily_basic 的流通股换手率（%）；
 - 风格因子按聚宽文档的 Barra CNE5 描述子计算（beta 半衰期 63、RSTR 504 日滞后 21 日、DASTD/CMRA/HSIGMA 等），
-  截面标准化、排序和正交化只用当日的研究股票池成员（默认沪深 300），市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
+  截面标准化、排序和正交化只用当日的研究股票池成员（默认沪市主板），市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
 - 未实现：`non_recurring_gain_loss` 与 `adjusted_profit_to_total_profit`（需要 `fina_indicator` 的扣非净利润），
   以及风格因子中依赖分析师预期的 EPIBS、EGRLF、EGRSF（其权重按比例分给其余描述子）。
 
@@ -695,7 +699,7 @@ AnnouncementReturn）。
 - 市值为日度总市值；股利为 daily_basic 的 `dv_ttm` 乘总市值，过去 12 个月股利总额变化超过 5% 的日子视为一次派息变动，
   DivSeason/DivYieldST 以 11–12 个月前是否有变动判断下月是否派息；需要剔除送转的股数（ShareIss1Y/5Y、PS）用
   总股本 × 不复权价 / 复权价；
-- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日研究股票池成员（默认沪深 300），行业为申万一级；
+- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日研究股票池成员（默认沪市主板），行业为申万一级；
 - 美股样本过滤（股价低于 5 美元、交易所、股票代码、SIC 金融业剔除等）不再使用；定义本身的限制保留（FirmAgeMom 只取最年轻
   五分之一，MomVol 只取换手率最高三分之一）；美国特有常数换成 A 股口径（法定税率 2008 年前 33%、之后 25%；ShareVol
   用沪深 300 换手率三分位代替美股 5%/10% 阈值）。
@@ -789,6 +793,42 @@ rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 
 `barra_cne6`、`tushare_tech` 与 `jkp153` 与其他库一样在 KunQuant 中计算：财报公式在季度图中计算并按公告日发布，指数加权窗口、滚动回归、截面排名与标准化由逐股或逐日 C++ 算子完成，`tushare_tech` 的指标是逐股序列 C++ 内核；原 Pandas 实现保留在 `tests/panel_reference/` 中，测试逐列对齐。
 
+### JKP 扩展因子集 jkp406
+
+新增的 `jkp406` 独立注册，保留 `jkp153` 的 144 个定义、列名及历史结果契约。扩展库用 `jkpx_001` 至
+`jkpx_364` 编号；扩展 220 个定义主要覆盖财报增长、资产变化、盈利与偿债比率、营运周期、估值及长短期收益。
+全部通过 KunQuant 计算，不新增依赖、Tushare 接口或财报字段。已有参考数据若满足 `jkp153` 即可复用。
+上市日文件始终记录实际读取哈希；参考清单若包含该文件则额外比对，兼容旧参考清单未列入该文件的格式。
+
+清单锁定在 `src/rquant/factors/libraries/jkp406_catalog.py`，公式在 `jkp406.py`。
+来源为 [JKP 官方说明](https://jkpfactors-data.s3.amazonaws.com/documents/Documentation.pdf)及
+[官方源码版本 67174c7](https://github.com/bkelly-lab/ReplicationCrisis/tree/67174c7f170bf8b952b3c86876f187fd9970b5ba/GlobalFactors)，
+并与官方 Python 版本 `c1762b9` 交叉核对。官方文档称 406 项，但该版本的明确导出清单为 315 个财报特征、
+46 个月度市场特征、31 个日度市场特征、11 个组合特征，加上核心清单中的 `prc`，合计 404 个唯一名称。
+`SOURCE_COUNT_DISCREPANCY=2` 记录未能对应到名称的差异；没有用额外变量凑满 406。
+
+404 个具名项目中实现 364 个，另 40 个在 `JKP406_SKIPPED` 逐项记录原因，包括员工数、独立回购现金流、
+年度/短窗口/特殊分红、特殊和非常损益、广告和人工费用、HXZ 模型收益，以及超出现有历史起点的 16–20 年季节性。
+这些是当前数据接口的支持边界，单元测试不代表真实数据有完整覆盖或有预测收益。
+
+口径沿用 `jkp153`：一个月 21 个交易日、一年 252 个交易日；财报取首次披露值，按真实公告日及连续可用季度发布；
+年度流量用 TTM，年度滞后为四个季度；停牌日输出为空；截面排序使用引擎传入的当日研究股票池。
+新增的长/短债务发行分别使用官方允许的长/短债务余额年度变化回退口径，不能解释为直接披露的发行现金流。
+新增现金周转天数使用 365 个自然日和年初年末余额均值；`ivol_capm_60m` 用不重叠的 21 日收益估计，至少 36 个月有效值。
+新增 `rvolhl_21d` 在计算高低价波动率之前校正隔夜跳空；保留原 `bidaskhl_21d` 定义。
+继承的 144 个定义保留原有假设（包括 `dv_ttm` 分红近似及不单列回购），没有在这次扩展中重新定义。
+其中 `eqnetis_gr1a`（`jkpx_064`）与 `eqis_gr1a`（`jkpx_071`）当前均以发行现金流代理，数值相同；官方允许在
+回购项缺失时使用发行额，但本地缺独立回购数据时不能反映真实净发行，也不能把它们当作两条独立信息。
+11–15 年同月与其他月份季节性追加为 `jkpx_363`、`jkpx_364`，前 362 个列名不变；它们要求最长 3780 个交易日回看，
+本地历史后段才可能有值。新增列改变目录和实现指纹，旧版因子库、训练和回测保留为历史结果，需要新版本时重建。
+测试参考保存在 `tests/panel_reference/jkp406.py`，按列比较数值及 NaN 掩码，并验证截断重算、停牌和比率边界。
+
+```bash
+rquant factors catalog --factor-set jkp406
+rquant factors build --factor-set jkp406
+rquant factors validate --factor-set jkp406
+```
+
 ### 验证因子
 
 ```bash
@@ -837,7 +877,7 @@ annual_effectiveness.csv
 
 ### 用 RD-Agent 自动挖因子
 
-`rquant rdagent export` 把截至挖掘期末（默认 2021-12-31）的沪深 300 历史成分日线导出给微软 RD-Agent 的 `fin_factor`
+`rquant rdagent export` 把截至挖掘期末（默认 2021-12-31）的研究股票池日线（默认沪市主板）导出给微软 RD-Agent 的 `fin_factor`
 循环，并附带把它的回测改成次日开盘口径的准备脚本。RD-Agent 用自己 test 段的结果挑因子，所以挖掘期之后的年份
 只留给 walk-forward 做样本外检验。RD-Agent 只支持 Linux，需要在 WSL2 里单独安装，并准备 LLM API key；完整步骤见
 [docs/rdagent.md](docs/rdagent.md)。
@@ -930,7 +970,8 @@ rquant report RUN_ID
 报告命令使用该运行的样本外预测执行 A 股约束下的 long-only TopkDropout 回测：
 
 - 初始资金 100 万元；
-- 目标持股 50 只，每 5 个交易日调仓一次：按调仓日的最新预测把持仓换成前 50 名，其余交易日不交易；
+- 默认研究股票池为沪市主板 `sh_main`，逐日剔除 ST 和上市不足 60 个交易日的股票；报告沿用训练时的股票池；
+- 目标持股 50 只，按训练清单中的标签自动选择调仓方式：`5d` 每 5 个交易日调整到最新前 50 名；`1d` 每日最多换出 5 只、补入排名靠前的股票；
   调仓日未能卖出的持仓（停牌、开盘跌停）保留到下一次调仓；
 - 等权、多头；
 - 信号后的下一可用开盘成交；
@@ -941,7 +982,10 @@ rquant report RUN_ID
 - 佣金、最低佣金、印花税和可选的冲击成本（`backtest.impact_cost`）来自 `config/default.yaml`；
 - 最后一个可用开盘尝试在相同约束下清仓，无法卖出的证券会明确保留在清单中。
 
-组合参数可以在命令行临时覆盖配置，例如复现旧的每日最多换 5 只：
+`report RUN_ID` 自动读取该运行 `walk_forward.json` 中的 `horizon`，应用 `backtest.by_horizon` 对应方案。
+优先级为命令行参数 > 标签方案 > 公共 `backtest` 配置；旧配置没有 `by_horizon` 时保持原参数。
+更改默认配置不会重写已有报告，也不会把旧的沪深 300 预测变成沪市主板预测。
+组合参数仍可在命令行临时覆盖，例如：
 
 ```bash
 rquant report RUN_ID --n-drop 5 --rebalance-days 1
