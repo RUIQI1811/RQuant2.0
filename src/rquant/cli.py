@@ -629,11 +629,16 @@ def _report(args: argparse.Namespace) -> int:
         predictions_path = run_directory / "predictions.parquet"
         if not predictions_path.exists():
             raise DataContractError(f"Predictions do not exist: {predictions_path}")
-        backtest = config.get("backtest", {})
+        backtest = dict(config.get("backtest", {}))
+        workflow_path = run_directory / "walk_forward.json"
+        if workflow_path.exists():
+            with workflow_path.open("r", encoding="utf-8") as handle:
+                horizon = json.load(handle).get("horizon")
+            backtest.update(backtest.get("by_horizon", {}).get(horizon, {}))
         portfolio_config = PortfolioConfig(
             initial_capital=float(backtest.get("initial_capital", 1_000_000)),
-            topk=args.topk or int(backtest.get("topk", 50)),
-            n_drop=args.n_drop or int(backtest.get("n_drop", 5)),
+            topk=args.topk if args.topk is not None else int(backtest.get("topk", 50)),
+            n_drop=args.n_drop if args.n_drop is not None else int(backtest.get("n_drop", 5)),
             benchmark=str(config.get("data", {}).get("benchmark", "SH000300")),
             trade_unit=int(backtest.get("trade_unit", 100)),
             commission_rate=float(backtest.get("commission_rate", 0.0003)),
@@ -642,7 +647,9 @@ def _report(args: argparse.Namespace) -> int:
             stamp_tax_after=float(backtest.get("stamp_tax_from_2023_08_28", 0.0005)),
             impact_cost=float(backtest.get("impact_cost", 0.0)),
             universe=_walk_forward_universe(run_directory, config),
-            rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
+            rebalance_days=(
+                args.rebalance_days if args.rebalance_days is not None else int(backtest.get("rebalance_days", 1))
+            ),
         )
         run.add_input("walk_forward_run_id", args.run_id)
         run.add_input("walk_forward_run_directory", str(run_directory))

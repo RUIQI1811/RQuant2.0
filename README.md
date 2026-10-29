@@ -141,7 +141,7 @@ rquant doctor --skip-permission-check
 | `data.formal_start`              | `2010-01-01` | 正式研究起点                 |
 | `data.warmup_trading_days`       |        `300` | 正式研究前预热交易日数       |
 | `data.through`                   |         `null` | `data sync` 与 `walk-forward` 未传 `--through` 时使用的截止日 |
-| `data.universe`                  |     `csi300` | 研究股票池：`csi300`（历史时点沪深 300）、`main`（沪深主板，见下文）、`sh_main`（沪市主板）或 `all` |
+| `data.universe`                  |     `sh_main` | 默认沪市主板（逐日剔除 ST、上市不足 60 个交易日）；也支持 `csi300`、`main` 或 `all` |
 | `data.max_requests_per_minute`   |        `190` | 所有请求及重试共享的分钟限速 |
 | `data.sync_workers`              |          `8` | 逐日分区并发请求线程数，用于掩盖网络延迟；总速率仍受上面的限速约束 |
 | `data.fundamentals_start_year`   |       `2004` | `data sync-fundamentals` 抓取财报的最早公告年份 |
@@ -156,6 +156,7 @@ rquant doctor --skip-permission-check
 | `backtest.topk`                  |         `50` | 目标持股数量                 |
 | `backtest.n_drop`                |         `50` | 每次调仓最多换出数量；等于 `topk` 时全量调整到最新前 `topk` 名 |
 | `backtest.rebalance_days`        |          `5` | 每隔多少个交易日调仓一次（从第一个预测日起算），其余交易日不下单 |
+| `backtest.by_horizon`            | 见下文 | 按训练标签覆盖公共组合参数；命令行参数优先 |
 | `backtest.impact_cost`           |        `0.0` | Qlib 二次冲击成本系数，按成交额占当日成交额比例的平方计费 |
 
 如需使用其他配置文件，所有命令都可以在主命令前指定：
@@ -664,7 +665,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set talib
   均线、EMA、布林带、MACD 按聚宽口径除以收盘价，ATR 与多空力道也除以收盘价，`price_no_fq` 是 daily_basic 的不复权收盘价；
   成交量是标准数据的复权成交量，成交额为元，换手率为 daily_basic 的流通股换手率（%）；
 - 风格因子按聚宽文档的 Barra CNE5 描述子计算（beta 半衰期 63、RSTR 504 日滞后 21 日、DASTD/CMRA/HSIGMA 等），
-  截面标准化、排序和正交化只用当日的研究股票池成员（默认沪深 300），市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
+  截面标准化、排序和正交化只用当日的研究股票池成员（默认沪市主板），市场收益为参考数据中的全 A 市值加权收益；缺失的描述子按权重比例分摊；
 - 未实现：`non_recurring_gain_loss` 与 `adjusted_profit_to_total_profit`（需要 `fina_indicator` 的扣非净利润），
   以及风格因子中依赖分析师预期的 EPIBS、EGRLF、EGRSF（其权重按比例分给其余描述子）。
 
@@ -695,7 +696,7 @@ AnnouncementReturn）。
 - 市值为日度总市值；股利为 daily_basic 的 `dv_ttm` 乘总市值，过去 12 个月股利总额变化超过 5% 的日子视为一次派息变动，
   DivSeason/DivYieldST 以 11–12 个月前是否有变动判断下月是否派息；需要剔除送转的股数（ShareIss1Y/5Y、PS）用
   总股本 × 不复权价 / 复权价；
-- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日研究股票池成员（默认沪深 300），行业为申万一级；
+- 截面步骤（五分位标记、行业均值/中位数、截面回归、Herfindahl）只用当日研究股票池成员（默认沪市主板），行业为申万一级；
 - 美股样本过滤（股价低于 5 美元、交易所、股票代码、SIC 金融业剔除等）不再使用；定义本身的限制保留（FirmAgeMom 只取最年轻
   五分之一，MomVol 只取换手率最高三分之一）；美国特有常数换成 A 股口径（法定税率 2008 年前 33%、之后 25%；ShareVol
   用沪深 300 换手率三分位代替美股 5%/10% 阈值）。
@@ -837,7 +838,7 @@ annual_effectiveness.csv
 
 ### 用 RD-Agent 自动挖因子
 
-`rquant rdagent export` 把截至挖掘期末（默认 2021-12-31）的沪深 300 历史成分日线导出给微软 RD-Agent 的 `fin_factor`
+`rquant rdagent export` 把截至挖掘期末（默认 2021-12-31）的研究股票池日线（默认沪市主板）导出给微软 RD-Agent 的 `fin_factor`
 循环，并附带把它的回测改成次日开盘口径的准备脚本。RD-Agent 用自己 test 段的结果挑因子，所以挖掘期之后的年份
 只留给 walk-forward 做样本外检验。RD-Agent 只支持 Linux，需要在 WSL2 里单独安装，并准备 LLM API key；完整步骤见
 [docs/rdagent.md](docs/rdagent.md)。
@@ -930,7 +931,8 @@ rquant report RUN_ID
 报告命令使用该运行的样本外预测执行 A 股约束下的 long-only TopkDropout 回测：
 
 - 初始资金 100 万元；
-- 目标持股 50 只，每 5 个交易日调仓一次：按调仓日的最新预测把持仓换成前 50 名，其余交易日不交易；
+- 默认研究股票池为沪市主板 `sh_main`，逐日剔除 ST 和上市不足 60 个交易日的股票；报告沿用训练时的股票池；
+- 目标持股 50 只，按训练清单中的标签自动选择调仓方式：`5d` 每 5 个交易日调整到最新前 50 名；`1d` 每日最多换出 5 只、补入排名靠前的股票；
   调仓日未能卖出的持仓（停牌、开盘跌停）保留到下一次调仓；
 - 等权、多头；
 - 信号后的下一可用开盘成交；
@@ -941,7 +943,10 @@ rquant report RUN_ID
 - 佣金、最低佣金、印花税和可选的冲击成本（`backtest.impact_cost`）来自 `config/default.yaml`；
 - 最后一个可用开盘尝试在相同约束下清仓，无法卖出的证券会明确保留在清单中。
 
-组合参数可以在命令行临时覆盖配置，例如复现旧的每日最多换 5 只：
+`report RUN_ID` 自动读取该运行 `walk_forward.json` 中的 `horizon`，应用 `backtest.by_horizon` 对应方案。
+优先级为命令行参数 > 标签方案 > 公共 `backtest` 配置；旧配置没有 `by_horizon` 时保持原参数。
+更改默认配置不会重写已有报告，也不会把旧的沪深 300 预测变成沪市主板预测。
+组合参数仍可在命令行临时覆盖，例如：
 
 ```bash
 rquant report RUN_ID --n-drop 5 --rebalance-days 1
