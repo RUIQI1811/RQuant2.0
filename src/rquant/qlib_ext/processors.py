@@ -50,6 +50,7 @@ class ZScoreNorm(_QlibProcessorBase):
     """Qlib's ``ZScoreNorm`` (all columns, statistics from the fit period) computed a few columns at a time in place.
 
     Qlib's version materialises full-size temporaries of the panel to fit and again to transform.
+    Fit statistics use float64 to avoid overflow on large finite ratios; the panel retains its original dtype.
     """
 
     def __init__(self, fit_start_time: Any, fit_end_time: Any) -> None:
@@ -63,7 +64,9 @@ class ZScoreNorm(_QlibProcessorBase):
         rows = (dates >= self.fit_start_time) & (dates <= self.fit_end_time)
         means, stds = [], []
         for chunk in _column_chunks(df.shape[1]):
-            values = df.iloc[rows, chunk].to_numpy()
+            # Large finite accounting ratios can overflow float32 squared deviations or their sum.
+            # Widen only this bounded chunk; fitted statistics remain training-only and the panel stays float32.
+            values = df.iloc[rows, chunk].to_numpy(dtype=np.float64)
             means.append(np.nanmean(values, axis=0))
             stds.append(np.nanstd(values, axis=0))
         self.mean_train = np.concatenate(means)
@@ -75,7 +78,9 @@ class ZScoreNorm(_QlibProcessorBase):
 
     def __call__(self, df: Any) -> Any:
         for chunk in _column_chunks(df.shape[1]):
-            df.iloc[:, chunk] = (df.iloc[:, chunk].to_numpy() - self.mean_train[chunk]) / self.std_train[chunk]
+            values = df.iloc[:, chunk].to_numpy()
+            normalized = (values - self.mean_train[chunk]) / self.std_train[chunk]
+            df.iloc[:, chunk] = normalized.astype(values.dtype, copy=False)
         return df
 
 
