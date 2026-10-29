@@ -120,7 +120,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 2058 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
+- 2060 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
   barra_cne6、tushare_tech、jkp153、jkp406）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
@@ -369,8 +369,8 @@ rquant factors catalog --factor-set jq240 --format csv --output factor_catalog.c
   见下文“Tushare 技术因子集 tushare_tech”。
 - `jkp153`：`jkp_001` 至 `jkp_144`，共 144 列，Jensen-Kelly-Pedersen 153 个全球因子特征中能用 Tushare 构建的部分，
   见下文“JKP 因子集 jkp153”。
-- `jkp406`：`jkpx_001` 至 `jkpx_362`，共 362 列，JKP 扩展特征的 Tushare 日频版本，包含原 144 个定义及 218 个新增定义；
-  可核实清单、42 个排除项和官方名称数量差异见下文。
+- `jkp406`：`jkpx_001` 至 `jkpx_364`，共 364 列，JKP 扩展特征的 Tushare 日频版本，包含原 144 个定义及 220 个扩展定义；
+  可核实清单、40 个排除项和官方名称数量差异见下文。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -796,7 +796,7 @@ rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 ### JKP 扩展因子集 jkp406
 
 新增的 `jkp406` 独立注册，保留 `jkp153` 的 144 个定义、列名及历史结果契约。扩展库用 `jkpx_001` 至
-`jkpx_362` 编号；新增 218 个定义主要覆盖财报增长、资产变化、盈利与偿债比率、营运周期、估值及长短期收益。
+`jkpx_364` 编号；扩展 220 个定义主要覆盖财报增长、资产变化、盈利与偿债比率、营运周期、估值及长短期收益。
 全部通过 KunQuant 计算，不新增依赖、Tushare 接口或财报字段。已有参考数据若满足 `jkp153` 即可复用。
 上市日文件始终记录实际读取哈希；参考清单若包含该文件则额外比对，兼容旧参考清单未列入该文件的格式。
 
@@ -807,8 +807,8 @@ rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 46 个月度市场特征、31 个日度市场特征、11 个组合特征，加上核心清单中的 `prc`，合计 404 个唯一名称。
 `SOURCE_COUNT_DISCREPANCY=2` 记录未能对应到名称的差异；没有用额外变量凑满 406。
 
-404 个具名项目中实现 362 个，另 42 个在 `JKP406_SKIPPED` 逐项记录原因，包括员工数、独立回购现金流、
-年度/短窗口/特殊分红、特殊和非常损益、广告和人工费用、HXZ 模型收益，以及超出现有历史起点的 15–20 年季节性。
+404 个具名项目中实现 364 个，另 40 个在 `JKP406_SKIPPED` 逐项记录原因，包括员工数、独立回购现金流、
+年度/短窗口/特殊分红、特殊和非常损益、广告和人工费用、HXZ 模型收益，以及超出现有历史起点的 16–20 年季节性。
 这些是当前数据接口的支持边界，单元测试不代表真实数据有完整覆盖或有预测收益。
 
 口径沿用 `jkp153`：一个月 21 个交易日、一年 252 个交易日；财报取首次披露值，按真实公告日及连续可用季度发布；
@@ -817,6 +817,10 @@ rquant walk-forward --model lgb --horizon 1d --factor-set jkp153
 新增现金周转天数使用 365 个自然日和年初年末余额均值；`ivol_capm_60m` 用不重叠的 21 日收益估计，至少 36 个月有效值。
 新增 `rvolhl_21d` 在计算高低价波动率之前校正隔夜跳空；保留原 `bidaskhl_21d` 定义。
 继承的 144 个定义保留原有假设（包括 `dv_ttm` 分红近似及不单列回购），没有在这次扩展中重新定义。
+其中 `eqnetis_gr1a`（`jkpx_064`）与 `eqis_gr1a`（`jkpx_071`）当前均以发行现金流代理，数值相同；官方允许在
+回购项缺失时使用发行额，但本地缺独立回购数据时不能反映真实净发行，也不能把它们当作两条独立信息。
+11–15 年同月与其他月份季节性追加为 `jkpx_363`、`jkpx_364`，前 362 个列名不变；它们要求最长 3780 个交易日回看，
+本地历史后段才可能有值。新增列改变目录和实现指纹，旧版因子库、训练和回测保留为历史结果，需要新版本时重建。
 测试参考保存在 `tests/panel_reference/jkp406.py`，按列比较数值及 NaN 掩码，并验证截断重算、停牌和比率边界。
 
 ```bash

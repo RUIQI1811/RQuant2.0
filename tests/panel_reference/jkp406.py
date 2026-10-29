@@ -73,6 +73,10 @@ class JKP406Chars(JKPChars):
         return replace_inf(value.astype(float)).where(self.trading)
 
     def extended(self, name):
+        if name in {"seas_11_15an", "seas_11_15na"}:
+            annual, other = self._seasonality(11, 15)
+            value = annual if name.endswith("an") else np.where(np.isfinite(annual), other, np.nan)
+            return np.where(np.isfinite(self.price.shift(15 * 252)), value, np.nan)
         raw = {"assets": "at", "sales": "sale", "book_equity": "be", "net_income": "ni"}
         if name in raw:
             return self._q(self.x(raw[name]))

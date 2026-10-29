@@ -146,8 +146,8 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   `a101_101`，GTJA191 当前为 `gtja_001` 至 `gtja_191` 中除 `gtja_030` 外的 190 列，Alpha360 为
   `a360_001` 至 `a360_360` 的 360 列；不得暴露上游原始名称。Alpha360 是六组归一化 OHLC、VWAP 与成交量字段
   各取 60 个滞后期，不是 360 条手工设计信号；
-- 当前注册表共有 2058 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-  `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=362`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
+- 当前注册表共有 2060 个可构建因子：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+  `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=364`。原先拼接 Alpha158 与 Alpha101 的 `combined` 因子集已按用户要求移除；若要组合多个库，
   应注册一个新的、名称稳定的因子集；
 - `oap_jq_cnc` 是唯一的选择型因子集，成员锁定在 `src/rquant/factors/libraries/oap_jq_cnc.py`（当前 254 列）：oap、jq240、
   china_chars 的 484 个因子用同一个 sh_main 全期秩相关矩阵按 0.8 去重，同类里按覆盖率、再按因子库顺序留，不用收益信息；
@@ -185,8 +185,9 @@ Tushare token 只能来自环境变量 `TUSHARE_TOKEN`。不得把 token 写入�
   读取 daily_basic、全 A 市场与 SMB/HML 收益、首次披露财报、`stock_basic` 上市日与标准数据的 `in_csi300`。它需要
   `FUNDAMENTAL_ENDPOINT_FIELDS` 中标注为 jq240 与 jkp153 的字段；mispricing 与 QMJ 只在当日沪深 300 成分股内排序。
   `tests/test_jkp153.py` 用截断数据重算、直接公式和截面排序回归验证；
-- `jkp406` 列名为 `jkpx_001` 至 `jkpx_362`，独立注册且不改变 `jkp153`；包含原 144 个定义及 218 个扩展定义。
-  明确清单为 404 个具名特征，42 个因缺少可审计输入而排除，官方“406”与具名清单的 2 项差异单独记录；不得凑数。
+- `jkp406` 列名为 `jkpx_001` 至 `jkpx_364`，独立注册且不改变 `jkp153`；包含原 144 个定义及 220 个扩展定义。
+  明确清单为 404 个具名特征，40 个因缺少可审计输入而排除，官方“406”与具名清单的 2 项差异单独记录；不得凑数。
+  11–15 年季节性追加为 363、364 列，原有 362 列次序不变；旧版因子结果指纹过期，需要时重建。
   清单和排除原因在 `jkp406_catalog.py`，全部通过 KunQuant 计算，不新增财报字段；财报、停牌及截面语义沿用 `jkp153`。
   新增长/短债务发行用对应余额年度变化的官方回退定义；继承的 144 个定义保留已有分红近似等假设。
   指纹须含继承的 `jkp153` 源码和算子依赖，季度输出命名空间不得与 `jkp153` 冲突；上市日文件若已列入参考清单则须比对，
@@ -240,8 +241,8 @@ python -m ruff check src tests
 python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
 ```
 
-当前预期为唯一目录（unique catalog）`2058`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
-`qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=362`、`oap_jq_cnc=254`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
+当前预期为唯一目录（unique catalog）`2060`，各因子集依次为 `qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+`qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`oap_jq_cnc=254`。还需运行对应后端的数值基准与执行测试，不能只验证目录名称。
 
 复用既有因子库前，还要显式比较清单中的实现指纹与当前引擎指纹；`factors validate` 对分区、目录和
 标准数据的校验不代替这一步：

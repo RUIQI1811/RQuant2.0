@@ -24,8 +24,8 @@ Modifications include 21-trading-day months, quarterly TTM statement flows,
 actual first-announcement alignment, research-universe composites and explicit
 data-availability omissions. The 144 inherited `jkp153` definitions are retained.
 The advertised 406 count is reconciled as 404 explicitly named characteristics
-plus a two-name documentation/source discrepancy; 362 named characteristics are
-implemented and 42 are excluded with reasons. See the module and README for
+plus a two-name documentation/source discrepancy; 364 named characteristics are
+implemented and 40 are excluded with reasons. See the module and README for
 the exact adaptation and omissions.
 
 ## KunQuant 0.1.11

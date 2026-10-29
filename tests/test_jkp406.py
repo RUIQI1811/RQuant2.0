@@ -94,6 +94,19 @@ def write_reference_fixture(root, inputs):
 
 
 class JKP406CatalogTests(unittest.TestCase):
+    def test_long_seasonality_appends_without_reordering_existing_columns(self):
+        from rquant.factors.libraries.jkp406_catalog import JKP406_SKIPPED, JKP406_SOURCE_NAMES
+
+        specs = get_catalog().select("jkp406")
+        old_skipped = set(JKP406_SKIPPED) | {"seas_11_15an", "seas_11_15na"}
+        expected_old = [name for name in JKP406_SOURCE_NAMES if name not in old_skipped]
+        self.assertEqual(362, len(expected_old))
+        self.assertEqual(expected_old, [s.source_name for s in specs[:362]])
+        self.assertEqual([("jkpx_363", "seas_11_15an"), ("jkpx_364", "seas_11_15na")],
+                         [(s.canonical_name, s.source_name) for s in specs[362:]])
+        self.assertNotIn("seas_11_15an", JKP406_SKIPPED)
+        self.assertNotIn("seas_11_15na", JKP406_SKIPPED)
+
     def test_legacy_reference_manifests_still_load_and_track_the_listing_file_hash(self):
         from rquant.factors.libraries.jkp406 import JKP406Library
 
@@ -168,7 +181,7 @@ class JKP406CatalogTests(unittest.TestCase):
 
         self.assertEqual(404, len(JKP406_SOURCE_NAMES))
         self.assertEqual(ADVERTISED_COUNT, len(JKP406_SOURCE_NAMES) + SOURCE_COUNT_DISCREPANCY)
-        self.assertEqual(362, len(JKP406_NAMES))
+        self.assertEqual(364, len(JKP406_NAMES))
 
 
 @unittest.skipUnless(KUNQUANT_READY, "KunQuant and C++ compiler required")
@@ -177,6 +190,34 @@ class JKP406CalculationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.inputs = synthetic_inputs(stocks=5)
         cls.outputs = calculate(cls.inputs)
+
+    def test_long_seasonality_matches_independent_shifts_and_truncation(self):
+        inputs = synthetic_inputs(days=3900, stocks=5)
+        close = inputs["close"]
+        close.iloc[3800, 0] = np.nan
+        close.iloc[3850 - 3780, 0] = 0.0
+        close.iloc[3850 - 21 * 144, 1] = 0.0
+        full = calculate(inputs)
+        prices = close.ffill()
+        annual_terms = [prices.shift(21 * k) / prices.shift(21 * (k + 1)) - 1 for k in range(131, 180, 12)]
+        annual_reference = sum(annual_terms) / len(annual_terms)
+        for annual, name in ((True, "seas_11_15an"), (False, "seas_11_15na")):
+            months = [k for k in range(120, 180) if (k % 12 == 11) == annual]
+            terms = [prices.shift(21 * k) / prices.shift(21 * (k + 1)) - 1 for k in months]
+            expected = sum(terms) / len(terms)
+            expected = expected.where(close.notna() & prices.shift(15 * 252).notna() & np.isfinite(expected))
+            if not annual:
+                expected = expected.where(np.isfinite(annual_reference))
+            self.assertTrue(np.isfinite(expected.to_numpy()).any())
+            np.testing.assert_allclose(full[name], expected, equal_nan=True, rtol=2e-8, atol=1e-8)
+        self.assertTrue(full["seas_11_15na"].iloc[3850, :2].isna().all())
+        cutoff = close.index[3850]
+        truncated = {k: (v[pd.to_datetime(v["ann_date"]) <= cutoff] if k == "fundamentals" else
+                         v.loc[:cutoff] if isinstance(v, (pd.DataFrame, pd.Series)) and
+                         isinstance(v.index, pd.DatetimeIndex) else v) for k, v in inputs.items()}
+        short = calculate(truncated)
+        for name in ("seas_11_15an", "seas_11_15na"):
+            np.testing.assert_allclose(short[name], full[name].loc[:cutoff], equal_nan=True, rtol=2e-8, atol=1e-8)
 
     def test_every_output_matches_independent_panel_reference(self):
         from panel_reference.jkp406 import JKP406Chars
@@ -187,7 +228,7 @@ class JKP406CalculationTests(unittest.TestCase):
         for name in JKP406_NAMES:
             with self.subTest(name=name):
                 actual, expected = self.outputs[name], reference.calculate(name)
-                if name not in {"seas_6_10an", "seas_6_10na"}:
+                if name not in {"seas_6_10an", "seas_6_10na", "seas_11_15an", "seas_11_15na"}:
                     self.assertTrue(np.isfinite(actual.to_numpy()).any(), name)
                 np.testing.assert_array_equal(actual.isna(), expected.isna())
                 np.testing.assert_allclose(actual, expected, equal_nan=True, rtol=2e-8, atol=1e-8)
@@ -298,7 +339,7 @@ class JKP406CalculationTests(unittest.TestCase):
             engine.compile = lambda: module
             engine.compile_statements = lambda: statement_modules
             result = engine.build_from_canonical(canonical, root / "factors")
-            self.assertEqual(362, result["columns"])
+            self.assertEqual(364, result["columns"])
             self.assertEqual(manifest["fingerprint"], result["reference_inputs"]["jkp406_reference"])
             built = pd.concat(pd.read_parquet(p) for p in (root / "factors" / "jkp406").glob("year=*/*.parquet"))
             eligible = inputs["universe"].any(axis=0)

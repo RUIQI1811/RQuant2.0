@@ -24,7 +24,7 @@ _REASON_3 = "Compustat special/extraordinary items have no reliable collected Tu
 _REASON_4 = "Advertising expense is not separately reported by the collected statements."
 _REASON_5 = "Total staff expense is not separately reported by the collected statements."
 _REASON_6 = "Historical point-in-time employee counts are not collected from Tushare."
-_REASON_7 = "Needs 15-20 years of history beyond the configured data start."
+_REASON_7 = "Needs 20 years of history beyond the current configured data start."
 _REASON_8 = "Auditable daily HXZ investment/profitability factor returns are not available."
 
 ACCOUNTING_NAMES = (
@@ -478,11 +478,12 @@ JKP406_SKIPPED = {
     "div6m_me": _REASON_1,
     "divspc1m_me": _REASON_1,
     "divspc12m_me": _REASON_1,
-    "seas_11_15an": _REASON_7,
     "seas_16_20an": _REASON_7,
-    "seas_11_15na": _REASON_7,
     "seas_16_20na": _REASON_7,
     "ivol_hxz4_21d": _REASON_8,
     "iskew_hxz4_21d": _REASON_8,
 }
-JKP406_NAMES = tuple(name for name in JKP406_SOURCE_NAMES if name not in JKP406_SKIPPED)
+_APPENDED_LONG_SEASONALITY = ("seas_11_15an", "seas_11_15na")
+JKP406_NAMES = tuple(
+    name for name in JKP406_SOURCE_NAMES if name not in JKP406_SKIPPED and name not in _APPENDED_LONG_SEASONALITY
+) + _APPENDED_LONG_SEASONALITY

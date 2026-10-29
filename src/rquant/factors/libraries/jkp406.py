@@ -72,6 +72,9 @@ def metadata(name: str) -> tuple[str, int]:
     if name in CORE_METADATA:
         theme, description, window = CORE_METADATA[name]
         return f"{theme}: {description}", window
+    if name in {"seas_11_15an", "seas_11_15na"}:
+        period = "same-month" if name.endswith("an") else "other-month"
+        return f"mean {period} return 11 to 15 years ago; month = 21 trading days", 15 * 252 + 1
     if name in RAW_ITEMS:
         return f"latest usable statement item {RAW_ITEMS[name]} (TTM for flows), in CNY", 1
     if name == "enterprise_value":
@@ -162,6 +165,11 @@ class JKP406Graph(core.JKPGraph):
         return self._memo(f"out:{name}", build)
 
     def _extended(self, name: str):
+        if name in {"seas_11_15an", "seas_11_15na"}:
+            value = self._seasonality(11, 15, name.endswith("an"))
+            if name.endswith("na"):
+                value = g.where(g.isfinite(self.calculate("seas_11_15an")), value, g.nan)
+            return g.where(g.isfinite(lag(self.price, 15 * 252)), value, g.nan)
         if name in RAW_ITEMS:
             return self._q(self.x(RAW_ITEMS[name]))
         if name == "enterprise_value":
