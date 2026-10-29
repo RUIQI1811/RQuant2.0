@@ -153,7 +153,7 @@ class ChinaCharsCatalogTests(unittest.TestCase):
         self.assertEqual("cnc_001", names[0])
         self.assertEqual("cnc_109", names[-1])
         self.assertEqual(len(set(CHINA_CHARS_NAMES)), len(CHINA_CHARS_NAMES))
-        self.assertEqual(2063, len(catalog.specs))
+        self.assertEqual(2064, len(catalog.specs))
         for dropped in ("hn", "lfe", "adm", "gad", "idvq", "idsq", "tail", "mkt_beta"):
             self.assertNotIn(dropped, CHINA_CHARS_NAMES)
 

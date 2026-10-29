@@ -1,6 +1,6 @@
-"""Three source-timing China anomaly definitions, independently adapted to Tushare.
+"""Source-timing China anomaly definitions, independently adapted to Tushare.
 
-Li, Liu, Liu and Wei (2024), Management Science, appendix A.4.18–20.
+Li, Liu, Liu and Wei (2024), Management Science, appendix A.4.18–21.
 Source CSMAR values and Tushare values have not been shown equal. Annual
 signals form at June close; quarter signals form at the first monthly trading
 day using reports known before that day. A missing prior report falls back to
@@ -22,6 +22,7 @@ from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 from rquant.io import sha256_file, stable_hash
 
 FIELDS = ("total_assets", "operate_profit", "n_income", "n_cashflow_act")
+EQUITY_FIELD = "total_hldr_eqy_inc_min_int"
 KEYS = ("instrument", "end_date", "ann_date")
 
 
@@ -74,7 +75,7 @@ def load_reference(canonical_root: Any, dates: Any, instruments: Any) -> tuple[d
             raise DataContractError(f"china469_pit reference differs from manifest: {path}")
     if "fundamentals.parquet" not in manifest["files"]:
         raise DataContractError("china469_pit fundamentals must be pinned by the reference manifest")
-    fundamentals = pd.read_parquet(root / "fundamentals.parquet", columns=[*KEYS, *FIELDS],
+    fundamentals = pd.read_parquet(root / "fundamentals.parquet", columns=[*KEYS, *FIELDS, EQUITY_FIELD],
                                    filters=[("instrument", "in", list(instruments))])
     calendar = pd.read_parquet(root / "trade_cal.parquet", columns=["exchange", "cal_date", "is_open"])
     raw_hash = None
@@ -132,7 +133,7 @@ class _Base(FactorLibrary):
         })
 
     def make_statement_grid(self, inputs: dict[str, Any], dates: Any, instruments: Any) -> Any:
-        frame = inputs["fundamentals"].loc[:, [*KEYS, *FIELDS]]
+        frame = inputs["fundamentals"].loc[:, [*KEYS, *self.statement_fields]]
         return formation_grid.FormationGrid(
             frame, dates, instruments, full_calendar=inputs["formation_calendar"], mode=self.mode
         )
@@ -145,7 +146,7 @@ class _Base(FactorLibrary):
                                     for value in (profit, income, cash))
             denominator = k.delay(inputs["total_assets"], 1)
         else:
-            denominator = inputs["total_assets"]
+            denominator = inputs[EQUITY_FIELD] if self.source == "Cbe" else inputs["total_assets"]
             if self.mode == "annual_previous":
                 denominator = k.delay(denominator, 4)
         value = k.replace_inf((profit - income + cash) / denominator)
@@ -178,5 +179,13 @@ class China469AnnualPreviousLibrary(_Base):
 class China469QuarterPreviousLibrary(_Base):
     family = "china469_claq"
     mode, source, column, output, ordinal = "monthly_previous", "Claq", "cnax_003", "q_cnax_claq", 3
+    statement_outputs = (output,)
+    statement_factors = {source: output}
+
+
+class China469EquityLibrary(_Base):
+    family = "china469_cbe"
+    mode, source, column, output, ordinal = "annual_current", "Cbe", "cnax_004", "y_cnax_cbe", 4
+    statement_fields = (EQUITY_FIELD, "operate_profit", "n_income", "n_cashflow_act")
     statement_outputs = (output,)
     statement_factors = {source: output}

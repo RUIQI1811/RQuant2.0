@@ -18,11 +18,11 @@ def tiny_engine():
         yield KunQuantFactorEngine(directory, FactorBuildConfig(factor_set="china469_pit", universe="all", workers=1))
 
 
-def test_registered_three_source_timing_factors() -> None:
+def test_registered_source_timing_factors() -> None:
     catalog = get_catalog()
     specs = catalog.select("china469_pit")
     assert [(s.canonical_name, s.source_name) for s in specs] == [
-        ("cnax_001", "Cop"), ("cnax_002", "Cla"), ("cnax_003", "Claq")
+        ("cnax_001", "Cop"), ("cnax_002", "Cla"), ("cnax_003", "Claq"), ("cnax_004", "Cbe")
     ]
 
 
@@ -34,6 +34,7 @@ def test_reference_loader_pins_and_checks_calendar_and_fundamentals(tmp_path) ->
     fundamentals = pd.DataFrame({
         "instrument": ["S1"], "end_date": ["2023-12-31"], "ann_date": ["2024-04-01"],
         "total_assets": [10.], "operate_profit": [3.], "n_income": [2.], "n_cashflow_act": [1.],
+        "total_hldr_eqy_inc_min_int": [5.],
     })
     fundamentals.to_parquet(reference / "fundamentals.parquet", index=False)
     days = pd.date_range("2024-05-01", "2024-08-10")
@@ -69,7 +70,8 @@ def test_legacy_calendar_is_checked_against_hashed_raw_tushare_partition(tmp_pat
     reference.mkdir(parents=True)
     partition.mkdir(parents=True)
     records = pd.DataFrame({"instrument": ["S1"], "end_date": ["2023-12-31"], "ann_date": ["2024-04-01"],
-                            "total_assets": [1.], "operate_profit": [1.], "n_income": [1.], "n_cashflow_act": [1.]})
+                            "total_assets": [1.], "operate_profit": [1.], "n_income": [1.], "n_cashflow_act": [1.],
+                            "total_hldr_eqy_inc_min_int": [1.]})
     records.to_parquet(reference / "fundamentals.parquet", index=False)
     days = pd.date_range("2024-04-01", "2024-06-30")
     calendar = pd.DataFrame({"exchange": "SSE", "cal_date": days.strftime("%Y%m%d"),
@@ -103,6 +105,7 @@ def test_statement_graph_matches_hand_calculation_and_frozen_formation(tiny_engi
         ("S2", "2022-12-31", "2023-04-01", 150., 30., 15., 15.),
         ("S2", "2023-12-31", "2024-07-01", 180., 35., 15., 20.),
     ], columns=["instrument", "end_date", "ann_date", "total_assets", "operate_profit", "n_income", "n_cashflow_act"])
+    frame["total_hldr_eqy_inc_min_int"] = [50., 80., 95., 120., 125., 0., 0.]
     frame["end_date"] = pd.to_datetime(frame.end_date)
     frame["ann_date"] = pd.to_datetime(frame.ann_date)
     calendar = pd.bdate_range("2020-01-01", "2025-12-31")
@@ -115,7 +118,12 @@ def test_statement_graph_matches_hand_calculation_and_frozen_formation(tiny_engi
     cop = pd.DataFrame(results.daily("y_cnax_cop"), index=dates, columns=instruments)
     cla = pd.DataFrame(results.daily("y_cnax_cla"), index=dates, columns=instruments)
     claq = pd.DataFrame(results.daily("q_cnax_claq"), index=dates, columns=instruments)
+    cbe = pd.DataFrame(results.daily("y_cnax_cbe"), index=dates, columns=instruments)
     assert np.isclose(cop.loc["2023-06-30", "S1"], 50 / 200)
+    assert np.isclose(cbe.loc["2023-06-30", "S1"], 50 / 80)
+    assert pd.isna(cbe.loc["2023-06-30", "S2"])
+    assert np.isclose(cbe.loc["2024-06-28", "S1"], 65 / 120)
+    assert pd.isna(cbe.loc["2024-06-28", "S2"])
     assert np.isclose(cla.loc["2023-06-30", "S1"], 50 / 100)
     assert np.isclose(cop.loc["2023-06-30", "S2"], 30 / 150)
     assert pd.isna(cla.loc["2023-06-30", "S2"])
@@ -129,7 +137,7 @@ def test_statement_graph_matches_hand_calculation_and_frozen_formation(tiny_engi
         shortened = engine.run_statements(
             {"fundamentals": short_frame, "formation_calendar": calendar}, prefix, instruments, modules
         )
-        for name in ("y_cnax_cop", "y_cnax_cla", "q_cnax_claq"):
+        for name in ("y_cnax_cop", "y_cnax_cla", "q_cnax_claq", "y_cnax_cbe"):
             expected = results.daily(name)[:len(prefix)]
             actual = shortened.daily(name)
             np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
@@ -150,6 +158,7 @@ def test_real_engine_path_builds_three_factors_from_small_canonical_fixture(tmp_
         ("SH600000", "2023-09-30", "2023-10-20", 220., 30., 9., 15.),
         ("SH600000", "2023-12-31", "2024-04-10", 240., 50., 15., 30.),
     ], columns=["instrument", "end_date", "ann_date", "total_assets", "operate_profit", "n_income", "n_cashflow_act"])
+    frame["total_hldr_eqy_inc_min_int"] = [80., 95., 120.]
     frame.to_parquet(reference / "fundamentals.parquet", index=False)
     days = pd.date_range("2020-01-01", "2025-12-31")
     pd.DataFrame({"exchange": "SSE", "cal_date": days.strftime("%Y%m%d"),
@@ -161,11 +170,12 @@ def test_real_engine_path_builds_three_factors_from_small_canonical_fixture(tmp_
     manifest["fingerprint"] = stable_hash(manifest)
     atomic_write_json(reference / "manifest.json", manifest)
     result = tiny_engine.build_from_canonical(canonical, tmp_path / "factors")
-    assert result["columns"] == 3
+    assert result["columns"] == 4
     values = pd.read_parquet(tmp_path / "factors" / "china469_pit" / "year=2024" / "factors.parquet")
     june = values.set_index("datetime").loc["2024-06-28"]
     assert np.isclose(june["cnax_001"], 65 / 240)
     assert np.isclose(june["cnax_002"], 65 / 200)
     assert np.isclose(june["cnax_003"], 29 / 220)
+    assert np.isclose(june["cnax_004"], 65 / 120)
     invalid_quote = values.set_index("datetime").loc["2024-07-01"]
-    assert invalid_quote[["cnax_001", "cnax_002", "cnax_003"]].isna().all()
+    assert invalid_quote[["cnax_001", "cnax_002", "cnax_003", "cnax_004"]].isna().all()
