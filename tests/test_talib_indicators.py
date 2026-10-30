@@ -51,7 +51,7 @@ class TALibCatalogTests(unittest.TestCase):
         self.assertEqual(125, len(names))
         self.assertEqual(("ta_001", "ta_125"), (names[0], names[-1]))
         self.assertEqual(len(set(TALIB_NAMES)), len(TALIB_NAMES))
-        self.assertEqual(2060, len(catalog.specs))
+        self.assertEqual(2078, len(catalog.specs))
 
     def test_declared_lookbacks_and_parameters_match_the_installed_library(self) -> None:
         for name, function, _, parameters, position, _, lookback in TALIB_INDICATORS:

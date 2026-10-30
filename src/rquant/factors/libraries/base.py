@@ -124,6 +124,12 @@ class FactorLibrary(ABC):
         """The first-reported statements the statement graph reads (``fundamentals`` unchanged by default)."""
         return fundamentals
 
+    def make_statement_grid(self, inputs: Mapping[str, Any], dates: Any, instruments: Any) -> Any:
+        """Construct the statement publication grid, preserving the default first-announcement contract."""
+        from rquant.factors.statements import QuarterGrid
+
+        return QuarterGrid(self.prepare_statements(inputs["fundamentals"]), dates, instruments)
+
     def load_reference_inputs(self, canonical_root: Any, dates: Any, instruments: Any) -> tuple[dict[str, Any], dict]:
         """Load inputs beyond the canonical bars, aligned to ``dates`` x ``instruments``, and the read files' hashes."""
         return {}, {}

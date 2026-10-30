@@ -130,6 +130,16 @@ def _default_registry() -> FactorLibraryRegistry:
     from rquant.factors.libraries.alpha158 import QlibAlpha158Library
     from rquant.factors.libraries.alpha360 import QlibAlpha360Library
     from rquant.factors.libraries.barra_cne6 import BarraCNE6Library
+    from rquant.factors.libraries.china469_pit import (
+        China469AnnualCapitalTurnoverLibrary,
+        China469AnnualCurrentLibrary,
+        China469AnnualPreviousLibrary,
+        China469AnnualRatiosLibrary,
+        China469EquityLibrary,
+        China469OperatingAnnualPreviousLibrary,
+        China469OperatingQuarterPreviousLibrary,
+        China469QuarterPreviousLibrary,
+    )
     from rquant.factors.libraries.china_chars import ChinaCharsLibrary
     from rquant.factors.libraries.gtja191 import GTJA191Library
     from rquant.factors.libraries.jkp153 import JKP153Library
@@ -155,6 +165,19 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(TushareTechLibrary())
     registry.register_library(JKP153Library())
     registry.register_library(JKP406Library())
+    registry.register_library(China469AnnualCurrentLibrary(), standalone=False)
+    registry.register_library(China469AnnualPreviousLibrary(), standalone=False)
+    registry.register_library(China469QuarterPreviousLibrary(), standalone=False)
+    registry.register_library(China469EquityLibrary(), standalone=False)
+    registry.register_library(China469OperatingAnnualPreviousLibrary(), standalone=False)
+    registry.register_library(China469OperatingQuarterPreviousLibrary(), standalone=False)
+    registry.register_library(China469AnnualRatiosLibrary(), standalone=False)
+    registry.register_library(China469AnnualCapitalTurnoverLibrary(), standalone=False)
+    registry.register_factor_set("china469_pit", (
+        "china469_cop", "china469_cla", "china469_claq", "china469_cbe",
+        "china469_operating_annual_lag", "china469_operating_quarter_lag",
+        "china469_annual_ratios", "china469_annual_capital_turnover",
+    ))
     registry.register_factor_selection(OAP_JQ_CNC_SELECTION)
     return registry
 

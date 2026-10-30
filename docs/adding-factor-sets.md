@@ -77,7 +77,7 @@ Windows 机器上跑，你只负责把命令写清楚。
 
 **新增财报字段**：在 `FUNDAMENTAL_ENDPOINT_FIELDS` 对应报表里追加，并像现有代码一样加注释
 `# <name> (...) items.`；只追加，不删、不改已有字段。代价是用户要重新 `data sync-fundamentals` 与
-`data build-reference`，并重建所有读财报的因子集（`china_chars`、`jq240`、`oap`、`barra_cne6`、`jkp153`、`jkp406`，
+`data build-reference`，并重建所有读财报的因子集（`china_chars`、`jq240`、`oap`、`barra_cne6`、`jkp153`、`jkp406`、`china469_pit`，
 以及 sh_main 上的 `oap_jq_cnc`）。能不加就不加；加了必须在 PR 描述里写明。
 
 **新增 Tushare 接口**（例如分析师预期、北向持股、龙虎榜）：需要改采集器、契约和账户积分，属于大改动。默认不做，
@@ -86,7 +86,7 @@ Windows 机器上跑，你只负责把命令写清楚。
 ## 5. 实现步骤清单
 
 以下 `<name>` 是因子集名（小写蛇形，如 `xyz123`），`<prefix>` 是列名前缀。已占用的前缀：`a158_ a101_ gtja_ a360_
-cnc_ svc_ ta_ jq_ oap_ cne6_ tst_ jkp_ jkpx_`，新前缀不能和它们冲突。
+cnc_ svc_ ta_ jq_ oap_ cne6_ tst_ jkp_ jkpx_ cnax_`，新前缀不能和它们冲突。
 
 1. **因子库模块** `src/rquant/factors/libraries/<name>.py`：
    - 模块 docstring：来源、版本/日期、独立重写声明、日频改造规则、与原定义的差异；
@@ -101,7 +101,7 @@ cnc_ svc_ ta_ jq_ oap_ cne6_ tst_ jkp_ jkpx_`，新前缀不能和它们冲突�
 2. **注册**：在 `registry.py` 的 `_default_registry()` 里 import 并 `registry.register_library(<Name>Library())`，
    放在 `JKP406Library()` 之后、`register_factor_selection(OAP_JQ_CNC_SELECTION)` 之前。CLI 的 `--factor-set`
    选项、目录和引擎都由注册表派生，不要在别处硬编码新名字。
-3. **目录计数**：总数当前是 2060，新增 N 列后改成 2060+N。用 `rg -n 2060 src tests agent.md README.md`
+3. **目录计数**：总数当前是 2078，新增 N 列后改成 2078+N。用 `rg -n 2078 src tests agent.md README.md`
    找全，目前在：`src/rquant/cli.py`（doctor 检查）、`tests/test_catalog.py`、`tests/test_cli.py`、
    `tests/test_china_chars.py`、`tests/test_jq240.py`、`tests/test_size_value_china.py`、
    `tests/test_talib_indicators.py`、`agent.md`、`README.md`。另外 `tests/test_factor_libraries.py` 的
@@ -154,9 +154,9 @@ rquant factors catalog --factor-set <name>
 python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
 ```
 
-最后一条的输出应为总数 2060+N，且原有各因子集的列数不变：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+最后一条的输出应为总数 2078+N，且原有各因子集的列数不变：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
 `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、
-`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`oap_jq_cnc=254`。
+`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`china469_pit=18`、`oap_jq_cnc=254`。
 
 你没有 Tushare token，也没有本地数据，**不要**运行 `rquant data ...`、`rquant factors build/validate`、
 `rquant walk-forward`、`rquant report`，也不要在 PR 里声称真实数据构建或回测已经验证。
