@@ -1,6 +1,7 @@
 """Source-timing China anomaly definitions, independently adapted to Tushare.
 
-Li, Liu, Liu and Wei (2024), Management Science, appendix A.4.12–21.
+Li, Liu, Liu and Wei (2024), Management Science, appendix A.3.17, A.3.22–23, A.4.5–6,
+A.4.10, A.4.12–21, A.4.24 and A.4.26.
 Source CSMAR values and Tushare values have not been shown equal. Annual
 signals form at June close; quarter signals form at the first monthly trading
 day using reports known before that day. A missing prior report falls back to
@@ -23,6 +24,8 @@ from rquant.io import sha256_file, stable_hash
 
 FIELDS = ("total_assets", "operate_profit", "n_income", "n_cashflow_act")
 EQUITY_FIELD = "total_hldr_eqy_inc_min_int"
+ADDITIONAL_FIELDS = ("income_tax", "total_revenue", "revenue", "oper_cost",
+                     "n_cashflow_inv_act", "n_cash_flows_fnc_act")
 KEYS = ("instrument", "end_date", "ann_date")
 
 
@@ -75,7 +78,8 @@ def load_reference(canonical_root: Any, dates: Any, instruments: Any) -> tuple[d
             raise DataContractError(f"china469_pit reference differs from manifest: {path}")
     if "fundamentals.parquet" not in manifest["files"]:
         raise DataContractError("china469_pit fundamentals must be pinned by the reference manifest")
-    fundamentals = pd.read_parquet(root / "fundamentals.parquet", columns=[*KEYS, *FIELDS, EQUITY_FIELD],
+    fundamentals = pd.read_parquet(root / "fundamentals.parquet", columns=[*KEYS, *FIELDS, EQUITY_FIELD,
+                                                                            *ADDITIONAL_FIELDS],
                                    filters=[("instrument", "in", list(instruments))])
     calendar = pd.read_parquet(root / "trade_cal.parquet", columns=["exchange", "cal_date", "is_open"])
     raw_hash = None
@@ -244,3 +248,63 @@ class China469OperatingQuarterPreviousLibrary(_OperatingLagBase):
     names = (("Olaq", 9), ("Oleq", 10))
     statement_outputs = (output, "q_cnax_oleq")
     statement_factors = {"Olaq": output, "Oleq": "q_cnax_oleq"}
+
+
+class China469AnnualRatiosLibrary(_Base):
+    family = "china469_annual_ratios"
+    mode, source, column, output, ordinal = "annual_current", "Pm", "cnax_011", "y_cnax_pm", 11
+    statement_fields = ("operate_profit", "total_revenue", "n_income", "income_tax", "n_cashflow_act",
+                        "total_assets", EQUITY_FIELD, "n_cashflow_inv_act", "n_cash_flows_fnc_act")
+    statement_outputs = (output, "y_cnax_tbi", "y_cnax_bl", "y_cnax_poa", "y_cnax_pta")
+    statement_factors = {"Pm": output, "Tbi": "y_cnax_tbi", "Bl": "y_cnax_bl", "Poa": "y_cnax_poa",
+                         "Pta": "y_cnax_pta"}
+
+    @property
+    def specs(self) -> tuple[FactorSpec, ...]:
+        return tuple(FactorSpec(f"cnax_{ordinal:03d}", name, self.family, ordinal, description, 1,
+                                f"{__name__}.{name}", 1) for name, ordinal, description in (
+            ("Pm", 11, "annual operating profit / total operating revenue, frozen at June formation"),
+            ("Tbi", 12, "annual (net income + tax expense) / net income, both amounts positive"),
+            ("Bl", 13, "annual total assets / total shareholders' equity, frozen at June formation"),
+            ("Poa", 14, "annual (net income - operating cash flow) / absolute net income"),
+            ("Pta", 15, "annual total accruals / absolute net income"),
+        ))
+
+    def build_statements(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        income = inputs["n_income"]
+        pretax = income + inputs["income_tax"]
+        tbi = k.mask(_profit_ratio(pretax, income), k.all_of(k.gt(pretax, 0.0), k.gt(income, 0.0)))
+        return {"y_cnax_pm": _profit_ratio(inputs["operate_profit"], inputs["total_revenue"]),
+                "y_cnax_tbi": tbi,
+                "y_cnax_bl": _profit_ratio(inputs["total_assets"], inputs[EQUITY_FIELD]),
+                "y_cnax_poa": _profit_ratio(income - inputs["n_cashflow_act"], k.absolute(income)),
+                "y_cnax_pta": _profit_ratio(income - inputs["n_cashflow_act"] - inputs["n_cashflow_inv_act"]
+                                            - inputs["n_cash_flows_fnc_act"], k.absolute(income))}
+
+
+class China469AnnualCapitalTurnoverLibrary(_Base):
+    family = "china469_annual_capital_turnover"
+    mode, source, column, output, ordinal = "annual_previous", "Cto", "cnax_016", "y_cnax_cto", 16
+    statement_fields = ("total_revenue", "total_assets", "revenue", "oper_cost", "n_income", "n_cashflow_act",
+                        "n_cashflow_inv_act", "n_cash_flows_fnc_act")
+    statement_outputs = (output, "y_cnax_gla", "y_cnax_ta")
+    statement_factors = {source: output, "Gla": "y_cnax_gla", "Ta": "y_cnax_ta"}
+
+    @property
+    def specs(self) -> tuple[FactorSpec, ...]:
+        return (FactorSpec(self.column, self.source, self.family, self.ordinal,
+                           "annual total operating revenue / previous-year total assets", 1,
+                           f"{__name__}.Cto", 1),
+                FactorSpec("cnax_017", "Gla", self.family, 17,
+                           "annual (operating revenue - operating cost) / previous-year total assets", 1,
+                           f"{__name__}.Gla", 1),
+                FactorSpec("cnax_018", "Ta", self.family, 18,
+                           "annual total accruals / previous-year total assets", 1,
+                           f"{__name__}.Ta", 1))
+
+    def build_statements(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        assets = k.delay(inputs["total_assets"], 4)
+        return {self.output: _profit_ratio(inputs["total_revenue"], assets),
+                "y_cnax_gla": _profit_ratio(inputs["revenue"] - inputs["oper_cost"], assets),
+                "y_cnax_ta": _profit_ratio(inputs["n_income"] - inputs["n_cashflow_act"]
+                                           - inputs["n_cashflow_inv_act"] - inputs["n_cash_flows_fnc_act"], assets)}

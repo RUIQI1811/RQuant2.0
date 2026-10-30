@@ -5,7 +5,7 @@
 `china469_pit.py` independently implements selected operating-profit and cash-profit definitions
 from Li, Liu, Liu and Wei, "Replicating and Digesting Anomalies in the Chinese
 A-Share Market", Management Science, https://doi.org/10.1287/mnsc.2023.4904,
-supplement A.4.12–21. No author code or CSMAR data is bundled. Tushare fields,
+supplement A.3.17, A.3.22–23, A.4.5–6, A.4.10, A.4.12–21, A.4.24 and A.4.26. No author code or CSMAR data is bundled. Tushare fields,
 point-in-time release handling, daily output and missing-prior-report fallback
 are project adaptations; cross-vendor numerical equivalence is not established.
 
