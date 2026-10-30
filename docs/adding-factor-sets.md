@@ -101,7 +101,7 @@ cnc_ svc_ ta_ jq_ oap_ cne6_ tst_ jkp_ jkpx_ cnax_`，新前缀不能和它们�
 2. **注册**：在 `registry.py` 的 `_default_registry()` 里 import 并 `registry.register_library(<Name>Library())`，
    放在 `JKP406Library()` 之后、`register_factor_selection(OAP_JQ_CNC_SELECTION)` 之前。CLI 的 `--factor-set`
    选项、目录和引擎都由注册表派生，不要在别处硬编码新名字。
-3. **目录计数**：总数当前是 2064，新增 N 列后改成 2064+N。用 `rg -n 2064 src tests agent.md README.md`
+3. **目录计数**：总数当前是 2070，新增 N 列后改成 2070+N。用 `rg -n 2070 src tests agent.md README.md`
    找全，目前在：`src/rquant/cli.py`（doctor 检查）、`tests/test_catalog.py`、`tests/test_cli.py`、
    `tests/test_china_chars.py`、`tests/test_jq240.py`、`tests/test_size_value_china.py`、
    `tests/test_talib_indicators.py`、`agent.md`、`README.md`。另外 `tests/test_factor_libraries.py` 的
@@ -154,9 +154,9 @@ rquant factors catalog --factor-set <name>
 python -c "from rquant.factors.catalog import get_catalog; c=get_catalog(); print(len(c.specs)); print({s: len(c.select(s)) for s in c.factor_sets()})"
 ```
 
-最后一条的输出应为总数 2064+N，且原有各因子集的列数不变：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
+最后一条的输出应为总数 2070+N，且原有各因子集的列数不变：`qlib_alpha158=158`、`wq_alpha101=101`、`gtja191=190`、
 `qlib_alpha360=360`、`china_chars=109`、`size_value_china=21`、`talib=125`、`jq240=233`、`oap=142`、`barra_cne6=38`、
-`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`china469_pit=4`、`oap_jq_cnc=254`。
+`tushare_tech=75`、`jkp153=144`、`jkp406=364`、`china469_pit=10`、`oap_jq_cnc=254`。
 
 你没有 Tushare token，也没有本地数据，**不要**运行 `rquant data ...`、`rquant factors build/validate`、
 `rquant walk-forward`、`rquant report`，也不要在 PR 里声称真实数据构建或回测已经验证。

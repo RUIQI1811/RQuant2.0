@@ -22,7 +22,9 @@ def test_registered_source_timing_factors() -> None:
     catalog = get_catalog()
     specs = catalog.select("china469_pit")
     assert [(s.canonical_name, s.source_name) for s in specs] == [
-        ("cnax_001", "Cop"), ("cnax_002", "Cla"), ("cnax_003", "Claq"), ("cnax_004", "Cbe")
+        ("cnax_001", "Cop"), ("cnax_002", "Cla"), ("cnax_003", "Claq"), ("cnax_004", "Cbe"),
+        ("cnax_005", "Opa"), ("cnax_006", "Ope"), ("cnax_007", "Ola"), ("cnax_008", "Ole"),
+        ("cnax_009", "Olaq"), ("cnax_010", "Oleq")
     ]
 
 
@@ -119,10 +121,20 @@ def test_statement_graph_matches_hand_calculation_and_frozen_formation(tiny_engi
     cla = pd.DataFrame(results.daily("y_cnax_cla"), index=dates, columns=instruments)
     claq = pd.DataFrame(results.daily("q_cnax_claq"), index=dates, columns=instruments)
     cbe = pd.DataFrame(results.daily("y_cnax_cbe"), index=dates, columns=instruments)
+    extra = {name: pd.DataFrame(results.daily(name), index=dates, columns=instruments) for name in
+             ("y_cnax_opa", "y_cnax_ope", "y_cnax_ola", "y_cnax_ole", "q_cnax_olaq", "q_cnax_oleq")}
     assert np.isclose(cop.loc["2023-06-30", "S1"], 50 / 200)
     assert np.isclose(cbe.loc["2023-06-30", "S1"], 50 / 80)
     assert pd.isna(cbe.loc["2023-06-30", "S2"])
     assert np.isclose(cbe.loc["2024-06-28", "S1"], 65 / 120)
+    assert np.isclose(extra["y_cnax_opa"].loc["2023-06-30", "S1"], 40 / 200)
+    assert np.isclose(extra["y_cnax_ope"].loc["2023-06-30", "S1"], 40 / 80)
+    assert np.isclose(extra["y_cnax_ola"].loc["2023-06-30", "S1"], 40 / 100)
+    assert np.isclose(extra["y_cnax_ole"].loc["2023-06-30", "S1"], 40 / 50)
+    assert np.isclose(extra["q_cnax_olaq"].loc["2024-05-01", "S1"], 20 / 220)
+    assert np.isclose(extra["q_cnax_oleq"].loc["2024-05-01", "S1"], 20 / 95)
+    assert pd.isna(extra["y_cnax_ope"].loc["2023-06-30", "S2"])
+    assert pd.isna(extra["y_cnax_ola"].loc["2023-06-30", "S2"])
     assert pd.isna(cbe.loc["2024-06-28", "S2"])
     assert np.isclose(cla.loc["2023-06-30", "S1"], 50 / 100)
     assert np.isclose(cop.loc["2023-06-30", "S2"], 30 / 150)
@@ -137,11 +149,31 @@ def test_statement_graph_matches_hand_calculation_and_frozen_formation(tiny_engi
         shortened = engine.run_statements(
             {"fundamentals": short_frame, "formation_calendar": calendar}, prefix, instruments, modules
         )
-        for name in ("y_cnax_cop", "y_cnax_cla", "q_cnax_claq", "y_cnax_cbe"):
+        for name in ("y_cnax_cop", "y_cnax_cla", "q_cnax_claq", "y_cnax_cbe", *extra):
             expected = results.daily(name)[:len(prefix)]
             actual = shortened.daily(name)
             np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
             np.testing.assert_allclose(actual, expected, equal_nan=True)
+
+
+def test_nonfinite_statement_denominators_never_produce_zero(tiny_engine) -> None:
+    frame = pd.DataFrame([
+        ("S1", "2021-12-31", "2022-04-01", np.inf, 20., 10., 5., np.inf),
+        ("S1", "2022-12-31", "2023-04-01", -np.inf, 25., 12., 6., -np.inf),
+        ("S1", "2023-09-30", "2023-10-20", np.inf, 30., 15., 9., np.inf),
+        ("S1", "2023-12-31", "2024-04-10", np.inf, 50., 20., 15., np.inf),
+    ], columns=["instrument", "end_date", "ann_date", "total_assets", "operate_profit", "n_income",
+                "n_cashflow_act", "total_hldr_eqy_inc_min_int"])
+    frame["end_date"] = pd.to_datetime(frame.end_date)
+    frame["ann_date"] = pd.to_datetime(frame.ann_date)
+    calendar = pd.bdate_range("2020-01-01", "2025-12-31")
+    dates = calendar[(calendar >= "2023-01-01") & (calendar <= "2024-06-28")]
+    results = tiny_engine.run_statements({"fundamentals": frame, "formation_calendar": calendar}, dates,
+                                         pd.Index(["S1"]))
+    for name in ("y_cnax_cop", "y_cnax_cla", "y_cnax_cbe", "y_cnax_opa", "y_cnax_ope", "y_cnax_ola", "y_cnax_ole"):
+        assert np.isnan(results.daily(name)[dates.get_loc("2023-06-30"), 0]), name
+    for name in ("q_cnax_claq", "q_cnax_olaq", "q_cnax_oleq"):
+        assert np.isnan(results.daily(name)[dates.get_loc("2024-05-01"), 0]), name
 
 
 def test_real_engine_path_builds_three_factors_from_small_canonical_fixture(tmp_path, tiny_engine) -> None:
@@ -170,12 +202,18 @@ def test_real_engine_path_builds_three_factors_from_small_canonical_fixture(tmp_
     manifest["fingerprint"] = stable_hash(manifest)
     atomic_write_json(reference / "manifest.json", manifest)
     result = tiny_engine.build_from_canonical(canonical, tmp_path / "factors")
-    assert result["columns"] == 4
+    assert result["columns"] == 10
     values = pd.read_parquet(tmp_path / "factors" / "china469_pit" / "year=2024" / "factors.parquet")
     june = values.set_index("datetime").loc["2024-06-28"]
     assert np.isclose(june["cnax_001"], 65 / 240)
     assert np.isclose(june["cnax_002"], 65 / 200)
     assert np.isclose(june["cnax_003"], 29 / 220)
     assert np.isclose(june["cnax_004"], 65 / 120)
+    assert np.isclose(june["cnax_005"], 50 / 240)
+    assert np.isclose(june["cnax_006"], 50 / 120)
+    assert np.isclose(june["cnax_007"], 50 / 200)
+    assert np.isclose(june["cnax_008"], 50 / 80)
+    assert np.isclose(june["cnax_009"], 20 / 220)
+    assert np.isclose(june["cnax_010"], 20 / 95)
     invalid_quote = values.set_index("datetime").loc["2024-07-01"]
-    assert invalid_quote[["cnax_001", "cnax_002", "cnax_003", "cnax_004"]].isna().all()
+    assert invalid_quote[[f"cnax_{n:03d}" for n in range(1, 11)]].isna().all()

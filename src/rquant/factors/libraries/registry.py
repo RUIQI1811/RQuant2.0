@@ -134,6 +134,8 @@ def _default_registry() -> FactorLibraryRegistry:
         China469AnnualCurrentLibrary,
         China469AnnualPreviousLibrary,
         China469EquityLibrary,
+        China469OperatingAnnualPreviousLibrary,
+        China469OperatingQuarterPreviousLibrary,
         China469QuarterPreviousLibrary,
     )
     from rquant.factors.libraries.china_chars import ChinaCharsLibrary
@@ -165,7 +167,12 @@ def _default_registry() -> FactorLibraryRegistry:
     registry.register_library(China469AnnualPreviousLibrary(), standalone=False)
     registry.register_library(China469QuarterPreviousLibrary(), standalone=False)
     registry.register_library(China469EquityLibrary(), standalone=False)
-    registry.register_factor_set("china469_pit", ("china469_cop", "china469_cla", "china469_claq", "china469_cbe"))
+    registry.register_library(China469OperatingAnnualPreviousLibrary(), standalone=False)
+    registry.register_library(China469OperatingQuarterPreviousLibrary(), standalone=False)
+    registry.register_factor_set("china469_pit", (
+        "china469_cop", "china469_cla", "china469_claq", "china469_cbe",
+        "china469_operating_annual_lag", "china469_operating_quarter_lag",
+    ))
     registry.register_factor_selection(OAP_JQ_CNC_SELECTION)
     return registry
 

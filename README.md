@@ -120,7 +120,7 @@ rquant doctor
 - NumPy、Pandas、PyArrow、LightGBM 等依赖能否导入；
 - KunQuant 所用的 C++ 编译器（macOS 为 `clang++`，Windows 为 `cl.exe`）；
 - Tushare token；
-- 2064 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
+- 2070 个当前可构建因子的固定目录（Alpha158、Alpha101、GTJA191、Alpha360、china_chars、size_value_china、talib、jq240、oap、
   barra_cne6、tushare_tech、jkp153、jkp406、china469_pit）；
 - 默认配置和本地数据清单；
 - Tushare 所需接口的实际访问权限。
@@ -371,7 +371,7 @@ rquant factors catalog --factor-set jq240 --format csv --output factor_catalog.c
   见下文“JKP 因子集 jkp153”。
 - `jkp406`：`jkpx_001` 至 `jkpx_364`，共 364 列，JKP 扩展特征的 Tushare 日频版本，包含原 144 个定义及 220 个扩展定义；
   可核实清单、40 个排除项和官方名称数量差异见下文。
-- `china469_pit`：`cnax_001` 至 `cnax_004`，按原文形成时间重写 Cop、Cla、Claq、Cbe 的 Tushare 版本，见下文。
+- `china469_pit`：`cnax_001` 至 `cnax_010`，按原文形成时间重写现金经营利润及营业利润类指标的 Tushare 版本，见下文。
 
 原先把 Alpha158 与 Alpha101 拼成 259 列的 `combined` 因子集已移除；`runs/` 下用它跑出的历史结果仍保留，
 但当前代码不再构建或读取 `data/factors/combined`。
@@ -832,20 +832,22 @@ rquant factors validate --factor-set jkp406
 
 ### China 469 形成时点因子 `china469_pit`
 
-这四列来自 Li、Liu、Liu、Wei 的 [469 项异常补充材料](https://pubsonline.informs.org/doi/suppl/10.1287/mnsc.2023.4904/suppl_file/mnsc.2023.4904.sm1.pdf) A.4.18–21：
+这十列来自 Li、Liu、Liu、Wei 的 [469 项异常补充材料](https://pubsonline.informs.org/doi/suppl/10.1287/mnsc.2023.4904/suppl_file/mnsc.2023.4904.sm1.pdf) A.4.12–21：
 `cnax_001` Cop 使用年度（营业利润−净利润＋经营现金流）／当年总资产；`cnax_002` Cla 的分母为上年末总资产；
 `cnax_003` Claq 使用单季分子和上一季末总资产；`cnax_004` Cbe 用年度分子除当年末股东权益（含少数股东权益）。现有 JKP、OAP 的相关列采用不同利润重构或窗口，不能当成相同定义。
+`cnax_005` Opa 和 `cnax_006` Ope 使用年度营业利润，分别除当年末资产和股东权益；`cnax_007` Ola 与 `cnax_008` Ole 使用上一年末资产和权益；`cnax_009` Olaq 与 `cnax_010` Oleq 使用单季营业利润和上一季末资产、权益。
 
 年度值在六月最后交易日收盘形成，只使用当时已公告的上一年年报，并固定到下一次形成；缺少指定年报或 Cla 所需的上年资产时清空，而非事后回填。
 季度值在月初首个交易日形成，要求报告期末至少早四个自然月，且当期及所需前一季报告均在形成日之前公告；缺所需报告时回退到较早合格季度是本项目约定。
 累计流量逐季转成单季值，分母为零、数据缺失或非有限行情时输出为空。形成日后发生的披露不回填。
 
 财务字段使用 Tushare `operate_profit`、`n_income`、`n_cashflow_act`、`total_assets` 和 `total_hldr_eqy_inc_min_int`，保留首次公告约束；尚未验证与 CSMAR 同值，不能声称逐值复现论文。
+财报参考表对同一报告期各已发布报表的可用日期取最晚值；因此即使某个指标只用利润表和资产负债表，较晚的现金流量表也可能使其保守延后。
 Cbe 的权益口径按 CSMAR 财报字典 A003000000“所有者权益合计”选择 Tushare 含少数股东权益的总权益；[CSMAR 字典](https://cn.ceibs.edu/pdf/library/40033.pdf) 同时将 A003100000 单列为归母权益。
 使用完整的 SSE 交易日历确定形成日，记录实际文件哈希；旧参考清单未列出日历哈希时，还需验证原始 Tushare 日历分区及原始同步指纹。
 旧版同步总清单未保存各分区摘要列表：对比可以发现单侧篡改，但不能证明同步替换的原始分区和参考日历仍属于当时的原始快照。
 月初信号在该日输出，项目下一交易日开盘成交会比月初开盘形成晚一个交易日；日历假定历史开闭市安排可用于确定形成边界。
-四列分别以年度当期、年度前期、季度前期锚点发布，以小型测试核对公式、截断、晚公告、缺年、零分母、非有限行情及日历篡改；尚未进行全市场构建或生产回测。
+十列分别以年度当期、年度前期、季度前期锚点发布，以小型测试核对公式、截断、晚公告、缺年、零分母、非有限行情及日历篡改；尚未进行全市场构建或生产回测。
 
 ### 验证因子
 

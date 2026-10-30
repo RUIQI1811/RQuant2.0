@@ -1,6 +1,6 @@
 """Source-timing China anomaly definitions, independently adapted to Tushare.
 
-Li, Liu, Liu and Wei (2024), Management Science, appendix A.4.18–21.
+Li, Liu, Liu and Wei (2024), Management Science, appendix A.4.12–21.
 Source CSMAR values and Tushare values have not been shown equal. Annual
 signals form at June close; quarter signals form at the first monthly trading
 day using reports known before that day. A missing prior report falls back to
@@ -149,8 +149,7 @@ class _Base(FactorLibrary):
             denominator = inputs[EQUITY_FIELD] if self.source == "Cbe" else inputs["total_assets"]
             if self.mode == "annual_previous":
                 denominator = k.delay(denominator, 4)
-        value = k.replace_inf((profit - income + cash) / denominator)
-        return {self.output: k.mask(value, k.ne(denominator, 0.0))}
+        return {self.output: _profit_ratio(profit - income + cash, denominator)}
 
     def build(self, inputs: dict[str, Any]) -> dict[str, Any]:
         return {}
@@ -186,6 +185,62 @@ class China469QuarterPreviousLibrary(_Base):
 class China469EquityLibrary(_Base):
     family = "china469_cbe"
     mode, source, column, output, ordinal = "annual_current", "Cbe", "cnax_004", "y_cnax_cbe", 4
-    statement_fields = (EQUITY_FIELD, "operate_profit", "n_income", "n_cashflow_act")
-    statement_outputs = (output,)
-    statement_factors = {source: output}
+    statement_fields = (*FIELDS, EQUITY_FIELD)
+    statement_outputs = (output, "y_cnax_opa", "y_cnax_ope")
+    statement_factors = {source: output, "Opa": "y_cnax_opa", "Ope": "y_cnax_ope"}
+
+    @property
+    def specs(self) -> tuple[FactorSpec, ...]:
+        return (*super().specs, *_profit_specs(self.family, (("Opa", 5), ("Ope", 6))))
+
+    def build_statements(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        return {**super().build_statements(inputs),
+                "y_cnax_opa": _profit_ratio(inputs["operate_profit"], inputs["total_assets"]),
+                "y_cnax_ope": _profit_ratio(inputs["operate_profit"], inputs[EQUITY_FIELD])}
+
+
+def _profit_ratio(numerator: Any, denominator: Any) -> Any:
+    finite = k.valid(k.replace_inf(numerator), k.replace_inf(denominator))
+    return k.mask(k.replace_inf(numerator / denominator), k.all_of(finite, k.ne(denominator, 0.0)))
+
+
+def _profit_specs(family: str, names: tuple[tuple[str, int], ...]) -> tuple[FactorSpec, ...]:
+    return tuple(FactorSpec(f"cnax_{ordinal:03d}", name, family, ordinal,
+                            f"{name}: Tushare operating profit with frozen formation dates", 1,
+                            f"{__name__}.{name}", 1) for name, ordinal in names)
+
+
+class _OperatingLagBase(_Base):
+    statement_fields = ("operate_profit", "total_assets", EQUITY_FIELD)
+    names: tuple[tuple[str, int], ...]
+
+    @property
+    def specs(self) -> tuple[FactorSpec, ...]:
+        return _profit_specs(self.family, self.names)
+
+    def build_statements(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        profit = inputs["operate_profit"]
+        periods = 4
+        if self.mode == "monthly_previous":
+            profit = k.select(k.eq(inputs["fiscal_quarter"], 0), profit, profit - k.delay(profit, 1))
+            periods = 1
+        assets = k.delay(inputs["total_assets"], periods)
+        equity = k.delay(inputs[EQUITY_FIELD], periods)
+        return {self.statement_outputs[0]: _profit_ratio(profit, assets),
+                self.statement_outputs[1]: _profit_ratio(profit, equity)}
+
+
+class China469OperatingAnnualPreviousLibrary(_OperatingLagBase):
+    family = "china469_operating_annual_lag"
+    mode, source, column, output, ordinal = "annual_previous", "Ola", "cnax_007", "y_cnax_ola", 7
+    names = (("Ola", 7), ("Ole", 8))
+    statement_outputs = (output, "y_cnax_ole")
+    statement_factors = {"Ola": output, "Ole": "y_cnax_ole"}
+
+
+class China469OperatingQuarterPreviousLibrary(_OperatingLagBase):
+    family = "china469_operating_quarter_lag"
+    mode, source, column, output, ordinal = "monthly_previous", "Olaq", "cnax_009", "q_cnax_olaq", 9
+    names = (("Olaq", 9), ("Oleq", 10))
+    statement_outputs = (output, "q_cnax_oleq")
+    statement_factors = {"Olaq": output, "Oleq": "q_cnax_oleq"}
