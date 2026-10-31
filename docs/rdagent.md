@@ -16,21 +16,50 @@ RD-Agent 只用固定的 train/valid/test 三段，并且**用 test 段的 IC �
 - 2022 年以后只留给 RQuant 的 walk-forward；拿挖到的因子报告结果时，只有 2022 年以后的年份算样本外。
 
 导出的股票是挖掘窗口内任意时点的沪深 300 成分（历史时点可知），每只股票保留它在导出范围内的全部行情，
-这样滚动窗口有预热数据；字段和 RD-Agent 自带的 `daily_pv.h5` 一致：`$open $close $high $low $volume $factor`，
-价格为后复权（`$close / $factor` 是原始价格）。
+这样滚动窗口有预热数据。字段是 `$open $close $high $low $volume $amount $vwap`：价格为后复权，每只股票首日
+收盘价归一为 1；`$amount` 是成交额（元，不复权），`$volume * $vwap = $amount`。
+
+RD-Agent 自带的数据还有复权因子 `$factor`，它的数据说明把它写成 "factor value of the stock"。第一次 16 轮试跑中，
+LLM 有一半轮次把它当成基本面数据来构造因子，挖出来的东西只是在测除权事件，所以导出时去掉了它，并用 bundle 里的
+`README.md` 替换 RD-Agent 的数据说明（它会原样进入写因子的提示词）。
 
 `rdagent_setup.py` 会改 RD-Agent 1.0.0 的三个 Qlib 因子模板：
 
 | 项目 | RD-Agent 默认 | 改为 |
 | --- | --- | --- |
-| 标签 | `Ref($close,-2)/Ref($close,-1)-1` | `Ref($open,-2)/Ref($open,-1)-1`（下一开盘到再下一开盘） |
+| 标签 | `Ref($close,-2)/Ref($close,-1)-1` | `Ref($open,-11)/Ref($open,-1)-1`（下一开盘起 10 日，`--label-days` 可改） |
 | 成交价 | close | open |
 | 买入成本 | 0.05% | 0.03%（佣金） |
 | 卖出成本 | 0.15% | 0.13%（佣金 + 0.1% 印花税） |
 | LightGBM 线程 | 20 | `--threads`，默认 4 |
 
 模型仍是 RD-Agent 自带的 LightGBM 和 qlib 的 TopkDropout（持股 50、每天最多换 5 只），基线因子是 qlib 自带的
-Alpha158 表达式。它只用来给候选因子排序，不替代 RQuant 的组合回测。
+Alpha158 表达式。它只用来给候选因子排序，不替代 RQuant 的组合回测。标签用 10 日而不是 1 日：1 日收益噪声太大，
+前两次运行里 IC 只有 0.02 左右，好坏因子难以区分；CogAlpha、AlphaForge 等论文都用 10–20 日。挖到的因子最后仍在
+RQuant 的 1 日 walk-forward 里检验。
+
+### 新颖度筛选
+
+RD-Agent 1.0.0 只在新因子和它已采纳的因子日均相关达到 0.99 时才当作重复，从不和 Alpha158 等已知因子库比；
+它还会把任一因子缺失的股票日整行删掉。前两次运行（36 轮）挖到的全是 Alpha158 的变体，其中一个大部分时间为空的
+因子让组合因子表只剩 18% 的行。`rdagent_setup.py` 因此改了它的 `factor_runner.py`（原文件备份为
+`factor_runner.py.orig`），改用 `rdagent_novelty.py` 筛选：
+
+- 新因子和参考因子（默认 `qlib_alpha158`、`wq_alpha101`、`gtja191`、`talib`，由导出时从 RQuant 的因子库抽样）
+  或本次已采纳的因子，日均截面秩相关的绝对值 ≥ 0.7 就拒绝；
+- 在参考样本（各抽样日的沪深 300 成分）上有值的比例不到 70% 也拒绝；
+- 代码里有 `shift(-n)` 或 `center=True`（会读到未来的行）就拒绝；
+- 同一天各股票几乎取同一个值（全市场的偏度、状态权重之类，或者像 `$amount / ($volume * $vwap)` 这样恒等于 1
+  的比值）也拒绝：截面模型用不上它，秩相关也没法和别的因子比较；
+- 一轮的因子全被拒时，拒绝原因（和哪个已有因子相关多少）作为报错交给 RD-Agent，作为下一轮的反馈；
+- 不再删除有缺失值的行，qlib 的数据加载把这些因子左连接到 Alpha158 上，LightGBM 自己处理缺失。
+
+RD-Agent 把回测结果缓存在 `<workdir>/pickle_cache`，缓存键只看因子任务、不看模板，改了标签以后 Alpha158 基线会
+直接读到旧标签的结果。准备脚本因此在回测设置（标签、线程数、模板、筛选代码、导出包）变化时，把旧缓存改名为
+`pickle_cache.stale-<时间>`，确认不需要后可以删掉。
+
+两个门槛可以在 `.env` 里用 `RQUANT_MAX_CORRELATION`、`RQUANT_MIN_COVERAGE` 覆盖。数据说明 `README.md` 也写明了
+这条规则，并提示了 A 股文献里的方向（隔夜和日内收益分开、按截面离散度切换动量和反转）。
 
 ## 2. 在 Windows 上准备 WSL2
 
@@ -70,11 +99,17 @@ rquant data build-qlib          # 确保 data/qlib 是最新的
 rquant rdagent export           # 写入 data/rdagent/
 ```
 
+参考因子集需要先用 `rquant factors build --factor-set <名字>` 建好；用 `--reference-sets` 换成别的集合，传空字符串
+`--reference-sets ""` 则不做参考比较（仍会和本次已采纳的因子比）。
+
 `data/rdagent/` 包括：
 
 ```text
 factor_source_data/daily_pv.parquet         全量：挖掘窗口内的沪深 300 历史成分
 factor_source_data_debug/daily_pv.parquet   调试：最后两年、前 100 只
+README.md                                   给 LLM 的数据说明（替换 RD-Agent 自带的）
+reference_factors.parquet                   参考因子在约 150 个抽样交易日上的值，供新颖度筛选
+rdagent_novelty.py                          新颖度筛选，准备脚本把它装进 RD-Agent
 rdagent.env                                 .env 模板（千问 / 百炼，API key 留空）
 rdagent_setup.py                            在 WSL 里运行的准备脚本
 manifest.json                               窗口、行数、哈希和 Qlib provider 指纹
@@ -95,7 +130,7 @@ python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" \
 ```
 
 脚本会把 Parquet 转成 RD-Agent 读取的 `git_ignore_folder/factor_implementation_source_data*/daily_pv.h5`，改好上面的
-模板（原文件备份为 `*.yaml.orig`，重复运行总是从备份重新改），并在工作目录写入 `.env`（已存在则不覆盖）。
+模板（原文件备份为 `*.yaml.orig`，重复运行总是从备份重新改）、给 RD-Agent 的 embedding 接口打分批补丁、装上新颖度筛选，并在工作目录写入 `.env`（已存在则不覆盖）。
 
 编辑 `~/rdagent-work/.env`，填 `DASHSCOPE_API_KEY`：在阿里云百炼控制台（中国内地地域）开通服务并创建 API Key。
 同一个 key 同时用于 chat 模型 `qwen-plus` 和 embedding 模型 `text-embedding-v4`，都走 LiteLLM 自带的 DashScope
@@ -103,14 +138,26 @@ python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" \
 
 - `qwen-plus` 上下文 128k，够用且便宜；想要更强可以改成 `qwen3-max`。不要用 `qwen-max`：它只有 30k 上下文，
   装不下 RD-Agent 的提示词；也不要用 QwQ 等推理模型（输出 `<think>`，慢且贵，要用就得再加 `REASONING_THINK_RM=True`）；
-- `EMBEDDING_MAX_STR_NUM=10`：百炼的 embedding 每次最多 10 条，RD-Agent 默认一次发 50 条；
+- `EMBEDDING_MAX_STR_NUM=10`：百炼的 embedding 每次最多 10 条。RD-Agent 1.0.0 的 LiteLLM 接口其实不读这个设置，
+  会把所有文本一次发出，知识库超过 10 条后（约第 5 轮）报 `batch size is invalid`；准备脚本会给它的
+  `rdagent/oai/backend/litellm.py` 打补丁按这个值分批（原文件备份为 `litellm.py.orig`）；
 - `.env` 里还留了 DeepSeek（chat）+ 硅基流动（embedding）的注释配置，想换时注释掉千问那几行即可。
 
 ## 5. 运行
 
+先确认 key 和模型能用（发一次 JSON 模式的 chat 和一次 embedding，走的是 RD-Agent 自己的 LLM 接口）：
+
+```bash
+python "/mnt/d/自己瞎搞/RQuant2.0/data/rdagent/rdagent_setup.py" --workdir ~/rdagent-work --check-llm
+```
+
+不要用 `rdagent health_check` 检查：RD-Agent 1.0.0 的这个命令只认 OpenAI 和 DeepSeek 的 key，遇到千问配置会报
+`UnboundLocalError: local variable 'embedding_model' referenced before assignment`，并不代表配置有错。
+
+两行都显示 OK 后开始挖：
+
 ```bash
 cd ~/rdagent-work
-rdagent health_check --no-check-docker
 rdagent fin_factor --loop-n 20
 ```
 
