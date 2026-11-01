@@ -33,8 +33,9 @@ from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
 from rquant.runs import RunContext
 from rquant.universe import SUPPORTED_UNIVERSES
-from rquant.workflow.backtest import PortfolioBacktestRunner, PortfolioConfig
+from rquant.workflow.backtest import STRATEGIES, PortfolioBacktestRunner, PortfolioConfig
 from rquant.workflow.runner import RollingWorkflowRunner
+from rquant.workflow.signal_analysis import SignalAnalysisRunner
 
 LOCKED_DEPENDENCIES = {"pyqlib": "0.9.7", "KunQuant": "0.1.11", "tushare": "1.4.29", "TA-Lib": "0.8.2"}
 
@@ -128,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--topk", type=int, help="Override backtest.topk")
     report.add_argument("--n-drop", type=int, help="Override backtest.n_drop")
     report.add_argument("--rebalance-days", type=int, help="Override backtest.rebalance_days")
+    report.add_argument(
+        "--strategy",
+        choices=STRATEGIES,
+        help="Override backtest.strategy: equal-weight top-K, or Qlib enhanced indexing with a risk model",
+    )
     report.set_defaults(handler=_report, run_category="report")
 
     rdagent = commands.add_parser("rdagent", help="Exchange data with Microsoft RD-Agent factor mining")
@@ -643,6 +649,8 @@ def _report(args: argparse.Namespace) -> int:
             impact_cost=float(backtest.get("impact_cost", 0.0)),
             universe=_walk_forward_universe(run_directory, config),
             rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
+            strategy=args.strategy or str(backtest.get("strategy", "topk-dropout")),
+            **_enhanced_indexing_options(backtest.get("enhanced_indexing") or {}),
         )
         run.add_input("walk_forward_run_id", args.run_id)
         run.add_input("walk_forward_run_directory", str(run_directory))
@@ -653,7 +661,9 @@ def _report(args: argparse.Namespace) -> int:
             qlib_root=paths.qlib,
             run_directory=run_directory,
             config=portfolio_config,
+            reference_root=paths.canonical / "reference",
         ).run()
+        signal = SignalAnalysisRunner(qlib_root=paths.qlib, run_directory=run_directory).run()
         report = build_report(run_directory)
         manifest_path = run_directory / "run.json"
         if manifest_path.exists():
@@ -666,7 +676,7 @@ def _report(args: argparse.Namespace) -> int:
             atomic_write_json(manifest_path, run_manifest)
             with (run_directory / "run.log").open("a", encoding="utf-8") as handle:
                 handle.write(f"{run_manifest['report_completed_at']} report completed run_id={run.run_id}\n")
-        return {"walk_forward_run_id": args.run_id, "backtest": portfolio, "report": report}
+        return {"walk_forward_run_id": args.run_id, "backtest": portfolio, "signal": signal, "report": report}
 
     return _run(args, action)
 
@@ -710,6 +720,25 @@ def _require_factor_universe(manifest_path: Path, universe: str) -> None:
             f"Factor store {manifest_path.parent} was built for universe {built!r}, not {universe!r}; "
             "rebuild it with `rquant factors build` for this universe"
         )
+
+
+ENHANCED_INDEXING_OPTIONS = {
+    "risk_lookback_days": int,
+    "risk_factors": int,
+    "risk_aversion": float,
+    "turnover_limit": float,
+    "benchmark_deviation": float,
+    "risk_degree": float,
+}
+
+
+def _enhanced_indexing_options(section: dict[str, Any]) -> dict[str, Any]:
+    """PortfolioConfig fields from the ``backtest.enhanced_indexing`` config section; a null benchmark_deviation
+    removes the per-stock limit."""
+    unknown = sorted(set(section).difference(ENHANCED_INDEXING_OPTIONS))
+    if unknown:
+        raise DataContractError(f"Unknown backtest.enhanced_indexing keys: {unknown}")
+    return {key: None if value is None else ENHANCED_INDEXING_OPTIONS[key](value) for key, value in section.items()}
 
 
 def _walk_forward_universe(run_directory: Path, config: dict[str, Any]) -> str:

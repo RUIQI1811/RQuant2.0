@@ -85,6 +85,29 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, code)
             self.assertEqual(paths.runs, run_directory.parent)
 
+    def test_report_strategy_flag_and_enhanced_indexing_options(self) -> None:
+        import yaml
+
+        from rquant.cli import _enhanced_indexing_options
+        from rquant.workflow.backtest import PortfolioConfig
+
+        args = build_parser().parse_args(["report", "run-id", "--strategy", "enhanced-indexing"])
+        self.assertEqual("enhanced-indexing", args.strategy)
+        self.assertIsNone(build_parser().parse_args(["report", "run-id"]).strategy)
+        with (Path(__file__).resolve().parents[1] / "config" / "default.yaml").open("r", encoding="utf-8") as handle:
+            backtest = yaml.safe_load(handle)["backtest"]
+        self.assertEqual("topk-dropout", backtest["strategy"])
+        options = _enhanced_indexing_options(backtest["enhanced_indexing"])
+        config = PortfolioConfig(strategy="enhanced-indexing", **options)
+        self.assertEqual((240, 10, 0.2, 0.01), (
+            config.risk_lookback_days, config.risk_factors, config.turnover_limit, config.benchmark_deviation
+        ))
+        self.assertIsNone(_enhanced_indexing_options({"benchmark_deviation": None})["benchmark_deviation"])
+        with self.assertRaises(DataContractError):
+            _enhanced_indexing_options({"lambda": 1})
+        with self.assertRaises(ValueError):
+            PortfolioConfig(strategy="risk-parity")
+
     def test_report_run_resolution_prefers_categorized_directory(self) -> None:
         with TemporaryDirectory() as temporary:
             runs_root = Path(temporary)

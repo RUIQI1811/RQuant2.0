@@ -12,10 +12,14 @@ from rquant.factors.catalog import FactorSet, get_catalog
 from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.loader import KunQuantDataLoader
 from rquant.qlib_ext.runtime import qlib_init_kwargs
-from rquant.workflow.lgb_window import Segment, fit_lgb_window
+from rquant.workflow.lgb_window import Segment, feature_importance, fit_double_ensemble_window, fit_lgb_window
 from rquant.workflow.rolling import generate_rolling_windows, previous_trading_day
 
 ModelName = Literal["lgb", "double-ensemble"]
+
+# Qlib's Alpha158 DoubleEnsemble benchmark trains every sub-model for a fixed number of rounds without early stopping
+# (examples/benchmarks/DoubleEnsemble/workflow_config_doubleensemble_Alpha158.yaml), so there is nothing to tune.
+DOUBLE_ENSEMBLE_EPOCHS = 28
 
 
 class RollingWorkflowRunner:
@@ -81,7 +85,9 @@ class RollingWorkflowRunner:
             raise DataContractError("No rolling windows are available for the requested range")
 
         all_predictions = []
+        all_importance = []
         window_manifests = []
+        factor_names = get_catalog().canonical_names(self.factor_set)
         for window in windows:
             np.random.seed(self.seed + window.prediction_year)
             window_dir = self.run_directory / f"year={window.prediction_year}"
@@ -100,22 +106,25 @@ class RollingWorkflowRunner:
                 "test": (window.test_start.isoformat(), window.test_end.isoformat()),
             }
             experiment_name = f"rquant-{self.factor_set}-{self.horizon}-{self.model_name}"
-            tuning_model = self._model()
-            with R.start(experiment_name=experiment_name, recorder_name=f"tune-{window.prediction_year}"):
-                self._fit(
-                    tuning_model,
-                    DataHandlerLP,
-                    DatasetH,
-                    R,
-                    fit_start=window.train_start,
-                    fit_end=usable_inner_end,
-                    data_end=window.validation_end,
-                    segments=tune_segments,
-                )
-            chosen_iterations = _best_iterations(tuning_model)
-            # Release the tuning panel before the refit panel is loaded so the two never sit in memory together.
-            del tuning_model
-            gc.collect()
+            if self.model_name == "double-ensemble":
+                chosen_iterations = DOUBLE_ENSEMBLE_EPOCHS
+            else:
+                tuning_model = self._model()
+                with R.start(experiment_name=experiment_name, recorder_name=f"tune-{window.prediction_year}"):
+                    self._fit(
+                        tuning_model,
+                        DataHandlerLP,
+                        DatasetH,
+                        R,
+                        fit_start=window.train_start,
+                        fit_end=usable_inner_end,
+                        data_end=window.validation_end,
+                        segments=tune_segments,
+                    )
+                chosen_iterations = _best_iterations(tuning_model)
+                # Release the tuning panel before the refit panel is loaded so the two never sit in memory together.
+                del tuning_model
+                gc.collect()
 
             final_model = self._model(iterations=chosen_iterations, refit=True)
             with R.start(experiment_name=experiment_name, recorder_name=f"refit-{window.prediction_year}"):
@@ -137,6 +146,10 @@ class RollingWorkflowRunner:
             prediction_frame.to_parquet(prediction_path, index=False)
             with (window_dir / "model.pkl").open("wb") as handle:
                 pickle.dump(final_model, handle)
+            importance = feature_importance(final_model, factor_names)
+            importance.to_parquet(window_dir / "feature_importance.parquet", index=False)
+            importance.insert(0, "prediction_year", window.prediction_year)
+            all_importance.append(importance)
 
             window_manifest = {
                 **asdict(window),
@@ -159,6 +172,9 @@ class RollingWorkflowRunner:
         if combined.duplicated(["datetime", "instrument"]).any():
             raise DataContractError("Rolling predictions overlap across test years")
         combined.to_parquet(self.run_directory / "predictions.parquet", index=False)
+        pd.concat(all_importance, ignore_index=True).to_parquet(
+            self.run_directory / "feature_importance.parquet", index=False
+        )
         manifest = {
             "status": "complete",
             "model": self.model_name,
@@ -190,26 +206,26 @@ class RollingWorkflowRunner:
     ) -> Any:
         """Fit ``model`` on one window and return its test predictions (None without a test segment).
 
-        LightGBM goes through ``fit_lgb_window``, which gives the same predictions as the Qlib dataset path below while
-        holding one copy of the panel instead of up to four; DoubleEnsemble keeps the Qlib path.
+        LightGBM goes through ``fit_lgb_window`` and DoubleEnsemble through ``fit_double_ensemble_window``. Both give
+        the same predictions as fitting on the Qlib dataset that ``_handler`` describes (the tests compare them), while
+        holding one copy of the panel instead of up to four.
         """
+        loader = KunQuantDataLoader(str(self.factor_root), self.factor_set, self.horizon)
+        test = segments.get("test")
+        window = {
+            "fit_start": fit_start.isoformat(),
+            "fit_end": fit_end.isoformat(),
+            "train": Segment(*segments["train"]),
+            "valid": Segment(*segments["valid"]),
+            "test": Segment(*test) if test is not None else None,
+        }
+
+        def load_panel() -> Any:
+            return loader.load(self.universe, fit_start.isoformat(), data_end.isoformat())
+
         if self.model_name == "lgb":
-            loader = KunQuantDataLoader(str(self.factor_root), self.factor_set, self.horizon)
-            test = segments.get("test")
-            return fit_lgb_window(
-                model,
-                lambda: loader.load(self.universe, fit_start.isoformat(), data_end.isoformat()),
-                fit_start=fit_start.isoformat(),
-                fit_end=fit_end.isoformat(),
-                train=Segment(*segments["train"]),
-                valid=Segment(*segments["valid"]),
-                test=Segment(*test) if test is not None else None,
-                log_metrics=R.log_metrics,
-            )
-        handler = self._handler(DataHandlerLP, fit_start=fit_start, fit_end=fit_end, data_end=data_end)
-        dataset = DatasetH(handler=handler, segments=segments)
-        model.fit(dataset)
-        return model.predict(dataset, segment="test") if "test" in segments else None
+            return fit_lgb_window(model, load_panel, log_metrics=R.log_metrics, **window)
+        return fit_double_ensemble_window(model, load_panel, **window)
 
     def _handler(self, DataHandlerLP: Any, *, fit_start: date, fit_end: date, data_end: date) -> Any:
         loader = KunQuantDataLoader(str(self.factor_root), self.factor_set, self.horizon)
@@ -260,20 +276,32 @@ class RollingWorkflowRunner:
                 num_boost_round=iterations or 1000,
                 **common,
             )
+        # Qlib's Alpha158 DoubleEnsemble benchmark configuration, with RQuant's thread count and seed.
         return DEnsembleModel(
-            num_models=6,
+            base_model="gbm",
+            loss="mse",
+            num_models=3,
             enable_sr=True,
             enable_fs=True,
-            alpha1=0.23,
-            alpha2=0.05,
+            alpha1=1,
+            alpha2=1,
             bins_sr=10,
             bins_fs=5,
             decay=0.5,
             sample_ratios=[0.8, 0.7, 0.6, 0.5, 0.4],
-            sub_weights=[1, 0.2, 0.2, 0.2, 0.2, 0.2],
-            epochs=iterations or 100,
-            early_stopping_rounds=None if refit else 20,
-            **common,
+            sub_weights=[1, 1, 1],
+            epochs=iterations or DOUBLE_ENSEMBLE_EPOCHS,
+            early_stopping_rounds=None,
+            colsample_bytree=0.8879,
+            learning_rate=0.2,
+            subsample=0.8789,
+            lambda_l1=205.6999,
+            lambda_l2=580.9768,
+            max_depth=8,
+            num_leaves=210,
+            num_threads=8,
+            seed=self.seed,
+            verbosity=-1,
         )
 
 

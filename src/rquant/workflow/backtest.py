@@ -10,6 +10,8 @@ from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.exchange import AshareCostModel, AshareExchange
 from rquant.qlib_ext.runtime import qlib_init_kwargs
 
+STRATEGIES = ("topk-dropout", "enhanced-indexing")
+
 
 @dataclass(frozen=True)
 class PortfolioConfig:
@@ -27,6 +29,17 @@ class PortfolioConfig:
     # Trade only every `rebalance_days` trading days, counted from the first prediction date. With n_drop == topk each
     # rebalance replaces every holding that fell out of the latest top-K, so the book becomes that top-K.
     rebalance_days: int = 1
+    # "topk-dropout" holds the equal-weighted top K. "enhanced-indexing" weights the whole universe with Qlib's
+    # EnhancedIndexingOptimizer against the universe's float-cap index (rquant.qlib_ext.strategy); topk and n_drop are
+    # then unused.
+    strategy: str = "topk-dropout"
+    risk_lookback_days: int = 240
+    risk_factors: int = 10
+    risk_aversion: float = 1.0
+    # Qlib's optimiser needs a number here; 2.0 (sell the whole book and buy a new one) leaves turnover unlimited.
+    turnover_limit: float = 0.2
+    benchmark_deviation: float | None = 0.01
+    risk_degree: float = 0.95
 
     def __post_init__(self) -> None:
         if self.topk < 1:
@@ -35,10 +48,22 @@ class PortfolioConfig:
             raise ValueError(f"n_drop must be between 1 and topk={self.topk}, got {self.n_drop}")
         if self.rebalance_days < 1:
             raise ValueError(f"rebalance_days must be at least 1, got {self.rebalance_days}")
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"strategy must be one of {STRATEGIES}, got {self.strategy}")
+        if self.risk_lookback_days < 2 or self.risk_factors < 1:
+            raise ValueError("risk_lookback_days must be at least 2 and risk_factors at least 1")
+        if self.risk_aversion < 0:
+            raise ValueError(f"risk_aversion must not be negative, got {self.risk_aversion}")
+        if self.turnover_limit < 0:
+            raise ValueError(f"turnover_limit must not be negative, got {self.turnover_limit}")
+        if self.benchmark_deviation is not None and self.benchmark_deviation < 0:
+            raise ValueError(f"benchmark_deviation must not be negative, got {self.benchmark_deviation}")
+        if not 0 < self.risk_degree <= 1:
+            raise ValueError(f"risk_degree must be in (0, 1], got {self.risk_degree}")
 
 
 class PortfolioBacktestRunner:
-    """Run Qlib TopkDropoutStrategy on the saved out-of-sample predictions."""
+    """Run Qlib TopkDropoutStrategy or EnhancedIndexingStrategy on the saved out-of-sample predictions."""
 
     def __init__(
         self,
@@ -46,10 +71,14 @@ class PortfolioBacktestRunner:
         qlib_root: str | Path,
         run_directory: str | Path,
         config: PortfolioConfig | None = None,
+        reference_root: str | Path | None = None,
     ) -> None:
         self.qlib_root = Path(qlib_root)
         self.run_directory = Path(run_directory)
         self.config = config or PortfolioConfig()
+        self.reference_root = Path(reference_root) if reference_root is not None else None
+        if self.config.strategy == "enhanced-indexing" and self.reference_root is None:
+            raise DataContractError("enhanced-indexing needs the reference data root for float market caps")
 
     def run(self) -> dict[str, Any]:
         qlib, pd, np = _dependencies()
@@ -72,6 +101,8 @@ class PortfolioBacktestRunner:
         from qlib.constant import REG_CN
         from qlib.contrib.strategy import TopkDropoutStrategy
         from qlib.data import D
+
+        from rquant.qlib_ext.strategy import EnhancedIndexingStrategy
 
         qlib.init(provider_uri=str(self.qlib_root), region=REG_CN, **qlib_init_kwargs())
         start_time = predictions["datetime"].min()
@@ -107,16 +138,27 @@ class PortfolioBacktestRunner:
             trade_unit=self.config.trade_unit,
             impact_cost=self.config.impact_cost,
         )
-        strategy_class = _liquidating_strategy_class(TopkDropoutStrategy)
-        strategy = strategy_class(
-            signal=signal,
-            topk=self.config.topk,
-            n_drop=self.config.n_drop,
-            risk_degree=1.0,
-            hold_thresh=1,
-            only_tradable=True,
-            forbid_all_trade_at_limit=False,
-        )
+        if self.config.strategy == "enhanced-indexing":
+            strategy = _liquidating_strategy_class(EnhancedIndexingStrategy)(
+                signal=signal,
+                risk_data=self._risk_data(D, pd, predictions, start_time, end_time),
+                optimizer_kwargs={
+                    "lamb": self.config.risk_aversion,
+                    "delta": self.config.turnover_limit,
+                    "b_dev": self.config.benchmark_deviation,
+                },
+                risk_degree=self.config.risk_degree,
+            )
+        else:
+            strategy = _liquidating_strategy_class(TopkDropoutStrategy)(
+                signal=signal,
+                topk=self.config.topk,
+                n_drop=self.config.n_drop,
+                risk_degree=1.0,
+                hold_thresh=1,
+                only_tradable=True,
+                forbid_all_trade_at_limit=False,
+            )
         executor_class = _zero_order_safe_executor_class(SimulatorExecutor)
         executor = executor_class(time_per_step="day", generate_portfolio_metrics=True, verbose=False)
         portfolio, indicators = backtest(
@@ -151,13 +193,21 @@ class PortfolioBacktestRunner:
             if abs(float(terminal_position.get_stock_amount(stock))) > 1e-12
         )
 
+        optimizations_path = None
+        if self.config.strategy == "enhanced-indexing":
+            optimizations_path = self.run_directory / "optimizations.parquet"
+            pd.DataFrame(
+                strategy.optimizations,
+                columns=["datetime", "universe", "holdings", "turnover", "active_share", "tracking_error"],
+            ).to_parquet(optimizations_path, index=False)
+
         net_returns = report["return"].astype(float) - report["cost"].astype(float)
         benchmark_returns = report["bench"].astype(float)
         metrics = _metrics(np, net_returns, benchmark_returns)
         manifest = {
             "status": "complete",
             "engine": "qlib.backtest",
-            "strategy": "LiquidatingTopkDropoutStrategy",
+            "strategy": type(strategy).__name__,
             "start": str(pd.Timestamp(start_time).date()),
             "end": str(pd.Timestamp(end_time).date()),
             "config": asdict(self.config),
@@ -166,8 +216,13 @@ class PortfolioBacktestRunner:
                 "rebalance": _rebalance_description(self.config),
                 "deal_price": "next trading day open",
                 "long_only": True,
-                "equal_weight": True,
-                "t_plus_one": "TopkDropoutStrategy hold_thresh=1",
+                "equal_weight": self.config.strategy == "topk-dropout",
+                "weights": _weighting_description(self.config),
+                "t_plus_one": (
+                    "TopkDropoutStrategy hold_thresh=1"
+                    if self.config.strategy == "topk-dropout"
+                    else "daily steps: a stock bought at one open is sold at the earliest on the next"
+                ),
                 "suspension": "Qlib $close NaN",
                 "open_limit": "direction-aware $limit_buy/$limit_sell",
                 "market_impact": (
@@ -191,10 +246,49 @@ class PortfolioBacktestRunner:
                 "positions": sha256_file(holdings_path),
                 "trades": sha256_file(trades_path),
                 "trade_indicators": sha256_file(indicators_path),
+                **({"optimizations": sha256_file(optimizations_path)} if optimizations_path is not None else {}),
             },
         }
         atomic_write_json(self.run_directory / "backtest.json", manifest)
         return manifest
+
+
+    def _risk_data(self, D: Any, pd: Any, predictions: Any, start_time: Any, end_time: Any) -> Any:
+        """Prices, volumes and float caps of every predicted instrument, from ``risk_lookback_days`` rows before the
+        first signal through the last trading day."""
+        from rquant.qlib_ext.strategy import RiskModelData, load_float_cap
+
+        assert self.reference_root is not None
+        calendar = D.calendar(end_time=start_time, freq="day")
+        if len(calendar) < self.config.risk_lookback_days:
+            raise DataContractError(
+                f"The provider calendar holds fewer than {self.config.risk_lookback_days} days before {start_time}"
+            )
+        history_start = calendar[-self.config.risk_lookback_days]
+        instruments = sorted(predictions["instrument"].unique())
+        quotes = D.features(instruments, ["$close", "$volume"], start_time=history_start, end_time=end_time, freq="day")
+        quotes.columns = ["close", "volume"]
+        close = quotes["close"].unstack(level="instrument").sort_index()
+        volume = quotes["volume"].unstack(level="instrument").sort_index()
+        float_cap = load_float_cap(self.reference_root, history_start, end_time, instruments)
+        return RiskModelData(
+            close=close,
+            volume=volume,
+            float_cap=float_cap,
+            lookback=self.config.risk_lookback_days,
+            num_factors=self.config.risk_factors,
+        )
+
+
+def _weighting_description(config: PortfolioConfig) -> str:
+    if config.strategy == "topk-dropout":
+        return f"equal weight across the top {config.topk}"
+    return (
+        "Qlib EnhancedIndexingOptimizer against the universe float-cap index: "
+        f"risk aversion {config.risk_aversion}, turnover limit {config.turnover_limit}, "
+        f"per-stock deviation {config.benchmark_deviation}, {config.risk_factors} PCA risk factors over "
+        f"{config.risk_lookback_days} days, risk degree {config.risk_degree}"
+    )
 
 
 def _rebalance_dates(pd: Any, calendar: Any, every: int) -> Any:
@@ -204,16 +298,18 @@ def _rebalance_dates(pd: Any, calendar: Any, every: int) -> Any:
 
 def _rebalance_description(config: PortfolioConfig) -> str:
     cadence = "daily" if config.rebalance_days == 1 else f"every {config.rebalance_days} trading days"
+    if config.strategy == "enhanced-indexing":
+        return f"{cadence}, re-optimised weights"
     if config.n_drop == config.topk:
         return f"{cadence}, full rebalance into the latest top {config.topk}"
     return f"{cadence}, drop at most {config.n_drop} of the top {config.topk}"
 
 
 def _liquidating_strategy_class(base_class: Any) -> type[Any]:
-    """Add a constrained final-step liquidation to Qlib's TopkDropoutStrategy."""
+    """Add a constrained final-step liquidation to a Qlib signal strategy."""
     from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
 
-    class LiquidatingTopkDropoutStrategy(base_class):  # type: ignore[misc,valid-type]
+    class LiquidatingStrategy(base_class):  # type: ignore[misc,valid-type]
         def generate_trade_decision(self, execute_result: Any = None) -> Any:
             trade_step = self.trade_calendar.get_trade_step()
             if trade_step + 1 < self.trade_calendar.get_trade_len():
@@ -222,7 +318,8 @@ def _liquidating_strategy_class(base_class: Any) -> type[Any]:
             trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
             orders = []
             for stock in sorted(self.trade_position.get_stock_list()):
-                if self.trade_position.get_stock_count(stock, bar=self.trade_calendar.get_freq()) < self.hold_thresh:
+                held_steps = self.trade_position.get_stock_count(stock, bar=self.trade_calendar.get_freq())
+                if held_steps < getattr(self, "hold_thresh", 1):
                     continue
                 if not self.trade_exchange.is_stock_tradable(
                     stock_id=stock,
@@ -243,7 +340,8 @@ def _liquidating_strategy_class(base_class: Any) -> type[Any]:
                     orders.append(order)
             return TradeDecisionWO(orders, self)
 
-    return LiquidatingTopkDropoutStrategy
+    LiquidatingStrategy.__name__ = LiquidatingStrategy.__qualname__ = f"Liquidating{base_class.__name__}"
+    return LiquidatingStrategy
 
 
 def _zero_order_safe_executor_class(base_class: Any) -> type[Any]:

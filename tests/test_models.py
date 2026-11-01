@@ -221,6 +221,100 @@ class LeanLGBWindowTests(unittest.TestCase):
                 else:
                     pd.testing.assert_series_equal(expected, actual, check_exact=True)
 
+    # Break caught: a lean DoubleEnsemble window whose segments, labels or feature names drift from the Qlib dataset
+    # path, which would change its sample re-weighting, feature selection or predictions.
+    def test_lean_double_ensemble_predicts_exactly_what_the_qlib_dataset_path_predicts(self) -> None:
+        from unittest import mock
+
+        import numpy as np
+        import pandas as pd
+        from qlib.data.dataset import DatasetH
+        from qlib.data.dataset.handler import DataHandlerLP
+        from qlib.data.dataset.loader import DataLoader
+        from qlib.workflow import R
+
+        from rquant.workflow import runner as runner_module
+        from rquant.workflow.runner import RollingWorkflowRunner
+
+        panel, dates = self._panel(np.random.default_rng(11))
+
+        class FixedLoader(DataLoader):
+            def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                pass
+
+            def load(self, instruments=None, start_time=None, end_time=None):  # type: ignore[no-untyped-def]
+                rows = panel.index.get_level_values("datetime")
+                keep = (rows >= pd.Timestamp(start_time)) & (rows <= pd.Timestamp(end_time))
+                return pd.DataFrame(np.asfortranarray(panel.to_numpy()[keep]), index=panel.index[keep],
+                                    columns=panel.columns, copy=False)
+
+        runner = RollingWorkflowRunner(
+            qlib_root="unused", factor_root="unused", run_directory="unused", model="double-ensemble",
+            horizon="1d", factor_set="wq_alpha101", seed=42,
+        )
+        day = [value.date() for value in dates]
+        segments = {
+            "train": (day[1].isoformat(), day[75].isoformat()),
+            "valid": (day[62].isoformat(), day[75].isoformat()),
+            "test": (day[78].isoformat(), day[-1].isoformat()),
+        }
+        with mock.patch.object(runner_module, "KunQuantDataLoader", FixedLoader):
+            qlib_model = runner._model(iterations=6)
+            # One thread: LightGBM's multithreaded histogram sums may round differently from run to run.
+            qlib_model.params["num_threads"] = 1
+            np.random.seed(3)
+            handler = runner._handler(DataHandlerLP, fit_start=day[0], fit_end=day[75], data_end=day[-1])
+            dataset = DatasetH(handler=handler, segments=segments)
+            qlib_model.fit(dataset)
+            expected = qlib_model.predict(dataset, segment="test")
+            model = runner._model(iterations=6)
+            model.params["num_threads"] = 1
+            np.random.seed(3)
+            with R.start(experiment_name="RQuantLean", recorder_name="lean-double-ensemble"):
+                actual = runner._fit(
+                    model, DataHandlerLP, DatasetH, R, fit_start=day[0], fit_end=day[75], data_end=day[-1],
+                    segments=segments,
+                )
+        self.assertEqual(3, len(model.ensemble))
+        for left, right in zip(qlib_model.sub_features, model.sub_features, strict=True):
+            self.assertEqual(sorted(left), sorted(right))
+        for left, right in zip(qlib_model.ensemble, model.ensemble, strict=True):
+            self.assertEqual(left.model_to_string(num_iteration=-1), right.model_to_string(num_iteration=-1))
+        pd.testing.assert_series_equal(expected, actual, check_exact=True)
+
+        from rquant.factors.catalog import get_catalog
+        from rquant.workflow.lgb_window import feature_importance
+
+        names = get_catalog().canonical_names("wq_alpha101")
+        importance = feature_importance(model, names)
+        self.assertEqual(list(names), importance["factor"].tolist())
+        expected_gain = qlib_model.get_feature_importance(importance_type="gain").reindex(names).fillna(0.0)
+        np.testing.assert_array_equal(expected_gain.to_numpy(), importance["gain"].to_numpy())
+
+    def test_lgb_feature_importance_names_every_factor_in_store_order(self) -> None:
+        import numpy as np
+        import pandas as pd
+
+        from rquant.workflow.lgb_window import feature_importance
+        from rquant.workflow.runner import RollingWorkflowRunner
+
+        rng = np.random.default_rng(2)
+        names = [f"f{position}" for position in range(6)]
+        x = pd.DataFrame(rng.normal(size=(400, 6)).astype(np.float32), columns=names)
+        y = (0.5 * x["f0"] - 0.3 * x["f3"] + rng.normal(scale=0.1, size=400)).to_numpy(np.float32)
+        lgb_model = RollingWorkflowRunner(
+            qlib_root="unused", factor_root="unused", run_directory="unused", model="lgb", horizon="1d",
+            factor_set="wq_alpha101",
+        )._model(iterations=5, refit=True)
+        import lightgbm as lgb
+
+        params = dict(lgb_model.params, lambda_l1=0.0, lambda_l2=0.0, min_data_in_leaf=5, verbosity=-1)
+        lgb_model.model = lgb.train(params, lgb.Dataset(x.to_numpy(), label=y), num_boost_round=5)
+        importance = feature_importance(lgb_model, names)
+        self.assertEqual(names, importance["factor"].tolist())
+        self.assertAlmostEqual(1.0, importance["gain_share"].sum())
+        self.assertEqual("f0", importance.sort_values("gain", ascending=False)["factor"].iloc[0])
+
     def test_moving_rows_to_front_leaves_a_column_major_copy_of_them(self) -> None:
         import numpy as np
 

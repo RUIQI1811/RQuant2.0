@@ -304,7 +304,7 @@ rquant report RUN_ID   # 自动按该滚动训练的股票池回测
 四年窗口上峰值从 6.1 GB 降到 3.1 GB；剩下的峰值在分箱那一刻：面板、验证与测试副本，加上 LightGBM 为确定分箱抽样的
 20 万行（672 列时约 1.6 GB，用完即释放）。sh_main 上 672 列的最大窗口一份面板约 4.2 GB；每个窗口各阶段的进程内存
 写在日志里（`rquant.workflow.lgb_window`，需要 psutil）。标签由 Qlib 的多进程池计算（Windows 上 5 个子进程合计约 6.3 GB），
-因此先算标签、再分配面板，两者不会同时占用内存。`double-ensemble` 仍走 Qlib 流程。
+因此先算标签、再分配面板，两者不会同时占用内存。`double-ensemble` 用同样的省内存加载与处理（`fit_double_ensemble_window`），再把训练、验证、测试段交给 Qlib 的 `DEnsembleModel`，预测与经 `DatasetH` 的原流程逐位相同。
 `main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
 `rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
 
@@ -871,7 +871,7 @@ rquant walk-forward \
 可选模型：
 
 - `lgb`：LightGBM；
-- `double-ensemble`：Qlib DoubleEnsemble。
+- `double-ensemble`：Qlib DoubleEnsemble，参数取 Qlib Alpha158 基准配置（3 个子模型、每个 28 轮、学习率 0.2、样本重加权与特征选择都开启）。轮数固定，所以没有调参阶段，每年只拟合一次；特征选择要对每个因子打乱重算一遍预测，因子多、股票池大时明显比 `lgb` 慢，建议先在 csi300 上跑。
 
 可选预测期限：
 
@@ -892,12 +892,17 @@ runs/walk-forward/<run-id>/
 ├── mlflow.db
 ├── walk_forward.json
 ├── predictions.parquet
+├── feature_importance.parquet
 ├── year=2013/
+│   ├── feature_importance.parquet
 │   ├── model.pkl
 │   ├── predictions.parquet
 │   └── window.json
 └── year=.../
 ```
+
+`feature_importance.parquet` 是每年最终模型的因子重要性（`gain`、`split` 和占总 gain 的比例 `gain_share`；DoubleEnsemble
+按子模型权重加总），根目录那份把各年合在一起，`report` 会汇总成表。
 
 检查训练结果：
 
@@ -947,6 +952,30 @@ rquant report RUN_ID
 rquant report RUN_ID --n-drop 5 --rebalance-days 1
 ```
 
+### 组合优化（增强指数）
+
+`--strategy enhanced-indexing`（或配置 `backtest.strategy`）改用 Qlib 的增强指数组合优化代替等权 top50：
+
+```bash
+rquant report RUN_ID --strategy enhanced-indexing
+```
+
+- 风险模型：每个信号日用 Qlib `StructuredCovEstimator`（10 个 PCA 统计因子）拟合当日股票池过去 240 个交易日的
+  日收益，收益按股票截在 2.5%/97.5% 分位，与 Qlib `examples/portfolio/prepare_riskdata.py` 一致；停牌日价格沿用，
+  复牌日计入跨停牌的涨跌。
+- 基准：当日股票池按流通市值（参考数据 `daily_basic` 的 `circ_mv`）加权，csi300、main、sh_main 都适用；
+  报告里对比的基准收益仍是 `data.benchmark`。
+- 优化：Qlib `EnhancedIndexingOptimizer`，最大化相对基准的预期收益减去 `risk_aversion` 倍跟踪方差；只做多、满仓，
+  每只股票偏离基准不超过 `benchmark_deviation`（默认 1%），每次调仓总换手不超过 `turnover_limit`（默认 0.2）。
+  投资比例 `risk_degree` 默认 0.95，其余留作现金应对费用和整手取整。前一日无成交量的股票保持原权重。
+- 参数在 `backtest.enhanced_indexing`；`topk`、`n_drop` 在这种模式下不用，`rebalance_days` 照常生效。
+- 需要参考数据（`rquant data build-reference`），以及 `ecos` 和 `scikit-learn`（已写入依赖，旧环境需重新
+  `pip install -e ".[dev]"`）。
+- 每次调仓的股票池大小、持股数、换手、主动份额和事前年化跟踪误差写在 `optimizations.parquet`，报告里有平均值。
+
+小账户注意：增强指数通常持有上百只、单只权重很低，100 万初始资金下整手取整会让实际持仓偏离优化结果，
+可以把 `backtest.initial_capital` 调大再比较。
+
 两种口径的 LGB walk-forward 对比（2013-2026，净收益，换手为年化双边成交额 / 账户市值）：
 
 | 因子集 | 标签 | 组合 | 年化 | 夏普 | 最大回撤 | 年换手 | 年成本 | run |
@@ -968,9 +997,17 @@ runs/walk-forward/<run-id>/
 ├── positions.parquet
 ├── trades.parquet
 ├── trade_indicators.parquet
+├── optimizations.parquet      # 仅 enhanced-indexing
+├── signal_ic.parquet
+├── signal_analysis.json
 ├── report.json
 └── report.md
 ```
+
+`report` 还会计算模型预测的 IC：每个预测日把分数与模型训练用的标签（下一开盘起的 1d/5d 收益）做截面
+Pearson（IC）和 Spearman（Rank IC）相关，至少 20 只股票才计入；ICIR 为日均值除以标准差，不年化，与 Qlib
+`SigAnaRecord` 一致。逐日结果在 `signal_ic.parquet`，全期与分年汇总在 `signal_analysis.json` 和 `report.md`。
+`report.md` 也会列出全期平均 gain 占比最高的 30 个因子，以及从未被使用的因子数。
 
 `report.json` 与 `report.md` 会同时包含按自然年汇总的稳定性表。策略年度收益按每日净收益
 `return - cost` 复利计算，并与同期沪深 300 基准比较；表中还会列出年度超额收益、最大回撤、

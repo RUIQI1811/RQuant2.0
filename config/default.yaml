@@ -45,3 +45,17 @@ backtest:
   stamp_tax_before_2023_08_28: 0.001
   stamp_tax_from_2023_08_28: 0.0005
   impact_cost: 0.0
+  # topk-dropout: equal-weighted top K (topk, n_drop). enhanced-indexing: Qlib's EnhancedIndexingOptimizer weights the
+  # universe against its own float-cap index with a 10-factor PCA risk model (`rquant report --strategy` overrides).
+  strategy: topk-dropout
+  enhanced_indexing:
+    risk_lookback_days: 240
+    risk_factors: 10
+    # lamb: larger values trade expected return for a lower tracking error.
+    risk_aversion: 1.0
+    # Sum of |weight changes| allowed per rebalance (0.2 = 10% of the book bought and 10% sold); 2.0 removes it.
+    turnover_limit: 0.2
+    # Largest weight difference from the benchmark per stock; null removes it.
+    benchmark_deviation: 0.01
+    # Share of the account invested; the rest is cash for costs and lot rounding.
+    risk_degree: 0.95
