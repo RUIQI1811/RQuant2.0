@@ -113,7 +113,7 @@ class PortfolioBacktestRunner:
         from qlib.workflow.record_temp import PortAnaRecord, SigAnaRecord
 
         from rquant.qlib_ext.strategy import OptimizationLog, keep_rebalance_dates
-        from rquant.workflow.runner import init_run_tracking
+        from rquant.workflow.runner import init_run_tracking, release_run_tracking
 
         store = self.run_directory / "backtest_mlflow"
         # A fresh store on every report: a copied run directory would otherwise write into the original's artifacts.
@@ -210,6 +210,7 @@ class PortfolioBacktestRunner:
                 indicator_analysis_freq="day",
             ).generate()
             recorder_id = recorder.id
+        release_run_tracking(store)
         if not artifacts or "report_normal_1day.pkl" not in artifacts:
             raise DataContractError("Qlib's PortAnaRecord did not return daily portfolio metrics")
         report = artifacts["report_normal_1day.pkl"]

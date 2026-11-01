@@ -171,6 +171,7 @@ class RollingWorkflowRunner:
             "mlflow_experiment": self.experiment_name,
         }
         atomic_write_json(self.run_directory / "walk_forward.json", manifest)
+        release_run_tracking(self.run_directory)
         return manifest
 
 
@@ -200,3 +201,31 @@ def init_run_tracking(
     if client.get_experiment_by_name(experiment_name) is None:
         client.create_experiment(experiment_name, artifact_location=str(run_directory / "mlruns"))
     return tracking_uri
+
+
+def release_run_tracking(run_directory: Path) -> None:
+    """Close MLflow's SQLite connections to ``run_directory/mlflow.db``.
+
+    MLflow keeps a pooled engine per database for the life of the process, which holds the file open; Windows then
+    refuses to delete or replace the run's store until the process exits.
+    """
+    import gc
+
+    try:
+        from mlflow.store.tracking.sqlalchemy_store import SqlAlchemyStore
+    except ImportError:  # pragma: no cover - MLflow comes with Qlib
+        return
+    database = (run_directory / "mlflow.db").resolve()
+
+    def ours(engine: Any) -> bool:
+        name = getattr(getattr(engine, "url", None), "database", None)
+        return bool(name) and Path(name).resolve() == database
+
+    engines = getattr(SqlAlchemyStore, "_engine_map", {})
+    for uri, engine in list(engines.items()):
+        if ours(engine):
+            engines.pop(uri, None)
+            engine.dispose()
+    for item in gc.get_objects():
+        if isinstance(item, SqlAlchemyStore) and ours(getattr(item, "engine", None)):
+            item.engine.dispose()
