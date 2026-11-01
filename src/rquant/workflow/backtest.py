@@ -281,7 +281,7 @@ class PortfolioBacktestRunner:
             "rows": len(report),
             "trade_rows": len(trades),
             "metrics_definition": METRICS_DEFINITION,
-            "metrics": risk_metrics(risk_analysis, report, artifacts.get("port_analysis_1day.pkl")),
+            "metrics": risk_metrics(risk_analysis, report),
             "indicator_analysis": _indicator_analysis(artifacts.get("indicator_analysis_1day.pkl")),
             "mlflow": {"tracking_uri": tracking_uri, "experiment": BACKTEST_EXPERIMENT, "recorder_id": recorder_id},
             "artifacts": {
@@ -346,35 +346,39 @@ class PortfolioBacktestRunner:
 
 BACKTEST_EXPERIMENT = "rquant-backtest"
 
+# Annualization: 252 trading days a year, as every earlier RQuant report and scripts/analysis/window_metrics.py use
+# (Qlib's own default for freq "day" is 238; the A-share calendar has about 242).
+TRADING_DAYS_PER_YEAR = 252
+
 METRICS_DEFINITION = (
-    "qlib.contrib.evaluate.risk_analysis of daily returns at freq 'day' (N = 238 trading days a year). "
-    "Default mode 'sum', Qlib's convention: annualized_return = mean daily return * 238, max_drawdown on the "
-    "cumulative sum of daily returns, information_ratio = mean / std * sqrt(238) (the Sharpe ratio at zero risk-free "
-    "rate for net_return). Mode 'product' compounds: annualized_return = final NAV ^ (238 / days) - 1, max_drawdown "
+    "qlib.contrib.evaluate.risk_analysis of daily returns with N = 252 trading days a year. "
+    "Default mode 'sum', Qlib's convention: annualized_return = mean daily return * 252, max_drawdown on the "
+    "cumulative sum of daily returns, information_ratio = mean / std * sqrt(252) (the Sharpe ratio at zero risk-free "
+    "rate for net_return). Mode 'product' compounds: annualized_return = final NAV ^ (252 / days) - 1, max_drawdown "
     "on the NAV. net_return is return - cost; excess returns subtract the benchmark, as PortAnaRecord computes them."
 )
 
 
-def risk_metrics(risk_analysis: Any, report: Any, port_analysis: Any = None) -> dict[str, dict[str, float | None]]:
-    """``risk_analysis`` of the net and benchmark returns in both modes, and PortAnaRecord's excess returns."""
-    net = report["return"].astype(float) - report["cost"].astype(float)
+def risk_metrics(risk_analysis: Any, report: Any) -> dict[str, dict[str, float | None]]:
+    """``risk_analysis`` (N = 252) of the net and benchmark returns in both modes, and of the excess returns with and
+    without cost as PortAnaRecord defines them (PortAnaRecord's own analysis, logged to MLflow, uses Qlib's 238)."""
+    returns = report["return"].astype(float)
+    cost = report["cost"].astype(float)
+    bench = report["bench"].astype(float)
+    net = returns - cost
 
-    def analysed(returns: Any, mode: str = "sum") -> dict[str, float | None]:
-        frame = risk_analysis(returns, freq="day", mode=mode)
+    def analysed(series: Any, mode: str = "sum") -> dict[str, float | None]:
+        frame = risk_analysis(series, N=TRADING_DAYS_PER_YEAR, freq=None, mode=mode)
         return {name: _finite(float(value)) for name, value in frame["risk"].items()}
 
-    metrics = {
+    return {
         "net_return": analysed(net),
         "net_return_compounded": analysed(net, "product"),
-        "benchmark_return": analysed(report["bench"].astype(float)),
-        "benchmark_return_compounded": analysed(report["bench"].astype(float), "product"),
+        "benchmark_return": analysed(bench),
+        "benchmark_return_compounded": analysed(bench, "product"),
+        "excess_return_with_cost": analysed(net - bench),
+        "excess_return_without_cost": analysed(returns - bench),
     }
-    if port_analysis is not None:
-        for name in ("excess_return_with_cost", "excess_return_without_cost"):
-            metrics[name] = {key: _finite(float(value)) for key, value in port_analysis.loc[name, "risk"].items()}
-    else:
-        metrics["excess_return_with_cost"] = analysed(net - report["bench"].astype(float))
-    return metrics
 
 
 def _indicator_analysis(frame: Any) -> dict[str, float | None] | None:

@@ -1036,16 +1036,17 @@ runs/walk-forward/<run-id>/
 └── report.md
 ```
 
-收益指标全部由 `qlib.contrib.evaluate.risk_analysis` 计算（一年 238 个交易日），写在 `backtest.json.metrics`：
+收益指标全部由 `qlib.contrib.evaluate.risk_analysis` 计算（传 `N=252`，一年按 252 个交易日折算；Qlib 自己的默认是 238），写在 `backtest.json.metrics`：
 
-- `net_return_compounded`（mode `product`）：报告的主口径。年化 = 期末净值 ^ (238 / 天数) − 1，最大回撤按净值算；
-- `net_return`（Qlib 默认 mode `sum`）：年化 = 日均收益 × 238，回撤按日收益累加曲线算，与 Qlib 官方 benchmark 同口径；
-  其中 `information_ratio` = 日均 / 日标准差 × √238，就是报告里的夏普；
+- `net_return_compounded`（mode `product`）：报告的主口径。年化 = 期末净值 ^ (252 / 天数) − 1，最大回撤按净值算；
+- `net_return`（Qlib 默认 mode `sum`）：年化 = 日均收益 × 252，回撤按日收益累加曲线算（Qlib 的默认累加方式）；
+  其中 `information_ratio` = 日均 / 日标准差 × √252，就是报告里的夏普；
 - `benchmark_return(_compounded)`：基准的同样两种口径；
-- `excess_return_with_cost` / `excess_return_without_cost`：`PortAnaRecord` 自己算的超额收益（mode `sum`）。
+- `excess_return_with_cost` / `excess_return_without_cost`：与 `PortAnaRecord` 同定义的超额收益（mode `sum`）。
+  `PortAnaRecord` 自己按 238 天算的那份记在 `backtest_mlflow/` 里，报告不用。
 
-和之前的报告相比，回测本身（成交、持仓、每日收益）不变；指标口径变了：夏普从 √252 改为 √238（约低 3%），
-复利年化按 238 天折算（略低于按 252 天）。`report.md` 的表把复利口径和 Qlib 默认口径并列。
+和之前的报告相比，回测本身（成交、持仓、每日收益）和复利年化、夏普都不变；`report.md` 的表把复利口径和
+Qlib 默认的累加口径并列。
 
 `report` 还会用 Qlib `SigAnaRecord` 计算模型预测的 IC：每个预测日把分数与模型训练用的标签（下一开盘起的 1d/5d
 收益）做截面 Pearson（IC）和 Spearman（Rank IC）相关；ICIR 为日均值除以标准差，不年化。逐日结果在
@@ -1083,8 +1084,7 @@ python scripts/analysis/window_metrics.py runs 2019-01-01 2026-10-21 \
   jq240_5d=20261028T222815Z-b7072fd9 jq240_1d_drop5=20261027T202921Z-41fb3dde-top50-drop5
 ```
 
-每个 `标签=目录` 指向 `runs/walk-forward/` 下已经运行过 `report` 的目录，结束日期可以省略。输出按夏普排序，包含年化、夏普、最大回撤、Calmar、累计收益、相对基准的年化超额和信息比率、日均换手和年化成本。每日净收益为 `return - cost`，夏普为日均收益 × 252 / (日收益标准差 × √252)；这个脚本仍按 252 天折算，和报告的
-`risk_analysis`（238 天）略有差别。
+每个 `标签=目录` 指向 `runs/walk-forward/` 下已经运行过 `report` 的目录，结束日期可以省略。输出按夏普排序，包含年化、夏普、最大回撤、Calmar、累计收益、相对基准的年化超额和信息比率、日均换手和年化成本。每日净收益为 `return - cost`，夏普为日均收益 × 252 / (日收益标准差 × √252)，和报告一样按 252 天折算。
 
 ## 9. 运行清单与状态判断
 

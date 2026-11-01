@@ -39,13 +39,17 @@ class BacktestMetricTests(unittest.TestCase):
         metrics = risk_metrics(risk_analysis, report)
         net = report["return"] - report["cost"]
         additive, compounded = metrics["net_return"], metrics["net_return_compounded"]
-        self.assertAlmostEqual(net.mean() / net.std(ddof=1) * math.sqrt(238), additive["information_ratio"])
-        self.assertAlmostEqual(net.mean() * 238, additive["annualized_return"])
+        self.assertAlmostEqual(net.mean() / net.std(ddof=1) * math.sqrt(252), additive["information_ratio"])
+        self.assertAlmostEqual(net.mean() * 252, additive["annualized_return"])
         nav = (1 + net).cumprod()
-        self.assertAlmostEqual(nav.iloc[-1] ** (238 / len(net)) - 1, compounded["annualized_return"])
+        self.assertAlmostEqual(nav.iloc[-1] ** (252 / len(net)) - 1, compounded["annualized_return"])
         self.assertAlmostEqual((nav / nav.cummax() - 1).min(), compounded["max_drawdown"])
         excess = net - report["bench"]
-        self.assertAlmostEqual(excess.mean() * 238, metrics["excess_return_with_cost"]["annualized_return"])
+        self.assertAlmostEqual(excess.mean() * 252, metrics["excess_return_with_cost"]["annualized_return"])
+        gross_excess = report["return"] - report["bench"]
+        self.assertAlmostEqual(
+            gross_excess.mean() * 252, metrics["excess_return_without_cost"]["annualized_return"]
+        )
 
 
 class RebalanceScheduleTests(unittest.TestCase):

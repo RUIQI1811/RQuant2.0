@@ -183,10 +183,10 @@ def _backtest_markdown(backtest: dict[str, Any]) -> list[str]:
 
     lines.extend(
         [
-            "qlib.contrib.evaluate.risk_analysis on daily returns, 238 trading days a year. Compounded columns use "
+            "qlib.contrib.evaluate.risk_analysis on daily returns, 252 trading days a year. Compounded columns use "
             "mode `product` (NAV growth and NAV drawdown); the Sharpe ratio is the mean over the standard deviation of "
-            "daily returns times sqrt(238) (information ratio for excess returns); the Qlib-sum columns are Qlib's "
-            "default mode (mean daily return times 238, drawdown of the summed returns), as Qlib's benchmarks report.",
+            "daily returns times sqrt(252) (information ratio for excess returns); the Qlib-sum columns are Qlib's "
+            "default mode (mean daily return times 252, drawdown of the summed returns).",
             "",
             "| Series | Annual return | Max drawdown | Sharpe | Annual return (Qlib sum) | Max drawdown (Qlib sum) |",
             "| :--- | ---: | ---: | ---: | ---: | ---: |",
