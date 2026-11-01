@@ -100,10 +100,7 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
         "",
     ]
     if "backtest" in summary:
-        markdown.extend(["## Portfolio backtest", ""])
-        for key, value in summary["backtest"].get("metrics", {}).items():
-            markdown.append(f"- {key}: {value}")
-        markdown.append("")
+        markdown.extend(_backtest_markdown(summary["backtest"]))
     if "optimizations" in summary:
         optimized = summary["optimizations"]
         markdown.extend(
@@ -159,6 +156,52 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
     markdown.extend(["## Limitations", "", *(f"- {item}" for item in summary["limitations"]), ""])
     (run_dir / "report.md").write_text("\n".join(markdown), encoding="utf-8")
     return summary
+
+
+METRIC_ROWS = (
+    ("Net return (return - cost)", "net_return", "net_return_compounded"),
+    ("Benchmark", "benchmark_return", "benchmark_return_compounded"),
+    ("Excess return with cost", "excess_return_with_cost", None),
+    ("Excess return without cost", "excess_return_without_cost", None),
+)
+
+
+def _backtest_markdown(backtest: dict[str, Any]) -> list[str]:
+    """The headline table of Qlib's risk_analysis: compounded annual return and NAV drawdown, the Sharpe (information)
+    ratio, and Qlib's default additive annual return and drawdown for comparison with Qlib's benchmarks."""
+    metrics = backtest.get("metrics", {})
+    lines = ["## Portfolio backtest", ""]
+    if not all(isinstance(value, dict) for value in metrics.values()):
+        lines.extend([*(f"- {key}: {value}" for key, value in metrics.items()), ""])
+        return lines
+
+    def cell(series: str | None, field: str, kind: str = "percent") -> str:
+        value = (metrics.get(series) or {}).get(field) if series else None
+        if value is None:
+            return "n/a"
+        return f"{value * 100:+.2f}%" if kind == "percent" else f"{value:.3f}"
+
+    lines.extend(
+        [
+            "qlib.contrib.evaluate.risk_analysis on daily returns, 238 trading days a year. Compounded columns use "
+            "mode `product` (NAV growth and NAV drawdown); the Sharpe ratio is the mean over the standard deviation of "
+            "daily returns times sqrt(238) (information ratio for excess returns); the Qlib-sum columns are Qlib's "
+            "default mode (mean daily return times 238, drawdown of the summed returns), as Qlib's benchmarks report.",
+            "",
+            "| Series | Annual return | Max drawdown | Sharpe | Annual return (Qlib sum) | Max drawdown (Qlib sum) |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for label, additive, compounded in METRIC_ROWS:
+        if additive not in metrics:
+            continue
+        lines.append(
+            f"| {label} | {cell(compounded, 'annualized_return')} | {cell(compounded, 'max_drawdown')} | "
+            f"{cell(additive, 'information_ratio', 'ratio')} | {cell(additive, 'annualized_return')} | "
+            f"{cell(additive, 'max_drawdown')} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _yearly_performance(pd: Any, portfolio: Any) -> list[dict[str, Any]]:

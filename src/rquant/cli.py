@@ -35,7 +35,7 @@ from rquant.runs import RunContext
 from rquant.universe import SUPPORTED_UNIVERSES
 from rquant.workflow.backtest import STRATEGIES, PortfolioBacktestRunner, PortfolioConfig
 from rquant.workflow.runner import RollingWorkflowRunner
-from rquant.workflow.signal_analysis import SignalAnalysisRunner
+from rquant.workflow.tasks import BUILT_IN_WORKFLOWS
 
 LOCKED_DEPENDENCIES = {"pyqlib": "0.9.7", "KunQuant": "0.1.11", "tushare": "1.4.29", "TA-Lib": "0.8.2"}
 
@@ -115,10 +115,19 @@ def build_parser() -> argparse.ArgumentParser:
     factor_evaluate.add_argument("--min-effective-days", type=int, default=20)
     factor_evaluate.set_defaults(handler=_factor_evaluate, run_category="factors-evaluate")
 
-    walk = commands.add_parser("walk-forward", help="Run yearly three-year rolling out-of-sample training")
-    walk.add_argument("--model", choices=("lgb", "double-ensemble"), required=True)
-    walk.add_argument("--horizon", choices=("1d", "5d"), required=True)
-    walk.add_argument("--factor-set", choices=_factor_sets(), required=True)
+    walk = commands.add_parser(
+        "walk-forward",
+        help="Roll a qrun workflow over calendar years with Qlib's RollingGen and TrainerR (out-of-sample)",
+    )
+    workflow = walk.add_mutually_exclusive_group(required=True)
+    workflow.add_argument(
+        "--model",
+        choices=tuple(BUILT_IN_WORKFLOWS),
+        help="A built-in workflow (src/rquant/workflow/workflows/<model>.yaml)",
+    )
+    workflow.add_argument("--workflow", help="A qrun workflow file whose task is rolled")
+    walk.add_argument("--horizon", choices=("1d", "5d"), help="Override the workflow's label horizon")
+    walk.add_argument("--factor-set", choices=_factor_sets(), help="Override the workflow's factor set")
     walk.add_argument("--first-year", type=int)
     walk.add_argument("--last-year", type=int)
     walk.add_argument("--through", type=_date, help="Inclusive date, YYYY-MM-DD (default: data.through)")
@@ -581,14 +590,11 @@ def _walk_forward(args: argparse.Namespace) -> int:
         through = _through(args, config)
         first_year = args.first_year or int(workflow.get("first_prediction_year", 2013))
         last_year = args.last_year or through.year
-        run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
-        run.add_input("factor_manifest", _fingerprint(paths.factors / args.factor_set / "manifest.json"))
-        _require_factor_universe(paths.factors / args.factor_set / "manifest.json", _universe(config))
         runner = RollingWorkflowRunner(
             qlib_root=paths.qlib,
             factor_root=paths.factors,
             run_directory=run.directory,
-            model=args.model,
+            workflow=args.model or Path(args.workflow).expanduser(),
             horizon=args.horizon,
             factor_set=args.factor_set,
             seed=int(workflow.get("seed", config.get("project", {}).get("seed", 42))),
@@ -597,6 +603,11 @@ def _walk_forward(args: argparse.Namespace) -> int:
             formal_start_year=_date_value(config.get("data", {}).get("formal_start", "2010-01-01")).year,
             universe=_universe(config),
         )
+        run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
+        run.add_input("factor_manifest", _fingerprint(paths.factors / runner.factor_set / "manifest.json"))
+        _require_factor_universe(paths.factors / runner.factor_set / "manifest.json", _universe(config))
+        run.add_input("workflow", str(runner.workflow_path))
+        run.add_input("workflow_sha256", sha256_file(runner.workflow_path))
         run.add_input("through", through.isoformat())
         return runner.run(first_year=first_year, last_year=last_year, through=through)
 
@@ -662,8 +673,9 @@ def _report(args: argparse.Namespace) -> int:
             run_directory=run_directory,
             config=portfolio_config,
             reference_root=paths.canonical / "reference",
+            horizon=_walk_forward_manifest(run_directory).get("horizon"),
         ).run()
-        signal = SignalAnalysisRunner(qlib_root=paths.qlib, run_directory=run_directory).run()
+        signal = portfolio.get("signal")
         report = build_report(run_directory)
         manifest_path = run_directory / "run.json"
         if manifest_path.exists():
@@ -741,15 +753,18 @@ def _enhanced_indexing_options(section: dict[str, Any]) -> dict[str, Any]:
     return {key: None if value is None else ENHANCED_INDEXING_OPTIONS[key](value) for key, value in section.items()}
 
 
+def _walk_forward_manifest(run_directory: Path) -> dict[str, Any]:
+    manifest_path = run_directory / "walk_forward.json"
+    if not manifest_path.exists():
+        return {}
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        return dict(json.load(handle))
+
+
 def _walk_forward_universe(run_directory: Path, config: dict[str, Any]) -> str:
     """The universe a walk-forward run trained on, so its report backtests the same universe."""
-    manifest_path = run_directory / "walk_forward.json"
-    if manifest_path.exists():
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            universe = json.load(handle).get("universe")
-        if universe:
-            return str(universe)
-    return _universe(config)
+    universe = _walk_forward_manifest(run_directory).get("universe")
+    return str(universe) if universe else _universe(config)
 
 
 def _universe(config: dict[str, Any]) -> str:

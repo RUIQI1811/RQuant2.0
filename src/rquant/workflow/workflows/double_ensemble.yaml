@@ -1,0 +1,166 @@
+# RQuant DoubleEnsemble workflow in Qlib's qrun format (Qlib's Alpha158 DoubleEnsemble benchmark parameters,
+# examples/benchmarks/DoubleEnsemble/workflow_config_doubleensemble_Alpha158.yaml, with RQuant's threads and seed).
+#
+# Rolling (what RQuant runs):
+#   rquant walk-forward --model double-ensemble [--factor-set jq240] [--horizon 1d]
+#   rquant walk-forward --workflow path/to/copy-of-this.yaml
+# walk-forward uses `task` as the template of Qlib's RollingGen: it sets the universe, factor store, factor set and
+# horizon of the run, rolls the segments, handler dates and ZScoreNorm fit period over calendar years
+# (rquant.workflow.tasks.CalendarYearRollingGen) and trains each year with TrainerR. Only SignalRecord runs per year;
+# `rquant report <run>` runs SigAnaRecord and PortAnaRecord on the combined predictions.
+#
+# Single window with Qlib itself, from the project root (one 2013 test year on csi300):
+#   qrun src/rquant/workflow/workflows/double_ensemble.yaml
+# qrun builds Qlib's own DatasetH, which holds several copies of the panel; walk-forward trains the same task through
+# RQuant's lean path instead (one float32 copy), which sh_main needs on a 16 GB machine.
+
+qlib_init:
+  provider_uri: data/qlib
+  region: cn
+  # MLflow 3 refuses its file store; SQLite keeps the runs in mlflow.db and the artifacts under ./mlruns.
+  exp_manager:
+    class: MLflowExpManager
+    module_path: qlib.workflow.expm
+    kwargs:
+      uri: sqlite:///mlflow.db
+      default_exp_name: rquant-qrun
+
+market: &market csi300
+benchmark: &benchmark SH000300
+
+# Train ends two trading days before the test so no 1d label (Ref($open, -2) / Ref($open, -1) - 1) reads into it.
+data_handler_config: &data_handler_config
+  instruments: *market
+  start_time: "2010-01-01"
+  end_time: "2013-12-31"
+  data_loader:
+    class: KunQuantDataLoader
+    module_path: rquant.qlib_ext.loader
+    kwargs:
+      factor_root: data/factors
+      factor_set: jq240
+      horizon: 1d
+  infer_processors:
+    - class: ProcessInf
+      module_path: rquant.qlib_ext.processors
+    - class: ZScoreNorm
+      module_path: rquant.qlib_ext.processors
+      kwargs:
+        fit_start_time: "2010-01-01"
+        fit_end_time: "2012-12-27"
+    - class: Fillna
+      module_path: rquant.qlib_ext.processors
+  learn_processors:
+    - class: DropnaLabel
+      module_path: rquant.qlib_ext.processors
+    - class: CSZScoreNorm
+      module_path: qlib.data.dataset.processor
+      kwargs:
+        fields_group: label
+  process_type: append
+  # SignalRecord saves the raw label for SigAnaRecord only when the raw panel is kept.
+  drop_raw: false
+
+port_analysis_config: &port_analysis_config
+  strategy:
+    class: LiquidatingTopkDropoutStrategy
+    module_path: rquant.qlib_ext.strategy
+    kwargs:
+      signal: <PRED>
+      topk: 50
+      n_drop: 5
+      rebalance_days: 1
+      risk_degree: 1.0
+      hold_thresh: 1
+      only_tradable: true
+      forbid_all_trade_at_limit: false
+  executor:
+    class: ZeroOrderSafeSimulatorExecutor
+    module_path: rquant.qlib_ext.executor
+    kwargs:
+      time_per_step: day
+      generate_portfolio_metrics: true
+      verbose: false
+  backtest:
+    start_time: null
+    end_time: null
+    account: 1000000
+    benchmark: *benchmark
+    exchange_kwargs:
+      exchange:
+        class: AshareExchange
+        module_path: rquant.qlib_ext.exchange
+        kwargs:
+          freq: day
+          start_time: "2013-01-01"
+          end_time: "2014-01-02"
+          # Every instrument, so holdings that leave the index can still be sold.
+          codes: all
+          trade_unit: 100
+          cost_model:
+            commission_rate: 0.0003
+            minimum_commission: 5.0
+            stamp_tax_before: 0.001
+            stamp_tax_after: 0.0005
+
+rolling:
+  # Every sub-model trains a fixed 28 rounds without early stopping, so there is nothing to pick before training.
+  refit: false
+
+task:
+  model:
+    class: DEnsembleModel
+    module_path: qlib.contrib.model.double_ensemble
+    kwargs:
+      base_model: gbm
+      loss: mse
+      num_models: 3
+      enable_sr: true
+      enable_fs: true
+      alpha1: 1
+      alpha2: 1
+      bins_sr: 10
+      bins_fs: 5
+      decay: 0.5
+      sample_ratios: [0.8, 0.7, 0.6, 0.5, 0.4]
+      sub_weights: [1, 1, 1]
+      epochs: 28
+      early_stopping_rounds: null
+      colsample_bytree: 0.8879
+      learning_rate: 0.2
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 8
+      num_leaves: 210
+      num_threads: 8
+      seed: 42
+      verbosity: -1
+  dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: DataHandlerLP
+        module_path: qlib.data.dataset.handler
+        kwargs: *data_handler_config
+      segments:
+        train: ["2010-01-01", "2012-12-27"]
+        valid: ["2012-07-01", "2012-12-27"]
+        test: ["2013-01-01", "2013-12-31"]
+  record:
+    - class: SignalRecord
+      module_path: qlib.workflow.record_temp
+      kwargs:
+        model: <MODEL>
+        dataset: <DATASET>
+    - class: SigAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs:
+        ana_long_short: false
+    - class: PortAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs:
+        config: *port_analysis_config
+        risk_analysis_freq: day
+        indicator_analysis_freq: day

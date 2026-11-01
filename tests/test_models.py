@@ -7,22 +7,48 @@ import warnings
 from pathlib import Path
 
 
+def built_in_model(name: str, **overrides):  # type: ignore[no-untyped-def]
+    """The model of a built-in workflow, with ``overrides`` on its kwargs."""
+    import copy
+
+    from qlib.utils import init_instance_by_config
+
+    from rquant.workflow.tasks import BUILT_IN_WORKFLOWS, load_workflow
+
+    config = copy.deepcopy(load_workflow(BUILT_IN_WORKFLOWS[name])["task"]["model"])
+    config["kwargs"].update(overrides)
+    return init_instance_by_config(config)
+
+
+def refit_overrides(name: str, iterations: int) -> dict:  # type: ignore[type-arg]
+    if name == "lgb":
+        return {"num_boost_round": iterations, "early_stopping_rounds": 0}
+    return {"epochs": iterations}
+
+
 @unittest.skipUnless(importlib.util.find_spec("lightgbm") is not None, "LightGBM is required")
 class ModelConstructionTests(unittest.TestCase):
-    def test_both_locked_model_adapters_construct(self) -> None:
-        from rquant.workflow.runner import RollingWorkflowRunner
-
+    def test_both_built_in_workflows_construct_their_models(self) -> None:
         for name, expected in (("lgb", "LGBModel"), ("double-ensemble", "DEnsembleModel")):
             with self.subTest(model=name):
-                runner = RollingWorkflowRunner(
-                    qlib_root="unused",
-                    factor_root="unused",
-                    run_directory="unused",
-                    model=name,
-                    horizon="1d",
-                    factor_set="oap_jq_cnc",
-                )
-                self.assertEqual(expected, type(runner._model(iterations=7, refit=True)).__name__)
+                self.assertEqual(expected, type(built_in_model(name, **refit_overrides(name, 7))).__name__)
+
+    # Break caught: built-in workflows whose model parameters drift from the ones every past run was trained with.
+    def test_built_in_models_keep_the_trained_parameters(self) -> None:
+        lgb_model = built_in_model("lgb")
+        self.assertEqual((50, 1000), (lgb_model.early_stopping_rounds, lgb_model.num_boost_round))
+        self.assertEqual(
+            {
+                "objective": "mse", "verbosity": -1, "learning_rate": 0.0421, "colsample_bytree": 0.8879,
+                "subsample": 0.8789, "lambda_l1": 205.6999, "lambda_l2": 580.9768, "max_depth": 8, "num_leaves": 210,
+                "num_threads": 8, "seed": 42,
+            },
+            lgb_model.params,
+        )
+        ensemble = built_in_model("double-ensemble")
+        self.assertEqual((3, 28, None), (ensemble.num_models, ensemble.epochs, ensemble.early_stopping_rounds))
+        self.assertEqual([0.8, 0.7, 0.6, 0.5, 0.4], ensemble.sample_ratios)
+        self.assertEqual(0.2, ensemble.params["learning_rate"])
 
     def test_fixed_panel_runs_two_models_two_horizons_three_factor_sets(self) -> None:
         import numpy as np
@@ -36,7 +62,6 @@ class ModelConstructionTests(unittest.TestCase):
         from qlib.workflow import R
 
         from rquant.factors.catalog import get_catalog
-        from rquant.workflow.runner import RollingWorkflowRunner
 
         rng = np.random.default_rng(42)
         # MLflow keeps its SQLite file open for the process lifetime, which blocks deletion on Windows.
@@ -87,16 +112,7 @@ class ModelConstructionTests(unittest.TestCase):
                     dataset = DatasetH(handler=handler, segments=segments)
                     for model_name in ("lgb", "double-ensemble"):
                         with self.subTest(factor_set=factor_set, horizon=horizon, model=model_name):
-                            runner = RollingWorkflowRunner(
-                                qlib_root="unused",
-                                factor_root="unused",
-                                run_directory="unused",
-                                model=model_name,
-                                horizon=horizon,
-                                factor_set=factor_set,
-                                seed=42,
-                            )
-                            model = runner._model(iterations=2, refit=True)
+                            model = built_in_model(model_name, **refit_overrides(model_name, 2))
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore", FutureWarning)
                                 model.fit(dataset)
@@ -150,24 +166,15 @@ class LeanLGBWindowTests(unittest.TestCase):
         columns = pd.MultiIndex.from_tuples([("feature", name) for name in names] + [("label", "LABEL0")])
         return pd.DataFrame(np.asfortranarray(values), index=index, columns=columns, copy=False), dates
 
-    # Break caught: a lean LightGBM window whose processing, segments or binning drift from the Qlib dataset path.
-    def test_lean_window_predicts_exactly_what_the_qlib_dataset_path_predicts(self) -> None:
-        from unittest import mock
-
+    def _task(self, panel, dates_kept, *, fit_end, data_end, segments, model_name):  # type: ignore[no-untyped-def]
+        """A rolling task over ``panel`` whose data loader is a KunQuantDataLoader serving it."""
         import numpy as np
         import pandas as pd
-        from qlib.data.dataset import DatasetH
-        from qlib.data.dataset.handler import DataHandlerLP
-        from qlib.workflow import R
 
-        from rquant.workflow import runner as runner_module
-        from rquant.workflow.runner import RollingWorkflowRunner
+        from rquant.qlib_ext.loader import KunQuantDataLoader
+        from rquant.workflow.tasks import handler_config
 
-        panel, dates = self._panel(np.random.default_rng(5))
-
-        from qlib.data.dataset.loader import DataLoader
-
-        class FixedLoader(DataLoader):
+        class FixedLoader(KunQuantDataLoader):
             def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
                 pass
 
@@ -177,40 +184,58 @@ class LeanLGBWindowTests(unittest.TestCase):
                 return pd.DataFrame(np.asfortranarray(panel.to_numpy()[keep]), index=panel.index[keep],
                                     columns=panel.columns, copy=False)
 
-        runner = RollingWorkflowRunner(
-            qlib_root="unused", factor_root="unused", run_directory="unused", model="lgb", horizon="1d",
-            factor_set="wq_alpha101", seed=42,
+        handler = handler_config(
+            factor_root="unused", factor_set="wq_alpha101", horizon="1d", universe="all",
+            start_time=dates_kept[0], end_time=data_end, fit_start_time=dates_kept[0], fit_end_time=fit_end,
         )
-        day = [value.date() for value in dates]
+        handler["kwargs"]["data_loader"] = {"class": FixedLoader, "kwargs": {}}
+        return {
+            "model": {"class": "unused"},
+            "dataset": {
+                "class": "DatasetH",
+                "module_path": "qlib.data.dataset",
+                "kwargs": {"handler": handler, "segments": segments},
+            },
+        }
+
+    # Break caught: a lean LightGBM window whose processing, segments or binning drift from the Qlib dataset path.
+    def test_lean_window_predicts_exactly_what_the_qlib_dataset_path_predicts(self) -> None:
+        import numpy as np
+        import pandas as pd
+        from qlib.utils import init_instance_by_config
+        from qlib.workflow import R
+
+        from rquant.workflow.trainer import fit_task, lean_window
+
+        panel, dates = self._panel(np.random.default_rng(5))
+        day = [value.date().isoformat() for value in dates]
         cases = {
-            "tune": (runner._model(), day[60], day[70], {
-                "train": (day[0].isoformat(), day[60].isoformat()),
-                "valid": (day[62].isoformat(), day[70].isoformat()),
+            "tune": (built_in_model("lgb"), day[60], day[70], {
+                "train": (day[0], day[60]),
+                "valid": (day[62], day[70]),
             }),
-            "refit": (runner._model(iterations=7, refit=True), day[75], day[-1], {
-                "train": (day[1].isoformat(), day[75].isoformat()),
-                "valid": (day[62].isoformat(), day[75].isoformat()),
-                "test": (day[78].isoformat(), day[-1].isoformat()),
+            "refit": (built_in_model("lgb", **refit_overrides("lgb", 7)), day[75], day[-1], {
+                "train": (day[1], day[75]),
+                "valid": (day[62], day[75]),
+                "test": (day[78], day[-1]),
             }),
         }
         for name, (model, fit_end, data_end, segments) in cases.items():
-            with self.subTest(case=name), mock.patch.object(runner_module, "KunQuantDataLoader", FixedLoader):
-                qlib_model = runner._model(**({} if name == "tune" else {"iterations": 7, "refit": True}))
+            with self.subTest(case=name):
+                task = self._task(panel, day, fit_end=fit_end, data_end=data_end, segments=segments, model_name="lgb")
+                self.assertIsNotNone(lean_window(task))
+                qlib_model = built_in_model("lgb", **({} if name == "tune" else refit_overrides("lgb", 7)))
                 if name == "tune":
                     # Early stopping stays on, but the run ends while the validation loss still falls: further out it
                     # flattens on this small panel and multithreaded metric sums pick among equal values, so the stop
                     # would vary from run to run within either path.
                     qlib_model.num_boost_round = model.num_boost_round = 60
                 with R.start(experiment_name="RQuantLean", recorder_name=f"qlib-{name}"):
-                    handler = runner._handler(DataHandlerLP, fit_start=day[0], fit_end=fit_end, data_end=data_end)
-                    dataset = DatasetH(handler=handler, segments=segments)
+                    dataset = init_instance_by_config(task["dataset"])
                     qlib_model.fit(dataset)
                     expected = qlib_model.predict(dataset, segment="test") if "test" in segments else None
                 with R.start(experiment_name="RQuantLean", recorder_name=f"lean-{name}"):
-                    actual = runner._fit(
-                        model, DataHandlerLP, DatasetH, R, fit_start=day[0], fit_end=fit_end, data_end=data_end,
-                        segments=segments,
-                    )
+                    actual = fit_task(model, task, log_metrics=R.log_metrics)
                 self.assertEqual(qlib_model.model.best_iteration, model.model.best_iteration)
                 self.assertEqual(qlib_model.model.num_trees(), model.model.num_trees())
                 self.assertEqual(
@@ -224,57 +249,33 @@ class LeanLGBWindowTests(unittest.TestCase):
     # Break caught: a lean DoubleEnsemble window whose segments, labels or feature names drift from the Qlib dataset
     # path, which would change its sample re-weighting, feature selection or predictions.
     def test_lean_double_ensemble_predicts_exactly_what_the_qlib_dataset_path_predicts(self) -> None:
-        from unittest import mock
-
         import numpy as np
         import pandas as pd
-        from qlib.data.dataset import DatasetH
-        from qlib.data.dataset.handler import DataHandlerLP
-        from qlib.data.dataset.loader import DataLoader
+        from qlib.utils import init_instance_by_config
         from qlib.workflow import R
 
-        from rquant.workflow import runner as runner_module
-        from rquant.workflow.runner import RollingWorkflowRunner
+        from rquant.workflow.trainer import fit_task
 
         panel, dates = self._panel(np.random.default_rng(11))
-
-        class FixedLoader(DataLoader):
-            def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
-                pass
-
-            def load(self, instruments=None, start_time=None, end_time=None):  # type: ignore[no-untyped-def]
-                rows = panel.index.get_level_values("datetime")
-                keep = (rows >= pd.Timestamp(start_time)) & (rows <= pd.Timestamp(end_time))
-                return pd.DataFrame(np.asfortranarray(panel.to_numpy()[keep]), index=panel.index[keep],
-                                    columns=panel.columns, copy=False)
-
-        runner = RollingWorkflowRunner(
-            qlib_root="unused", factor_root="unused", run_directory="unused", model="double-ensemble",
-            horizon="1d", factor_set="wq_alpha101", seed=42,
-        )
-        day = [value.date() for value in dates]
+        day = [value.date().isoformat() for value in dates]
         segments = {
-            "train": (day[1].isoformat(), day[75].isoformat()),
-            "valid": (day[62].isoformat(), day[75].isoformat()),
-            "test": (day[78].isoformat(), day[-1].isoformat()),
+            "train": (day[1], day[75]),
+            "valid": (day[62], day[75]),
+            "test": (day[78], day[-1]),
         }
-        with mock.patch.object(runner_module, "KunQuantDataLoader", FixedLoader):
-            qlib_model = runner._model(iterations=6)
-            # One thread: LightGBM's multithreaded histogram sums may round differently from run to run.
-            qlib_model.params["num_threads"] = 1
-            np.random.seed(3)
-            handler = runner._handler(DataHandlerLP, fit_start=day[0], fit_end=day[75], data_end=day[-1])
-            dataset = DatasetH(handler=handler, segments=segments)
-            qlib_model.fit(dataset)
-            expected = qlib_model.predict(dataset, segment="test")
-            model = runner._model(iterations=6)
-            model.params["num_threads"] = 1
-            np.random.seed(3)
-            with R.start(experiment_name="RQuantLean", recorder_name="lean-double-ensemble"):
-                actual = runner._fit(
-                    model, DataHandlerLP, DatasetH, R, fit_start=day[0], fit_end=day[75], data_end=day[-1],
-                    segments=segments,
-                )
+        task = self._task(panel, day, fit_end=day[75], data_end=day[-1], segments=segments, model_name="de")
+        qlib_model = built_in_model("double-ensemble", epochs=6)
+        # One thread: LightGBM's multithreaded histogram sums may round differently from run to run.
+        qlib_model.params["num_threads"] = 1
+        np.random.seed(3)
+        dataset = init_instance_by_config(task["dataset"])
+        qlib_model.fit(dataset)
+        expected = qlib_model.predict(dataset, segment="test")
+        model = built_in_model("double-ensemble", epochs=6)
+        model.params["num_threads"] = 1
+        np.random.seed(3)
+        with R.start(experiment_name="RQuantLean", recorder_name="lean-double-ensemble"):
+            actual = fit_task(model, task)
         self.assertEqual(3, len(model.ensemble))
         for left, right in zip(qlib_model.sub_features, model.sub_features, strict=True):
             self.assertEqual(sorted(left), sorted(right))
@@ -291,21 +292,40 @@ class LeanLGBWindowTests(unittest.TestCase):
         expected_gain = qlib_model.get_feature_importance(importance_type="gain").reindex(names).fillna(0.0)
         np.testing.assert_array_equal(expected_gain.to_numpy(), importance["gain"].to_numpy())
 
+    # Break caught: a task whose handler differs from RQuant's processors silently taking the lean path, which would
+    # train on differently processed data than the task describes.
+    def test_only_rquant_processors_take_the_lean_path(self) -> None:
+        import copy
+
+        import numpy as np
+
+        from rquant.workflow.trainer import lean_window
+
+        panel, dates = self._panel(np.random.default_rng(1))
+        day = [value.date().isoformat() for value in dates]
+        task = self._task(panel, day, fit_end=day[60], data_end=day[-1], segments={}, model_name="lgb")
+        self.assertEqual(day[60], lean_window(task)["fit_end_time"])
+        changed = copy.deepcopy(task)
+        changed["dataset"]["kwargs"]["handler"]["kwargs"]["infer_processors"].pop()
+        self.assertIsNone(lean_window(changed))
+        changed = copy.deepcopy(task)
+        changed["dataset"]["kwargs"]["handler"]["kwargs"]["learn_processors"][1]["kwargs"]["fields_group"] = "feature"
+        self.assertIsNone(lean_window(changed))
+        changed = copy.deepcopy(task)
+        changed["dataset"]["kwargs"]["handler"]["kwargs"]["data_loader"] = {"class": "StaticDataLoader"}
+        self.assertIsNone(lean_window(changed))
+
     def test_lgb_feature_importance_names_every_factor_in_store_order(self) -> None:
         import numpy as np
         import pandas as pd
 
         from rquant.workflow.lgb_window import feature_importance
-        from rquant.workflow.runner import RollingWorkflowRunner
 
         rng = np.random.default_rng(2)
         names = [f"f{position}" for position in range(6)]
         x = pd.DataFrame(rng.normal(size=(400, 6)).astype(np.float32), columns=names)
         y = (0.5 * x["f0"] - 0.3 * x["f3"] + rng.normal(scale=0.1, size=400)).to_numpy(np.float32)
-        lgb_model = RollingWorkflowRunner(
-            qlib_root="unused", factor_root="unused", run_directory="unused", model="lgb", horizon="1d",
-            factor_set="wq_alpha101",
-        )._model(iterations=5, refit=True)
+        lgb_model = built_in_model("lgb", **refit_overrides("lgb", 5))
         import lightgbm as lgb
 
         params = dict(lgb_model.params, lambda_l1=0.0, lambda_l2=0.0, min_data_in_leaf=5, verbosity=-1)

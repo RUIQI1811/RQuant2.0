@@ -20,10 +20,14 @@ from typing import Any
 from rquant.errors import DataContractError
 
 try:
+    from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy as _TopkDropoutStrategy
     from qlib.contrib.strategy.signal_strategy import WeightStrategyBase as _WeightStrategyBase
 except ImportError:  # pragma: no cover - Qlib is a locked dependency
 
     class _WeightStrategyBase:  # type: ignore[no-redef]
+        pass
+
+    class _TopkDropoutStrategy:  # type: ignore[no-redef]
         pass
 
 
@@ -92,16 +96,32 @@ class RiskModelData:
         return self.volume.loc[date].reindex(codes).gt(0).to_numpy()
 
 
+class OptimizationLog:
+    """Rows ``EnhancedIndexingStrategy`` appends per rebalance. Qlib copies the lists and dicts of a strategy config
+    before building the strategy, so a log the caller reads back afterwards has to be an object of its own."""
+
+    def __init__(self) -> None:
+        self.rows: list[dict[str, Any]] = []
+
+
 class EnhancedIndexingStrategy(_WeightStrategyBase):  # type: ignore[misc,valid-type]
     """Qlib's enhanced-indexing strategy with an in-memory risk model and the universe's float-cap benchmark."""
 
-    def __init__(self, *, risk_data: RiskModelData, optimizer_kwargs: dict[str, Any] | None = None, **kwargs: Any):
+    def __init__(
+        self,
+        *,
+        risk_data: RiskModelData,
+        optimizer_kwargs: dict[str, Any] | None = None,
+        optimization_log: OptimizationLog | None = None,
+        **kwargs: Any,
+    ):
         from qlib.contrib.strategy.optimizer import EnhancedIndexingOptimizer
 
         super().__init__(**kwargs)
         self.risk_data = risk_data
         self.optimizer = EnhancedIndexingOptimizer(**(optimizer_kwargs or {}))
-        self.optimizations: list[dict[str, Any]] = []
+        self.optimization_log = optimization_log or OptimizationLog()
+        self.optimizations = self.optimization_log.rows
 
     def generate_target_weight_position(
         self, score: Any, current: Any, trade_start_time: Any, trade_end_time: Any
@@ -158,6 +178,77 @@ class EnhancedIndexingStrategy(_WeightStrategyBase):  # type: ignore[misc,valid-
             }
         )
         return {stock: float(value) for stock, value in zip(universe, weight, strict=True) if value > 0}
+
+
+class RebalancingLiquidationMixin:
+    """Trade every ``rebalance_days`` trading days and sell everything on the last step.
+
+    Rebalancing keeps the signal of every ``rebalance_days``-th trading day from its first date: Qlib strategies place
+    no orders on a step whose previous day has no signal, so the book stays untouched between rebalances. On the final
+    step every holding held at least ``hold_thresh`` steps (one when the strategy has none) is sold if it can trade.
+    """
+
+    def __init__(self, *, rebalance_days: int = 1, **kwargs: Any) -> None:
+        if rebalance_days < 1:
+            raise ValueError(f"rebalance_days must be at least 1, got {rebalance_days}")
+        if rebalance_days > 1 and hasattr(kwargs.get("signal"), "index"):
+            kwargs["signal"] = keep_rebalance_dates(kwargs["signal"], rebalance_days)
+        self.rebalance_days = rebalance_days
+        super().__init__(**kwargs)
+
+    def generate_trade_decision(self, execute_result: Any = None) -> Any:
+        from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
+
+        trade_step = self.trade_calendar.get_trade_step()
+        if trade_step + 1 < self.trade_calendar.get_trade_len():
+            return super().generate_trade_decision(execute_result)
+
+        trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
+        orders = []
+        for stock in sorted(self.trade_position.get_stock_list()):
+            held_steps = self.trade_position.get_stock_count(stock, bar=self.trade_calendar.get_freq())
+            if held_steps < getattr(self, "hold_thresh", 1):
+                continue
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=stock,
+                start_time=trade_start,
+                end_time=trade_end,
+                direction=OrderDir.SELL,
+            ):
+                continue
+            amount = self.trade_position.get_stock_amount(stock)
+            order = Order(
+                stock_id=stock,
+                amount=amount,
+                start_time=trade_start,
+                end_time=trade_end,
+                direction=Order.SELL,
+            )
+            if self.trade_exchange.check_order(order):
+                orders.append(order)
+        return TradeDecisionWO(orders, self)
+
+
+def keep_rebalance_dates(signal: Any, every: int) -> Any:
+    """The rows of ``signal`` (on a <datetime, instrument> index) dated on every ``every``-th trading day of the
+    provider calendar, counted from the signal's first date."""
+    import pandas as pd
+    from qlib.data import D
+
+    days = signal.index.get_level_values("datetime")
+    calendar = D.calendar(start_time=days.min(), end_time=days.max(), freq="day")
+    kept = signal[days.isin(pd.DatetimeIndex(pd.to_datetime(list(calendar))[::every]))]
+    if len(kept) == 0:
+        raise DataContractError("No predictions fall on a rebalance date")
+    return kept
+
+
+class LiquidatingTopkDropoutStrategy(RebalancingLiquidationMixin, _TopkDropoutStrategy):  # type: ignore[misc]
+    """Qlib's ``TopkDropoutStrategy`` with a rebalance interval and a final liquidation."""
+
+
+class LiquidatingEnhancedIndexingStrategy(RebalancingLiquidationMixin, EnhancedIndexingStrategy):  # type: ignore[misc]
+    """``EnhancedIndexingStrategy`` with a rebalance interval and a final liquidation."""
 
 
 def load_float_cap(reference_root: str | Path, start: Any, end: Any, instruments: list[str]) -> Any:

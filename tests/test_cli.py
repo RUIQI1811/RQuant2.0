@@ -5,7 +5,7 @@ import io
 import json
 import subprocess
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -28,12 +28,23 @@ class CliTests(unittest.TestCase):
             ["factors", "validate", "--factor-set", "wq_alpha101"],
             ["factors", "evaluate", "--factor-set", "oap_jq_cnc", "--horizon", "20d"],
             ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "oap_jq_cnc"],
+            ["walk-forward", "--model", "double-ensemble"],
+            ["walk-forward", "--workflow", "my_lgb.yaml", "--through", "2025-01-01"],
             ["report", "run-id"],
             ["rdagent", "export", "--mining-end", "2021-12-31"],
         ]
         for argv in cases:
             with self.subTest(argv=argv):
                 self.assertTrue(callable(parser.parse_args(argv).handler))
+
+    def test_walk_forward_takes_exactly_one_workflow(self) -> None:
+        parser = build_parser()
+        for argv in (
+            ["walk-forward", "--horizon", "1d"],
+            ["walk-forward", "--model", "lgb", "--workflow", "my_lgb.yaml"],
+        ):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                parser.parse_args(argv)
 
     def test_research_commands_have_run_categories(self) -> None:
         parser = build_parser()

@@ -10,10 +10,10 @@ from rquant.errors import DataContractError
 from rquant.io import atomic_write_json
 from rquant.reporting import build_report
 
-HAS_PARQUET = importlib.util.find_spec("pandas") is not None and importlib.util.find_spec("pyarrow") is not None
+HAS_STACK = all(importlib.util.find_spec(name) is not None for name in ("pandas", "pyarrow", "qlib"))
 
 
-@unittest.skipUnless(HAS_PARQUET, "pandas and pyarrow are required")
+@unittest.skipUnless(HAS_STACK, "pandas, pyarrow and pyqlib are required")
 class SignalAnalysisTests(unittest.TestCase):
     def _frame(self, rng):  # type: ignore[no-untyped-def]
         import numpy as np
@@ -27,35 +27,22 @@ class SignalAnalysisTests(unittest.TestCase):
         score.iloc[:3] = np.nan
         return score, label
 
-    # Break caught: an IC that pools dates, drops the Spearman ranking, or counts days with too few stocks.
-    def test_daily_ic_matches_qlib_calc_ic(self) -> None:
+    # Break caught: a summary that pools years, drops the Rank IC, or reports an annualised ICIR.
+    def test_summary_of_qlib_daily_ic_splits_calendar_years(self) -> None:
         import numpy as np
+        import pandas as pd
         from qlib.contrib.eva.alpha import calc_ic
 
-        from rquant.workflow.signal_analysis import daily_ic
-
-        score, label = self._frame(np.random.default_rng(1))
-        daily = daily_ic(score, label).set_index("datetime")
-        expected_ic, expected_rank_ic = calc_ic(score, label)
-        np.testing.assert_allclose(expected_ic.to_numpy(), daily["ic"].to_numpy(), rtol=1e-12)
-        np.testing.assert_allclose(expected_rank_ic.to_numpy(), daily["rank_ic"].to_numpy(), rtol=1e-12)
-        self.assertEqual(27, int(daily["instruments"].iloc[0]))
-
-        sparse = daily_ic(score, label, min_cross_section=28)
-        self.assertNotIn(score.index.get_level_values("datetime")[0], set(sparse["datetime"]))
-
-    def test_summary_splits_calendar_years_and_reports_icir(self) -> None:
-        import numpy as np
-
-        from rquant.workflow.signal_analysis import daily_ic, summarize_ic
+        from rquant.workflow.signal_analysis import summarize_ic
 
         score, label = self._frame(np.random.default_rng(2))
-        daily = daily_ic(score, label)
+        ic, rank_ic = calc_ic(score, label)
+        daily = pd.DataFrame({"ic": ic, "rank_ic": rank_ic}).rename_axis("datetime").reset_index()
         summary = summarize_ic(daily)
         self.assertEqual([2021, 2022], [row["year"] for row in summary["years"]])
         self.assertEqual(len(daily), summary["overall"]["days"])
-        self.assertAlmostEqual(daily["ic"].mean() / daily["ic"].std(), summary["overall"]["ic_ir"])
-        self.assertAlmostEqual(daily["rank_ic"].mean(), summary["overall"]["rank_ic"])
+        self.assertAlmostEqual(ic.mean() / ic.std(), summary["overall"]["ic_ir"])
+        self.assertAlmostEqual(rank_ic.mean(), summary["overall"]["rank_ic"])
         with self.assertRaises(DataContractError):
             summarize_ic(daily.iloc[0:0])
 
