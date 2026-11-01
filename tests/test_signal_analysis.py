@@ -63,7 +63,7 @@ class SignalAnalysisTests(unittest.TestCase):
             pd.DataFrame(
                 {
                     "prediction_year": [2021, 2021, 2022, 2022],
-                    "factor": ["a", "b", "a", "b"],
+                    "factor": ["a", "jq_001", "a", "jq_001"],
                     "gain": [3.0, 1.0, 1.0, 0.0],
                     "split": [3, 1, 1, 0],
                     "gain_share": [0.75, 0.25, 1.0, 0.0],
@@ -83,14 +83,16 @@ class SignalAnalysisTests(unittest.TestCase):
             report = build_report(run_directory)
 
             top = report["feature_importance"]["top"]
-            self.assertEqual(["a", "b"], [item["factor"] for item in top])
+            self.assertEqual(["a", "jq_001"], [item["factor"] for item in top])
+            # Catalog columns are shown with their source library's name; unknown columns keep their own.
+            self.assertEqual(["a", "net_profit_to_total_operate_revenue_ttm"], [item["source_name"] for item in top])
             self.assertAlmostEqual(0.875, top[0]["mean_gain_share"])
             self.assertEqual([2, 1], [item["years_used"] for item in top])
             self.assertAlmostEqual(85.0, report["optimizations"]["holdings"])
             markdown = (run_directory / "report.md").read_text(encoding="utf-8")
             self.assertIn("## Prediction IC", markdown)
             self.assertIn("| All | 2 | 0.0500 | 0.400 | 0.0600 | 0.500 | 0.60 |", markdown)
-            self.assertIn("| 1 | a | 87.50% | 2 |", markdown)
+            self.assertIn("| 1 | a | a | 87.50% | 2 |", markdown)
             self.assertIn("## Portfolio optimisation", markdown)
             with (run_directory / "report.json").open("r", encoding="utf-8") as handle:
                 self.assertIn("signal_analysis", json.load(handle))

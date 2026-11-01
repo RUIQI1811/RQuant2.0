@@ -277,15 +277,28 @@ def _feature_importance_summary(pd: Any, frame: Any) -> dict[str, Any]:
             "years_used": grouped["split"].apply(lambda values: int((values > 0).sum())),
         }
     ).sort_values("mean_gain_share", ascending=False, kind="mergesort")
+    source_names = _source_names()
     return {
         "years": years,
         "factors": int(len(table)),
         "unused_factors": int((table["years_used"] == 0).sum()),
         "top": [
-            {"factor": str(name), "mean_gain_share": float(row.mean_gain_share), "years_used": int(row.years_used)}
+            {
+                "factor": str(name),
+                "source_name": source_names.get(str(name), str(name)),
+                "mean_gain_share": float(row.mean_gain_share),
+                "years_used": int(row.years_used),
+            }
             for name, row in table.head(IMPORTANCE_TOP).iterrows()
         ],
     }
+
+
+def _source_names() -> dict[str, str]:
+    """Catalog column name (``jq_218``) to the factor's name in its source library (``single_day_VPT``)."""
+    from rquant.factors.catalog import get_catalog
+
+    return {spec.canonical_name: spec.source_name for spec in get_catalog().specs}
 
 
 def _signal_markdown(signal: dict[str, Any]) -> list[str]:
@@ -318,11 +331,14 @@ def _importance_markdown(importance: dict[str, Any]) -> list[str]:
         f"Share of the model's total split gain, averaged over {importance['years']} walk-forward years. "
         f"{importance['unused_factors']} of {importance['factors']} factors were never split on.",
         "",
-        "| Rank | Factor | Mean gain share | Years used |",
-        "| ---: | :--- | ---: | ---: |",
+        "| Rank | Factor | Source name | Mean gain share | Years used |",
+        "| ---: | :--- | :--- | ---: | ---: |",
     ]
     for rank, row in enumerate(importance["top"], start=1):
-        lines.append(f"| {rank} | {row['factor']} | {row['mean_gain_share']:.2%} | {row['years_used']} |")
+        source = row.get("source_name", row["factor"])
+        lines.append(
+            f"| {rank} | {row['factor']} | {source} | {row['mean_gain_share']:.2%} | {row['years_used']} |"
+        )
     lines.append("")
     return lines
 
