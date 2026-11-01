@@ -93,24 +93,12 @@ class PortfolioBacktestRunner:
 
     def run(self) -> dict[str, Any]:
         qlib, pd, np = _dependencies()
-        predictions_path = self.run_directory / "predictions.parquet"
-        if not predictions_path.exists():
-            raise DataContractError(f"Predictions do not exist: {predictions_path}")
-        predictions = pd.read_parquet(predictions_path)
-        required = {"datetime", "instrument", "score"}
-        if not required.issubset(predictions.columns):
-            raise DataContractError(f"Prediction columns must include {sorted(required)}")
-        predictions = predictions.dropna(subset=["score"]).copy()
-        predictions["datetime"] = pd.to_datetime(predictions["datetime"])
-        if predictions.empty:
-            raise DataContractError("No finite predictions are available for backtesting")
-        if predictions.duplicated(["datetime", "instrument"]).any():
-            raise DataContractError("Predictions contain duplicate datetime/instrument rows")
+        predictions = load_predictions(pd, self.run_directory)
 
         from qlib.constant import REG_CN
         from qlib.contrib.evaluate import risk_analysis
         from qlib.workflow import R
-        from qlib.workflow.record_temp import PortAnaRecord, SigAnaRecord
+        from qlib.workflow.record_temp import PortAnaRecord
 
         from rquant.qlib_ext.strategy import OptimizationLog, keep_rebalance_dates
         from rquant.workflow.runner import init_run_tracking, release_run_tracking
@@ -197,12 +185,12 @@ class PortfolioBacktestRunner:
             recorder = R.get_recorder()
             # The artifacts SignalRecord saves; SigAnaRecord and PortAnaRecord read them back.
             recorder.save_objects(**{"pred.pkl": signal.to_frame("score")})
-            # As in SignalRecord, a label that cannot be built (no horizon) is saved as None; nothing is scored.
-            labels = _labels(D, pd, signal, self.horizon) if self.horizon is not None else None
-            recorder.save_objects(**{"label.pkl": labels})
             signal_summary = None
-            if labels is not None:
-                signal_summary = self._write_signal_analysis(pd, SigAnaRecord(recorder).generate())
+            if self.horizon is not None:
+                signal_summary = analyse_signal(recorder, signal, self.horizon, self.run_directory)
+            else:
+                # As in SignalRecord, a label that cannot be built (no horizon) is saved as None; nothing is scored.
+                recorder.save_objects(**{"label.pkl": None})
             artifacts = PortAnaRecord(
                 recorder,
                 config=port_analysis_config,
@@ -297,26 +285,6 @@ class PortfolioBacktestRunner:
         atomic_write_json(self.run_directory / "backtest.json", manifest)
         return manifest
 
-    def _write_signal_analysis(self, pd: Any, artifacts: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Write SigAnaRecord's daily IC and Rank IC, and their overall and calendar-year summary."""
-        from rquant.workflow.signal_analysis import summarize_ic
-
-        if not artifacts:
-            return None
-        daily = pd.DataFrame({"ic": artifacts["ic.pkl"], "rank_ic": artifacts["ric.pkl"]})
-        daily = daily.rename_axis("datetime").reset_index()
-        daily.to_parquet(self.run_directory / "signal_ic.parquet", index=False)
-        assert self.horizon is not None
-        summary = {
-            "status": "complete",
-            "engine": "qlib.workflow.record_temp.SigAnaRecord",
-            "horizon": self.horizon,
-            "label": LABEL_EXPRESSIONS[self.horizon],
-            **summarize_ic(daily),
-        }
-        atomic_write_json(self.run_directory / "signal_analysis.json", summary)
-        return summary
-
     def _risk_data(self, D: Any, pd: Any, predictions: Any, start_time: Any, end_time: Any) -> Any:
         """Prices, volumes and float caps of every predicted instrument, from ``risk_lookback_days`` rows before the
         first signal through the last trading day."""
@@ -344,7 +312,93 @@ class PortfolioBacktestRunner:
         )
 
 
+class SignalAnalysisRunner:
+    """Score a run's saved predictions with Qlib's ``SigAnaRecord`` alone, without a portfolio backtest.
+
+    The predictions and labels are saved as ``SignalRecord`` saves them, in a fresh recorder under
+    ``<run>/signal_mlflow``; ``signal_ic.parquet`` and ``signal_analysis.json`` are written as ``rquant report``
+    writes them.
+    """
+
+    def __init__(self, *, qlib_root: str | Path, run_directory: str | Path, horizon: str) -> None:
+        if horizon not in LABEL_EXPRESSIONS:
+            raise DataContractError(f"Unsupported horizon: {horizon}")
+        self.qlib_root = Path(qlib_root)
+        self.run_directory = Path(run_directory)
+        self.horizon = horizon
+
+    def run(self) -> dict[str, Any]:
+        qlib, pd, _ = _dependencies()
+        predictions = load_predictions(pd, self.run_directory)
+
+        from qlib.constant import REG_CN
+        from qlib.workflow import R
+
+        from rquant.workflow.runner import init_run_tracking, release_run_tracking
+
+        store = self.run_directory / "signal_mlflow"
+        if store.exists():
+            shutil.rmtree(store)
+        store.mkdir()
+        init_run_tracking(store, SIGNAL_EXPERIMENT, provider_uri=self.qlib_root, region=REG_CN, qlib_module=qlib)
+        signal = predictions.set_index(["datetime", "instrument"])["score"].sort_index()
+        with R.start(experiment_name=SIGNAL_EXPERIMENT, recorder_name="signal"):
+            recorder = R.get_recorder()
+            recorder.save_objects(**{"pred.pkl": signal.to_frame("score")})
+            summary = analyse_signal(recorder, signal, self.horizon, self.run_directory)
+        release_run_tracking(store)
+        if summary is None:
+            raise DataContractError("Qlib's SigAnaRecord returned no IC")
+        return summary
+
+
+def load_predictions(pd: Any, run_directory: Path) -> Any:
+    """The run's finite out-of-sample predictions (``datetime``, ``instrument``, ``score``)."""
+    predictions_path = run_directory / "predictions.parquet"
+    if not predictions_path.exists():
+        raise DataContractError(f"Predictions do not exist: {predictions_path}")
+    predictions = pd.read_parquet(predictions_path)
+    required = {"datetime", "instrument", "score"}
+    if not required.issubset(predictions.columns):
+        raise DataContractError(f"Prediction columns must include {sorted(required)}")
+    predictions = predictions.dropna(subset=["score"]).copy()
+    predictions["datetime"] = pd.to_datetime(predictions["datetime"])
+    if predictions.empty:
+        raise DataContractError("No finite predictions are available")
+    if predictions.duplicated(["datetime", "instrument"]).any():
+        raise DataContractError("Predictions contain duplicate datetime/instrument rows")
+    return predictions
+
+
+def analyse_signal(recorder: Any, signal: Any, horizon: str, run_directory: Path) -> dict[str, Any] | None:
+    """Save the ``horizon`` labels of ``signal`` to ``recorder`` (whose ``pred.pkl`` is ``signal``), run Qlib's
+    ``SigAnaRecord``, and write its daily IC and Rank IC with their overall and calendar-year summary."""
+    import pandas as pd
+    from qlib.data import D
+    from qlib.workflow.record_temp import SigAnaRecord
+
+    from rquant.workflow.signal_analysis import summarize_ic
+
+    recorder.save_objects(**{"label.pkl": _labels(D, pd, signal, horizon)})
+    artifacts = SigAnaRecord(recorder).generate()
+    if not artifacts:
+        return None
+    daily = pd.DataFrame({"ic": artifacts["ic.pkl"], "rank_ic": artifacts["ric.pkl"]})
+    daily = daily.rename_axis("datetime").reset_index()
+    daily.to_parquet(run_directory / "signal_ic.parquet", index=False)
+    summary = {
+        "status": "complete",
+        "engine": "qlib.workflow.record_temp.SigAnaRecord",
+        "horizon": horizon,
+        "label": LABEL_EXPRESSIONS[horizon],
+        **summarize_ic(daily),
+    }
+    atomic_write_json(run_directory / "signal_analysis.json", summary)
+    return summary
+
+
 BACKTEST_EXPERIMENT = "rquant-backtest"
+SIGNAL_EXPERIMENT = "rquant-signal"
 
 # Annualization: 252 trading days a year, as every earlier RQuant report and scripts/analysis/window_metrics.py use
 # (Qlib's own default for freq "day" is 238; the A-share calendar has about 242).

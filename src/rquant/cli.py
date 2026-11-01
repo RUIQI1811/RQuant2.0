@@ -33,7 +33,7 @@ from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
 from rquant.runs import RunContext
 from rquant.universe import SUPPORTED_UNIVERSES
-from rquant.workflow.backtest import STRATEGIES, PortfolioBacktestRunner, PortfolioConfig
+from rquant.workflow.backtest import STRATEGIES, PortfolioBacktestRunner, PortfolioConfig, SignalAnalysisRunner
 from rquant.workflow.runner import RollingWorkflowRunner
 from rquant.workflow.tasks import BUILT_IN_WORKFLOWS
 
@@ -142,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--strategy",
         choices=STRATEGIES,
         help="Override backtest.strategy: equal-weight top-K, or Qlib enhanced indexing with a risk model",
+    )
+    report.add_argument(
+        "--signal-only",
+        action="store_true",
+        help="Score the predictions (Qlib SigAnaRecord IC / Rank IC) and summarise feature importance, without the "
+        "portfolio backtest",
     )
     report.set_defaults(handler=_report, run_category="report")
 
@@ -646,6 +652,10 @@ def _report(args: argparse.Namespace) -> int:
         predictions_path = run_directory / "predictions.parquet"
         if not predictions_path.exists():
             raise DataContractError(f"Predictions do not exist: {predictions_path}")
+        if args.signal_only:
+            if any(value is not None for value in (args.topk, args.n_drop, args.rebalance_days, args.strategy)):
+                raise DataContractError("--signal-only runs no backtest; drop the portfolio options")
+            return _signal_report(run, paths, args.run_id, run_directory, predictions_path)
         backtest = config.get("backtest", {})
         portfolio_config = PortfolioConfig(
             initial_capital=float(backtest.get("initial_capital", 1_000_000)),
@@ -691,6 +701,29 @@ def _report(args: argparse.Namespace) -> int:
         return {"walk_forward_run_id": args.run_id, "backtest": portfolio, "signal": signal, "report": report}
 
     return _run(args, action)
+
+
+def _signal_report(
+    run: RunContext, paths: ProjectPaths, run_id: str, run_directory: Path, predictions_path: Path
+) -> dict[str, Any]:
+    """``report --signal-only``: IC and feature importance of a walk-forward run, no backtest."""
+    horizon = _walk_forward_manifest(run_directory).get("horizon")
+    if not horizon:
+        raise DataContractError(f"{run_directory / 'walk_forward.json'} does not name the run's horizon")
+    run.add_input("walk_forward_run_id", run_id)
+    run.add_input("walk_forward_run_directory", str(run_directory))
+    run.add_input("predictions_sha256", sha256_file(predictions_path))
+    run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
+    signal = SignalAnalysisRunner(qlib_root=paths.qlib, run_directory=run_directory, horizon=str(horizon)).run()
+    report = build_report(run_directory)
+    manifest_path = run_directory / "run.json"
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            run_manifest = json.load(handle)
+        run_manifest.setdefault("outputs", {})["signal"] = signal
+        run_manifest["outputs"]["report"] = report
+        atomic_write_json(manifest_path, run_manifest)
+    return {"walk_forward_run_id": run_id, "signal": signal, "report": report}
 
 
 def _dependency_versions() -> dict[str, str | None]:

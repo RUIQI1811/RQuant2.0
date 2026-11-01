@@ -95,6 +95,44 @@ class SignalAnalysisTests(unittest.TestCase):
             with (run_directory / "report.json").open("r", encoding="utf-8") as handle:
                 self.assertIn("signal_analysis", json.load(handle))
 
+    # Break caught: --signal-only scoring against a label other than the one the run trained on, or running the
+    # portfolio backtest anyway.
+    def test_signal_only_scores_predictions_with_sig_ana_record_and_no_backtest(self) -> None:
+        import numpy as np
+        import pandas as pd
+        from qlib.contrib.eva.alpha import calc_ic
+        from qlib.data import D
+        from test_enhanced_indexing import write_provider
+
+        from rquant.workflow.backtest import SignalAnalysisRunner
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dates, instruments, _ = write_provider(root / "qlib", np.random.default_rng(5))
+            run_directory = root / "run"
+            run_directory.mkdir()
+            rng = np.random.default_rng(6)
+            index = pd.MultiIndex.from_product([dates[20:50], instruments], names=["datetime", "instrument"])
+            pd.Series(rng.normal(size=len(index)), index=index, name="score").reset_index().to_parquet(
+                run_directory / "predictions.parquet", index=False
+            )
+
+            summary = SignalAnalysisRunner(
+                qlib_root=root / "qlib", run_directory=run_directory, horizon="1d"
+            ).run()
+
+            score = pd.read_parquet(run_directory / "predictions.parquet").set_index(["datetime", "instrument"])
+            label = D.features(instruments, ["Ref($open, -2) / Ref($open, -1) - 1"], dates[20], dates[49])
+            label = label.iloc[:, 0].swaplevel().sort_index().reindex(score.index)
+            ic, rank_ic = calc_ic(score["score"], label)
+            self.assertAlmostEqual(ic.mean(), summary["overall"]["ic"])
+            self.assertAlmostEqual(rank_ic.mean(), summary["overall"]["rank_ic"])
+            self.assertTrue((run_directory / "signal_ic.parquet").exists())
+            self.assertFalse((run_directory / "portfolio.parquet").exists())
+            self.assertFalse((run_directory / "backtest_mlflow").exists())
+            with self.assertRaises(DataContractError):
+                SignalAnalysisRunner(qlib_root=root / "qlib", run_directory=run_directory, horizon="3d")
+
 
 if __name__ == "__main__":
     unittest.main()

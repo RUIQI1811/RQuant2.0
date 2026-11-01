@@ -1053,6 +1053,13 @@ Qlib 默认的累加口径并列。
 `signal_ic.parquet`，全期与分年汇总在 `signal_analysis.json` 和 `report.md`。
 `report.md` 也会列出全期平均 gain 占比最高的 30 个因子，以及从未被使用的因子数。
 
+只想比较模型、不跑回测时，用 `--signal-only`：只运行 `SigAnaRecord`（记录在 `<run>/signal_mlflow/`），
+写出 `signal_ic.parquet`、`signal_analysis.json` 并重新生成 `report.md`（目录里没有回测结果时只含 IC 与因子重要性）：
+
+```bash
+rquant report RUN_ID --signal-only
+```
+
 `report.json` 与 `report.md` 会同时包含按自然年汇总的稳定性表。策略年度收益按每日净收益
 `return - cost` 复利计算，并与同期沪深 300 基准比较；表中还会列出年度超额收益、最大回撤、
 日均换手、年度累计换手和现金交易成本。最后一个年份若只覆盖部分年度，应结合表中的起止日期解读。

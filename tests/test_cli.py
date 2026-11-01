@@ -105,6 +105,8 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(["report", "run-id", "--strategy", "enhanced-indexing"])
         self.assertEqual("enhanced-indexing", args.strategy)
         self.assertIsNone(build_parser().parse_args(["report", "run-id"]).strategy)
+        self.assertTrue(build_parser().parse_args(["report", "run-id", "--signal-only"]).signal_only)
+        self.assertFalse(build_parser().parse_args(["report", "run-id"]).signal_only)
         with (Path(__file__).resolve().parents[1] / "config" / "default.yaml").open("r", encoding="utf-8") as handle:
             backtest = yaml.safe_load(handle)["backtest"]
         self.assertEqual("topk-dropout", backtest["strategy"])
