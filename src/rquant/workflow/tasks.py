@@ -32,8 +32,14 @@ BUILT_IN_WORKFLOWS = {
     "alstm": WORKFLOW_DIRECTORY / "alstm.yaml",
     "hist": WORKFLOW_DIRECTORY / "hist.yaml",
     "tra": WORKFLOW_DIRECTORY / "tra.yaml",
-    # GRU over a TSDatasetH window of any factor set.
+    # TSDatasetH / MTSDatasetH windows of every column of any factor set.
     "gru-ts": WORKFLOW_DIRECTORY / "gru_ts.yaml",
+    "alstm-ts": WORKFLOW_DIRECTORY / "alstm_ts.yaml",
+    "tra-ts": WORKFLOW_DIRECTORY / "tra_ts.yaml",
+    # Qlib's Alpha158 benchmarks: TSDatasetH / MTSDatasetH windows of 20 qlib_alpha158 factors.
+    "gru-alpha158": WORKFLOW_DIRECTORY / "gru_alpha158.yaml",
+    "alstm-alpha158": WORKFLOW_DIRECTORY / "alstm_alpha158.yaml",
+    "tra-alpha158": WORKFLOW_DIRECTORY / "tra_alpha158.yaml",
 }
 
 # Datasets that feed a model a window of past rows per sample, and the kwarg naming its length in trading days.
@@ -158,6 +164,9 @@ def rolling_template(
     if _class_name(dataset) == "MTSDatasetH":
         # MTSDatasetH can only guess the label horizon from Qlib expression fields, which KunQuantDataLoader has not.
         dataset.setdefault("kwargs", {}).setdefault("horizon", TRUNC_DAYS[task_horizon(task)])
+    # Only SignalRecord's label reads the raw panel, and rolling training saves its predictions itself: dropping it
+    # saves one copy of the panel on Qlib's own dataset path.
+    kwargs["drop_raw"] = True
     task["record"] = [{"class": "SignalRecord", "module_path": "qlib.workflow.record_temp"}]
     return task
 
@@ -186,6 +195,15 @@ def time_series_window(task: dict[str, Any]) -> int:
         return 0
     default = 30 if key == "step_len" else 60  # TSDatasetH's and MTSDatasetH's defaults
     return int(dataset.get("kwargs", {}).get(key) or default)
+
+
+def selected_columns(task: dict[str, Any]) -> list[str] | None:
+    """The feature columns a ``FilterCol`` processor of the task's handler keeps, or None to keep every factor."""
+    kwargs = _handler(task).get("kwargs", {})
+    for processor in kwargs.get("infer_processors", []) + kwargs.get("learn_processors", []):
+        if isinstance(processor, dict) and _class_name(processor) == "FilterCol":
+            return list(processor.get("kwargs", {}).get("col_list", []))
+    return None
 
 
 def _class_name(config: dict[str, Any]) -> str:

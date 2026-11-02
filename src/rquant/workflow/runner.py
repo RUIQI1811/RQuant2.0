@@ -22,6 +22,7 @@ from rquant.workflow.tasks import (
     CalendarYearRollingGen,
     load_workflow,
     rolling_template,
+    selected_columns,
     task_factor_set,
     task_horizon,
 )
@@ -74,10 +75,20 @@ class RollingWorkflowRunner:
             model_kwargs["seed"] = seed
         self.horizon = task_horizon(self.template)
         self.factor_set = task_factor_set(self.template)
-        factors = len(get_catalog().canonical_names(self.factor_set))
-        # A time-series model reads one row of factors per day; `d_feat: null` takes the factor set's width.
+        names = list(get_catalog().canonical_names(self.factor_set))
+        selected = selected_columns(self.template)
+        if selected is not None and (missing := sorted(set(selected) - set(names))):
+            raise DataContractError(
+                f"The workflow's FilterCol keeps columns {self.factor_set} does not have: {', '.join(missing[:5])}"
+            )
+        # A time-series model reads one row of factors per day; `d_feat: null` (TRA: `model_config.input_size: null`)
+        # takes the number of columns it gets.
+        width = len(selected if selected is not None else names)
         if "d_feat" in model_kwargs and model_kwargs["d_feat"] is None:
-            model_kwargs["d_feat"] = factors
+            model_kwargs["d_feat"] = width
+        model_config = model_kwargs.get("model_config")  # TRA's backbone
+        if isinstance(model_config, dict) and "input_size" in model_config and model_config["input_size"] is None:
+            model_config["input_size"] = width
 
     @property
     def experiment_name(self) -> str:

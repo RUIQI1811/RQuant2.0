@@ -910,15 +910,24 @@ Qlib 的 PyTorch 模型也能直接滚动训练。先装 PyTorch：有 NVIDIA �
 | `alstm` | `pytorch_alstm.ALSTM` | 同上 |
 | `hist` | `pytorch_hist.HIST` | 同上，另需股票-概念矩阵 |
 | `tra` | `pytorch_tra.TRAModel` | `MTSDatasetH`，同上的 60 天 × 6 字段序列 |
-| `gru-ts` | `pytorch_gru_ts.GRU` | `TSDatasetH`，任何因子集最近 20 天的因子行 |
+| `gru-ts` | `pytorch_gru_ts.GRU` | `TSDatasetH`，任何因子集最近 20 天的因子行（默认 jq240） |
+| `alstm-ts` | `pytorch_alstm_ts.ALSTM` | 同上 |
+| `tra-ts` | `pytorch_tra.TRAModel` | `MTSDatasetH`，任何因子集最近 60 天的因子行 |
+| `gru-alpha158` | `pytorch_gru_ts.GRU` | `TSDatasetH`，`qlib_alpha158` 中 Qlib 基准选的 20 个因子、最近 20 天 |
+| `alstm-alpha158` | `pytorch_alstm_ts.ALSTM` | 同上 |
+| `tra-alpha158` | `pytorch_tra.TRAModel` | `MTSDatasetH`，同样 20 个因子、最近 60 天 |
 
 ```bash
 rquant walk-forward --model hist --horizon 1d --first-year 2013 --last-year 2026 --through 2026-10-21
 rquant walk-forward --model gru-ts --factor-set jq240 --horizon 1d --through 2026-10-21
+rquant --universe sh_main walk-forward --model alstm-ts --factor-set jq240 --through 2026-10-21
 ```
 
+- `*-alpha158` 三个文件照搬 Qlib 的 Alpha158 基准：`FilterCol` 只留 20 个因子（RESI5、WVMA5、RSQR5、KLEN 等），
+  `RobustZScoreNorm` 截断到 ±3。只送 20 列给网络，所以内存比 Alpha360 小得多，sh_main 也能跑；换成别的因子集会报错。
+  HIST 只有 Alpha360 版（它按 6 个字段 × 60 天的结构设计）。
 - 前四个模型的 workflow 默认因子集是 `qlib_alpha360`（Qlib 基准用的就是 Alpha360）；`--factor-set` 换成别的会因为
-  列数不是 360 而报错。`gru-ts` 的 `d_feat: null` 自动取因子集的列数。参数都取 Qlib Alpha360 / Alpha158 基准配置。
+  列数不是 360 而报错。`*-ts` 的 `d_feat: null`（TRA 是 `model_config.input_size: null`）自动取因子集的列数。参数都取 Qlib Alpha360 / Alpha158 基准配置。
 - 时序窗口：`TSDatasetH` / `MTSDatasetH` 要在每段开头往前多读 `step_len` / `seq_len` 天，walk-forward 会把 handler 的
   起点相应往前挪（gru-ts 20 天、TRA 60 天），所以训练段第一天的样本也有完整窗口，不会用 0 补齐。
 - 验证集独立：神经网络按验证集早停，所以这些 workflow 设了 `rolling.holdout_valid: true`，训练段在验证段开始前按标签
@@ -928,8 +937,11 @@ rquant walk-forward --model gru-ts --factor-set jq240 --horizon 1d --through 202
   （`stock2concept.npy`、`stock_index.npy`）；想用自己的概念表就复制 `hist.yaml` 填上这两个路径。没有预训练的 LSTM，
   主干从随机权重开始。
 - TRA 对所有段都读 handler 的 learn 视图（会去掉没有标签的行），所以运行最后两个交易日（1d 标签还没出来）没有预测。
-- 内存：这些模型走 Qlib 原生 `DatasetH`，handler 会把整个窗口的面板存两三份。16 GB 的机器建议先在 csi300 上跑；
-  sh_main 的 Alpha360 面板单份就有 9-10 GB。显存方面 8 GB 显卡够用。
+- 内存：这些模型走 Qlib 原生数据集，handler 存推理和训练两份面板（滚动训练不留原始面板），时序采样器再存一份。
+  实测 400 只股票、4 年窗口、233 个因子（面板 0.4 GB）时 `gru-ts` / `alstm-ts` 进程峰值比空载多 2.3 GB，约为面板的
+  6 倍；sh_main 的 jq240 窗口约 1.5 GB，估计峰值 9 GB 左右，跑的时候关掉其他大程序。sh_main 的 Alpha360 面板单份就有
+  9-10 GB，跑不了。`n_jobs` 设为 0（在训练进程里取批数据）：Windows 上每个 DataLoader 子进程都会复制一份样本。
+  显存方面 8 GB 显卡够用。
 
 可选预测期限：
 

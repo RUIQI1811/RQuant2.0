@@ -69,6 +69,7 @@ class NeuralWorkflowTests(unittest.TestCase):
             cls.root, stocks=24, factor_set="qlib_alpha360", start="2019-06-03"
         )
         write_store(cls.root / "a101", stocks=24, start="2019-06-03")
+        write_store(cls.root / "a158", stocks=24, factor_set="qlib_alpha158", start="2019-06-03")
         cls.instruments = [f"SH6{value:05d}" for value in range(24)]
         cls.canonical_root = write_industries(cls.root, cls.instruments, cls.calendar)
 
@@ -91,7 +92,8 @@ class NeuralWorkflowTests(unittest.TestCase):
             first_prediction_year=2021, last_prediction_year=2021, horizon="1d", through=date(2021, 12, 20),
             train_years=1, validation_months=6, formal_start_year=2020,
         )[0]
-        for name, padding in (("gru", 0), ("tra", 60), ("gru-ts", 20)):
+        cases = {"gru": 0, "tra": 60, "gru-ts": 20, "tra-ts": 60, "gru-alpha158": 20, "tra-alpha158": 60}
+        for name, padding in cases.items():
             with self.subTest(model=name):
                 workflow = load_workflow(BUILT_IN_WORKFLOWS[name])
                 self.assertTrue(workflow["rolling"]["holdout_valid"])
@@ -112,12 +114,14 @@ class NeuralWorkflowTests(unittest.TestCase):
                 self.assertEqual(previous_trading_day(self.calendar, window.test_start, 1), segments["valid"][1])
                 self.assertLess(segments["train"][1], segments["valid"][0])
                 handler = task["dataset"]["kwargs"]["handler"]["kwargs"]
+                self.assertTrue(handler["drop_raw"])
                 start = handler["start_time"].date()
                 trading_before = [day for day in self.calendar if start <= day < segments["train"][0]]
                 self.assertEqual(padding, len(trading_before))
-                zscore = handler["infer_processors"][1]["kwargs"]
+                (zscore,) = [processor["kwargs"] for processor in handler["infer_processors"]
+                             if "fit_start_time" in processor.get("kwargs", {})]
                 self.assertEqual(segments["train"], (zscore["fit_start_time"].date(), zscore["fit_end_time"].date()))
-                if name == "tra":
+                if name.startswith("tra"):
                     self.assertEqual(2, task["dataset"]["kwargs"]["horizon"])
 
     # Break caught: a Qlib PyTorch model failing inside RQuant's rolling training (dataset, concepts, d_feat,
@@ -137,21 +141,34 @@ class NeuralWorkflowTests(unittest.TestCase):
             "tra": {"n_epochs": 2, "model_config": {"input_size": 6, "hidden_size": 8, "num_layers": 1,
                                                      "rnn_arch": "LSTM", "use_attn": True, "dropout": 0.0}},
             "gru-ts": {"n_epochs": 2, "hidden_size": 8, "batch_size": 256, "n_jobs": 0},
+            "alstm-ts": {"n_epochs": 2, "hidden_size": 8, "batch_size": 256},
+            "tra-ts": {"n_epochs": 2},  # keeps the model_config whose input_size the runner filled in
+            # Qlib's Alpha158 benchmarks: FilterCol keeps 20 factors, so the model's input width must be 20.
+            "gru-alpha158": {"n_epochs": 2, "hidden_size": 8, "batch_size": 256, "n_jobs": 0},
+            "alstm-alpha158": {"n_epochs": 2, "hidden_size": 8, "batch_size": 256, "n_jobs": 0},
+            "tra-alpha158": {"n_epochs": 2, "model_config": {"input_size": 20, "hidden_size": 8, "num_layers": 1,
+                                                              "rnn_arch": "LSTM", "use_attn": True, "dropout": 0.0}},
         }
+        stores = {"gru-ts": self.root / "a101" / "factors", "alstm-ts": self.root / "a101" / "factors",
+                  "tra-ts": self.root / "a101" / "factors", "gru-alpha158": self.root / "a158" / "factors",
+                  "alstm-alpha158": self.root / "a158" / "factors", "tra-alpha158": self.root / "a158" / "factors"}
         for name, overrides in cases.items():
             with self.subTest(model=name):
                 run_directory = self.root / f"run-{name}"
                 run_directory.mkdir()
                 runner = RollingWorkflowRunner(
                     qlib_root=self.qlib_root,
-                    factor_root=self.root / "a101" / "factors" if name == "gru-ts" else self.factor_root,
+                    factor_root=stores.get(name, self.factor_root),
                     run_directory=run_directory, workflow=name, horizon="1d", seed=3, train_years=1,
                     validation_months=6, formal_start_year=2020, universe="all", canonical_root=self.canonical_root,
-                    factor_set="wq_alpha101" if name == "gru-ts" else None,
+                    factor_set="wq_alpha101" if name.endswith("-ts") else None,
                 )
                 # TRA picks its device itself; the others take GPU (-1 = CPU).
-                runner.template["model"]["kwargs"].update(**({} if name == "tra" else {"GPU": -1}), **overrides)
-                if name == "tra":
+                tra = name.startswith("tra")
+                runner.template["model"]["kwargs"].update(**({} if tra else {"GPU": -1}), **overrides)
+                if name == "tra-ts":
+                    runner.template["model"]["kwargs"]["model_config"].update(hidden_size=8, num_layers=1)
+                if tra:
                     runner.template["dataset"]["kwargs"]["batch_size"] = 128
                 with contextlib.ExitStack() as stack:
                     if name == "hist":
@@ -168,12 +185,27 @@ class NeuralWorkflowTests(unittest.TestCase):
                 # label) covers every test day here.
                 self.assertEqual(set(test_days), set(days))
                 self.assertEqual(1, len(manifest["windows"]))
-                if name == "gru-ts":
+                if name in ("gru-ts", "alstm-ts"):
                     self.assertEqual(101, manifest["model_config"]["kwargs"]["d_feat"])
+                if name == "tra-ts":
+                    self.assertEqual(101, manifest["model_config"]["kwargs"]["model_config"]["input_size"])
                 if name == "hist":
                     concepts = np.load(run_directory / "hist" / "stock2concept.npy")
                     self.assertEqual((24, 5), concepts.shape)
                     self.assertTrue((concepts.sum(axis=1) >= 1).all())
+
+    # Break caught: an Alpha158 benchmark workflow run on another factor set, whose FilterCol columns do not exist
+    # (Qlib would silently train on an empty or wrong feature block).
+    def test_alpha158_workflows_reject_other_factor_sets(self) -> None:
+        from rquant.errors import DataContractError
+        from rquant.workflow.runner import RollingWorkflowRunner
+
+        for name in ("gru-alpha158", "alstm-alpha158", "tra-alpha158"):
+            with self.subTest(model=name), self.assertRaisesRegex(DataContractError, "FilterCol"):
+                RollingWorkflowRunner(
+                    qlib_root=self.qlib_root, factor_root=self.factor_root, run_directory=self.root / "unused",
+                    workflow=name, factor_set="jq240", universe="all",
+                )
 
 
 if __name__ == "__main__":

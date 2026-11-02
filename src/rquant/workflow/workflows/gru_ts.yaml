@@ -122,7 +122,9 @@ task:
       batch_size: 800
       metric: loss
       loss: mse
-      n_jobs: 4
+      # Load batches in the training process: DataLoader workers each get a copy of the window's samples on
+      # Windows (spawn), several GB on sh_main.
+      n_jobs: 0
       GPU: 0
       seed: 42
   dataset:
