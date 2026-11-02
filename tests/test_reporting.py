@@ -82,6 +82,29 @@ class ReportingTests(unittest.TestCase):
         self.assertIn(label, markdown)
         self.assertNotIn("{universe}", markdown)
 
+    # Break caught: a headline that shows Qlib's additive annual return where the compounded one belongs.
+    def test_report_headline_puts_compounded_risk_analysis_first(self) -> None:
+        def risk(annualized: float, drawdown: float, ratio: float) -> dict[str, float]:
+            return {"annualized_return": annualized, "max_drawdown": drawdown, "information_ratio": ratio}
+
+        atomic_write_json(
+            self.run_directory / "backtest.json",
+            {
+                "status": "complete",
+                "metrics": {
+                    "net_return": risk(0.30, -0.40, 1.22),
+                    "net_return_compounded": risk(0.38, -0.45, 1.10),
+                    "benchmark_return": risk(0.05, -0.30, 0.3),
+                    "benchmark_return_compounded": risk(0.04, -0.35, 0.2),
+                    "excess_return_with_cost": risk(0.25, -0.20, 1.5),
+                },
+            },
+        )
+        build_report(self.run_directory)
+        markdown = (self.run_directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("| Net return (return - cost) | +38.00% | -45.00% | 1.220 | +30.00% | -40.00% |", markdown)
+        self.assertIn("| Excess return with cost | n/a | n/a | 1.500 | +25.00% | -20.00% |", markdown)
+
     def test_report_rejects_incomplete_portfolio_columns(self) -> None:
         pd = self.pd
         pd.DataFrame(

@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from rquant.config import ProjectPaths, load_config, resolve_paths
+from rquant.config import ProjectPaths, factor_root_for, load_config, resolve_paths
 from rquant.data.canonical import CanonicalBuilder
 from rquant.data.collector import TushareCollector
 from rquant.data.qlib_builder import QlibProviderBuilder
@@ -33,8 +33,15 @@ from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
 from rquant.runs import RunContext
 from rquant.universe import SUPPORTED_UNIVERSES
-from rquant.workflow.backtest import PortfolioBacktestRunner, PortfolioConfig
+from rquant.workflow.backtest import (
+    RISK_MODELS,
+    STRATEGIES,
+    PortfolioBacktestRunner,
+    PortfolioConfig,
+    SignalAnalysisRunner,
+)
 from rquant.workflow.runner import RollingWorkflowRunner
+from rquant.workflow.tasks import BUILT_IN_WORKFLOWS
 
 LOCKED_DEPENDENCIES = {"pyqlib": "0.9.7", "KunQuant": "0.1.11", "tushare": "1.4.29", "TA-Lib": "0.8.2"}
 
@@ -114,10 +121,19 @@ def build_parser() -> argparse.ArgumentParser:
     factor_evaluate.add_argument("--min-effective-days", type=int, default=20)
     factor_evaluate.set_defaults(handler=_factor_evaluate, run_category="factors-evaluate")
 
-    walk = commands.add_parser("walk-forward", help="Run yearly three-year rolling out-of-sample training")
-    walk.add_argument("--model", choices=("lgb", "double-ensemble"), required=True)
-    walk.add_argument("--horizon", choices=("1d", "5d"), required=True)
-    walk.add_argument("--factor-set", choices=_factor_sets(), required=True)
+    walk = commands.add_parser(
+        "walk-forward",
+        help="Roll a qrun workflow over calendar years with Qlib's RollingGen and TrainerR (out-of-sample)",
+    )
+    workflow = walk.add_mutually_exclusive_group(required=True)
+    workflow.add_argument(
+        "--model",
+        choices=tuple(BUILT_IN_WORKFLOWS),
+        help="A built-in workflow (src/rquant/workflow/workflows/<model>.yaml)",
+    )
+    workflow.add_argument("--workflow", help="A qrun workflow file whose task is rolled")
+    walk.add_argument("--horizon", choices=("1d", "5d"), help="Override the workflow's label horizon")
+    walk.add_argument("--factor-set", choices=_factor_sets(), help="Override the workflow's factor set")
     walk.add_argument("--first-year", type=int)
     walk.add_argument("--last-year", type=int)
     walk.add_argument("--through", type=_date, help="Inclusive date, YYYY-MM-DD (default: data.through)")
@@ -128,6 +144,23 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--topk", type=int, help="Override backtest.topk")
     report.add_argument("--n-drop", type=int, help="Override backtest.n_drop")
     report.add_argument("--rebalance-days", type=int, help="Override backtest.rebalance_days")
+    report.add_argument(
+        "--strategy",
+        choices=STRATEGIES,
+        help="Override backtest.strategy: equal-weight top-K, or Qlib enhanced indexing with a risk model",
+    )
+    report.add_argument(
+        "--risk-model",
+        choices=RISK_MODELS,
+        help="Override backtest.enhanced_indexing.risk_model: PCA factors of past returns, or Shenwan industries + "
+        "CNE6 styles from the barra_cne6 store (industry and size limits)",
+    )
+    report.add_argument(
+        "--signal-only",
+        action="store_true",
+        help="Score the predictions (Qlib SigAnaRecord IC / Rank IC) and summarise feature importance, without the "
+        "portfolio backtest",
+    )
     report.set_defaults(handler=_report, run_category="report")
 
     rdagent = commands.add_parser("rdagent", help="Exchange data with Microsoft RD-Agent factor mining")
@@ -575,14 +608,11 @@ def _walk_forward(args: argparse.Namespace) -> int:
         through = _through(args, config)
         first_year = args.first_year or int(workflow.get("first_prediction_year", 2013))
         last_year = args.last_year or through.year
-        run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
-        run.add_input("factor_manifest", _fingerprint(paths.factors / args.factor_set / "manifest.json"))
-        _require_factor_universe(paths.factors / args.factor_set / "manifest.json", _universe(config))
         runner = RollingWorkflowRunner(
             qlib_root=paths.qlib,
             factor_root=paths.factors,
             run_directory=run.directory,
-            model=args.model,
+            workflow=args.model or Path(args.workflow).expanduser(),
             horizon=args.horizon,
             factor_set=args.factor_set,
             seed=int(workflow.get("seed", config.get("project", {}).get("seed", 42))),
@@ -590,7 +620,13 @@ def _walk_forward(args: argparse.Namespace) -> int:
             validation_months=int(workflow.get("validation_months", 6)),
             formal_start_year=_date_value(config.get("data", {}).get("formal_start", "2010-01-01")).year,
             universe=_universe(config),
+            canonical_root=paths.canonical,
         )
+        run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
+        run.add_input("factor_manifest", _fingerprint(paths.factors / runner.factor_set / "manifest.json"))
+        _require_factor_universe(paths.factors / runner.factor_set / "manifest.json", _universe(config))
+        run.add_input("workflow", str(runner.workflow_path))
+        run.add_input("workflow_sha256", sha256_file(runner.workflow_path))
         run.add_input("through", through.isoformat())
         return runner.run(first_year=first_year, last_year=last_year, through=through)
 
@@ -629,6 +665,11 @@ def _report(args: argparse.Namespace) -> int:
         predictions_path = run_directory / "predictions.parquet"
         if not predictions_path.exists():
             raise DataContractError(f"Predictions do not exist: {predictions_path}")
+        if args.signal_only:
+            portfolio_options = (args.topk, args.n_drop, args.rebalance_days, args.strategy, args.risk_model)
+            if any(value is not None for value in portfolio_options):
+                raise DataContractError("--signal-only runs no backtest; drop the portfolio options")
+            return _signal_report(run, paths, args.run_id, run_directory, predictions_path)
         backtest = config.get("backtest", {})
         portfolio_config = PortfolioConfig(
             initial_capital=float(backtest.get("initial_capital", 1_000_000)),
@@ -643,6 +684,11 @@ def _report(args: argparse.Namespace) -> int:
             impact_cost=float(backtest.get("impact_cost", 0.0)),
             universe=_walk_forward_universe(run_directory, config),
             rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
+            strategy=args.strategy or str(backtest.get("strategy", "topk-dropout")),
+            **{
+                **_enhanced_indexing_options(backtest.get("enhanced_indexing") or {}),
+                **({"risk_model": args.risk_model} if args.risk_model else {}),
+            },
         )
         run.add_input("walk_forward_run_id", args.run_id)
         run.add_input("walk_forward_run_directory", str(run_directory))
@@ -653,7 +699,11 @@ def _report(args: argparse.Namespace) -> int:
             qlib_root=paths.qlib,
             run_directory=run_directory,
             config=portfolio_config,
+            reference_root=paths.canonical / "reference",
+            horizon=_walk_forward_manifest(run_directory).get("horizon"),
+            factor_root=factor_root_for(paths.data, portfolio_config.universe),
         ).run()
+        signal = portfolio.get("signal")
         report = build_report(run_directory)
         manifest_path = run_directory / "run.json"
         if manifest_path.exists():
@@ -666,9 +716,32 @@ def _report(args: argparse.Namespace) -> int:
             atomic_write_json(manifest_path, run_manifest)
             with (run_directory / "run.log").open("a", encoding="utf-8") as handle:
                 handle.write(f"{run_manifest['report_completed_at']} report completed run_id={run.run_id}\n")
-        return {"walk_forward_run_id": args.run_id, "backtest": portfolio, "report": report}
+        return {"walk_forward_run_id": args.run_id, "backtest": portfolio, "signal": signal, "report": report}
 
     return _run(args, action)
+
+
+def _signal_report(
+    run: RunContext, paths: ProjectPaths, run_id: str, run_directory: Path, predictions_path: Path
+) -> dict[str, Any]:
+    """``report --signal-only``: IC and feature importance of a walk-forward run, no backtest."""
+    horizon = _walk_forward_manifest(run_directory).get("horizon")
+    if not horizon:
+        raise DataContractError(f"{run_directory / 'walk_forward.json'} does not name the run's horizon")
+    run.add_input("walk_forward_run_id", run_id)
+    run.add_input("walk_forward_run_directory", str(run_directory))
+    run.add_input("predictions_sha256", sha256_file(predictions_path))
+    run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
+    signal = SignalAnalysisRunner(qlib_root=paths.qlib, run_directory=run_directory, horizon=str(horizon)).run()
+    report = build_report(run_directory)
+    manifest_path = run_directory / "run.json"
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            run_manifest = json.load(handle)
+        run_manifest.setdefault("outputs", {})["signal"] = signal
+        run_manifest["outputs"]["report"] = report
+        atomic_write_json(manifest_path, run_manifest)
+    return {"walk_forward_run_id": run_id, "signal": signal, "report": report}
 
 
 def _dependency_versions() -> dict[str, str | None]:
@@ -712,15 +785,42 @@ def _require_factor_universe(manifest_path: Path, universe: str) -> None:
         )
 
 
+ENHANCED_INDEXING_OPTIONS = {
+    "risk_model": str,
+    "risk_lookback_days": int,
+    "risk_factors": int,
+    "risk_half_life": float,
+    "industry_deviation": float,
+    "size_deviation": float,
+    "style_deviation": float,
+    "risk_aversion": float,
+    "turnover_limit": float,
+    "benchmark_deviation": float,
+    "risk_degree": float,
+}
+
+
+def _enhanced_indexing_options(section: dict[str, Any]) -> dict[str, Any]:
+    """PortfolioConfig fields from the ``backtest.enhanced_indexing`` config section; a null benchmark_deviation
+    removes the per-stock limit."""
+    unknown = sorted(set(section).difference(ENHANCED_INDEXING_OPTIONS))
+    if unknown:
+        raise DataContractError(f"Unknown backtest.enhanced_indexing keys: {unknown}")
+    return {key: None if value is None else ENHANCED_INDEXING_OPTIONS[key](value) for key, value in section.items()}
+
+
+def _walk_forward_manifest(run_directory: Path) -> dict[str, Any]:
+    manifest_path = run_directory / "walk_forward.json"
+    if not manifest_path.exists():
+        return {}
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        return dict(json.load(handle))
+
+
 def _walk_forward_universe(run_directory: Path, config: dict[str, Any]) -> str:
     """The universe a walk-forward run trained on, so its report backtests the same universe."""
-    manifest_path = run_directory / "walk_forward.json"
-    if manifest_path.exists():
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            universe = json.load(handle).get("universe")
-        if universe:
-            return str(universe)
-    return _universe(config)
+    universe = _walk_forward_manifest(run_directory).get("universe")
+    return str(universe) if universe else _universe(config)
 
 
 def _universe(config: dict[str, Any]) -> str:

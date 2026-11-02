@@ -1,0 +1,154 @@
+# RQuant GRU workflow in Qlib's qrun format (PyTorch: pip install -e ".[nn]"; a CUDA GPU is used when found).
+#
+# Qlib's GRU (qlib.contrib.model.pytorch_gru) with its Alpha360 benchmark parameters.
+#
+# Rolling (what RQuant runs):
+#   rquant walk-forward --model gru
+#   rquant walk-forward --workflow path/to/copy-of-this.yaml
+# The model reads qlib_alpha360 as 60 days x 6 fields (d_feat 6), as Qlib's Alpha360 benchmark does; other factor
+# sets need a model that takes one row of factors per day (gru-ts).
+# walk-forward rolls `task` over calendar years with Qlib's RollingGen and trains each year with TrainerR through
+# Qlib's own dataset (no lean path): the handler holds the window's panel two to three times, so prefer csi300 or a
+# narrow factor set on a 16 GB machine. Validation is held out of training (rolling.holdout_valid).
+#
+# Single window with Qlib itself, from the project root (one 2013 test year on csi300):
+#   qrun src/rquant/workflow/workflows/gru.yaml
+
+qlib_init:
+  provider_uri: data/qlib
+  region: cn
+  # MLflow 3 refuses its file store; SQLite keeps the runs in mlflow.db and the artifacts under ./mlruns.
+  exp_manager:
+    class: MLflowExpManager
+    module_path: qlib.workflow.expm
+    kwargs:
+      uri: sqlite:///mlflow.db
+      default_exp_name: rquant-qrun
+
+market: &market csi300
+benchmark: &benchmark SH000300
+
+# Train ends two trading days before the test so no 1d label (Ref($open, -2) / Ref($open, -1) - 1) reads into it.
+data_handler_config: &data_handler_config
+  instruments: *market
+  start_time: "2010-01-01"
+  end_time: "2013-12-31"
+  data_loader:
+    class: KunQuantDataLoader
+    module_path: rquant.qlib_ext.loader
+    kwargs:
+      factor_root: data/factors
+      factor_set: qlib_alpha360
+      horizon: 1d
+  infer_processors:
+    - class: ProcessInf
+      module_path: rquant.qlib_ext.processors
+    - class: ZScoreNorm
+      module_path: rquant.qlib_ext.processors
+      kwargs:
+        fit_start_time: "2010-01-01"
+        fit_end_time: "2012-06-28"
+    - class: Fillna
+      module_path: rquant.qlib_ext.processors
+  learn_processors:
+    - class: DropnaLabel
+      module_path: rquant.qlib_ext.processors
+    - class: CSZScoreNorm
+      module_path: qlib.data.dataset.processor
+      kwargs:
+        fields_group: label
+  process_type: append
+  # SignalRecord saves the raw label for SigAnaRecord only when the raw panel is kept.
+  drop_raw: false
+
+port_analysis_config: &port_analysis_config
+  strategy:
+    class: LiquidatingTopkDropoutStrategy
+    module_path: rquant.qlib_ext.strategy
+    kwargs:
+      signal: <PRED>
+      topk: 50
+      n_drop: 5
+      rebalance_days: 1
+      risk_degree: 1.0
+      hold_thresh: 1
+      only_tradable: true
+      forbid_all_trade_at_limit: false
+  executor:
+    class: ZeroOrderSafeSimulatorExecutor
+    module_path: rquant.qlib_ext.executor
+    kwargs:
+      time_per_step: day
+      generate_portfolio_metrics: true
+      verbose: false
+  backtest:
+    start_time: null
+    end_time: null
+    account: 1000000
+    benchmark: *benchmark
+    exchange_kwargs:
+      exchange:
+        class: AshareExchange
+        module_path: rquant.qlib_ext.exchange
+        kwargs:
+          freq: day
+          start_time: "2013-01-01"
+          end_time: "2014-01-02"
+          # Every instrument, so holdings that leave the index can still be sold.
+          codes: all
+          trade_unit: 100
+          cost_model:
+            commission_rate: 0.0003
+            minimum_commission: 5.0
+            stamp_tax_before: 0.001
+            stamp_tax_after: 0.0005
+
+rolling:
+  # Train stops two trading days before the six validation months, which the network early-stops on.
+  holdout_valid: true
+
+task:
+  model:
+    class: GRU
+    module_path: qlib.contrib.model.pytorch_gru
+    kwargs:
+      d_feat: 6
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.0
+      n_epochs: 200
+      lr: 0.001
+      early_stop: 20
+      batch_size: 800
+      metric: loss
+      loss: mse
+      GPU: 0
+      seed: 42
+  dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: DataHandlerLP
+        module_path: qlib.data.dataset.handler
+        kwargs: *data_handler_config
+      segments:
+        train: ["2010-01-01", "2012-06-28"]
+        valid: ["2012-07-02", "2012-12-27"]
+        test: ["2013-01-01", "2013-12-31"]
+  record:
+    - class: SignalRecord
+      module_path: qlib.workflow.record_temp
+      kwargs:
+        model: <MODEL>
+        dataset: <DATASET>
+    - class: SigAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs:
+        ana_long_short: false
+    - class: PortAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs:
+        config: *port_analysis_config
+        risk_analysis_freq: day
+        indicator_analysis_freq: day

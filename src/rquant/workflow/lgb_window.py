@@ -1,4 +1,4 @@
-"""Train and predict one LightGBM walk-forward window without DataHandlerLP, DatasetH or LGBModel copies.
+"""Train and predict one walk-forward window without DataHandlerLP, DatasetH or LGBModel copies.
 
 The steps and their results are those of RollingWorkflowRunner's Qlib path for ``lgb``: the infer processors run on
 the loaded panel with fitting (ProcessInf, ZScoreNorm over the fit period, Fillna), the learn processors (DropnaLabel,
@@ -204,3 +204,131 @@ def _learn_rows(block: Any, rows: slice, width: int, label: Any, keep: Any) -> t
         return take_features(block, rows, width), label[rows]
     positions = np.arange(rows.start, rows.stop)[keep[rows]]
     return np.array(block[positions, :width], dtype=np.float32, order="F"), label[positions]
+
+
+class _SegmentFrame:
+    """The parts of a ``DatasetH.prepare(..., col_set=["feature", "label"])`` frame that ``DEnsembleModel`` reads.
+
+    ``frame["feature"]`` and ``frame["label"]`` return the two frames as they are, so the features stay the single
+    float32 block they were built as instead of being concatenated with the label into a new MultiIndex frame.
+    """
+
+    def __init__(self, features: Any, label: Any) -> None:
+        self._parts = {"feature": features, "label": label}
+
+    @property
+    def empty(self) -> bool:
+        return bool(self._parts["feature"].empty)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._parts[key]
+
+
+class _PreparedSegments:
+    """A stand-in for ``DatasetH`` that hands ``DEnsembleModel.fit`` and ``predict`` already prepared segments."""
+
+    def __init__(self, learn: dict[str, _SegmentFrame], infer: dict[str, Any]) -> None:
+        self.learn = learn
+        self.infer = infer
+
+    def prepare(self, segments: Any, col_set: Any = None, data_key: Any = None) -> Any:
+        from qlib.data.dataset.handler import DataHandlerLP
+
+        if data_key == DataHandlerLP.DK_L:
+            if col_set != ["feature", "label"]:
+                raise DataContractError(f"Unsupported learn columns: {col_set}")
+            return [self.learn[name] for name in segments] if isinstance(segments, list) else self.learn[segments]
+        if col_set != "feature" or isinstance(segments, list):
+            raise DataContractError(f"Unsupported infer request: {segments}, {col_set}")
+        return self.infer[segments]
+
+
+def fit_double_ensemble_window(
+    model: Any,
+    load_panel: Callable[[], Any],
+    *,
+    fit_start: str,
+    fit_end: str,
+    train: Segment,
+    valid: Segment,
+    test: Segment | None,
+) -> Any:
+    """Fit ``model`` (a Qlib ``DEnsembleModel``) on the panel ``load_panel`` returns and return the test predictions
+    (None without a test segment).
+
+    The panel goes through the same processors as ``fit_lgb_window``; ``DEnsembleModel`` then receives the learn rows
+    of the train and valid segments, and predicts the test rows, exactly as ``DatasetH`` would hand them over. Only
+    the panel buffer and one copy of each segment exist before the model starts its own copies.
+    """
+    import numpy as np
+    import pandas as pd
+
+    panel = load_panel()
+    _log_memory("loaded")
+    label, keep = process_panel(panel, fit_start=fit_start, fit_end=fit_end)
+    index = panel.index
+    dates = index.get_level_values("datetime").to_numpy()
+    width = panel.shape[1] - 1
+    names = pd.Index(panel.columns.get_level_values(-1)[:width])
+    if len(panel._mgr.blocks) != 1 or panel._mgr.blocks[0].dtype != np.float32:
+        raise DataContractError("Walk-forward panel must be a single float32 block")
+    block = panel.to_numpy()
+    del panel
+    _log_memory("processed")
+
+    y = label.to_numpy()
+    infer: dict[str, Any] = {}
+    if test is not None:
+        rows = segment_rows(dates, test)
+        infer["test"] = pd.DataFrame(take_features(block, rows, width), index=index[rows], columns=names, copy=False)
+    learn: dict[str, _SegmentFrame] = {}
+    for name, segment in (("valid", valid), ("train", train)):
+        rows = segment_rows(dates, segment)
+        if keep is None or keep[rows].all():
+            positions: Any = rows
+            x = take_features(block, rows, width) if name == "valid" else move_rows_to_front(block, rows, width)
+        else:
+            positions = np.arange(rows.start, rows.stop)[keep[rows]]
+            x = np.array(block[positions, :width], dtype=np.float32, order="F")
+        if len(x) == 0:
+            raise ValueError(f"Empty {name} segment, please check the walk-forward windows.")
+        frame_index = index[positions]
+        learn[name] = _SegmentFrame(
+            pd.DataFrame(x, index=frame_index, columns=names, copy=False),
+            pd.DataFrame({"LABEL0": y[positions]}, index=frame_index),
+        )
+    del block
+    gc.collect()
+    _log_memory("segments copied")
+
+    segments = _PreparedSegments(learn, infer)
+    model.fit(segments)
+    _log_memory("trained")
+    del learn, segments.learn
+    gc.collect()
+    if test is None:
+        return None
+    return model.predict(segments, segment="test")
+
+
+def feature_importance(model: Any, names: Any) -> Any:
+    """Gain and split importance of a fitted ``LGBModel`` or ``DEnsembleModel``, one row per factor in ``names``.
+
+    DoubleEnsemble sums its sub-models weighted by ``sub_weights`` (Qlib's ``get_feature_importance``); a factor no
+    sub-model used scores zero. ``gain_share`` is the factor's share of the total gain.
+    """
+    import pandas as pd
+
+    names = pd.Index(list(names))
+    columns = {}
+    for kind in ("gain", "split"):
+        booster = getattr(model, "model", None)
+        if booster is not None:
+            values = pd.Series(booster.feature_importance(importance_type=kind), index=names, dtype=float)
+        else:
+            values = model.get_feature_importance(importance_type=kind).astype(float)
+        columns[kind] = values.reindex(names).fillna(0.0)
+    frame = pd.DataFrame(columns)
+    total = float(frame["gain"].sum())
+    frame["gain_share"] = frame["gain"] / total if total > 0 else 0.0
+    return frame.rename_axis("factor").reset_index()
