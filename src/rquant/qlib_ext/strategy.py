@@ -156,11 +156,26 @@ class EnhancedIndexingStrategy(_WeightStrategyBase):  # type: ignore[misc,valid-
             mfh=force_hold,
             mfs=np.zeros(len(universe), dtype=bool),
         )
+        failed = not np.isfinite(weight).all() or weight.sum() <= 0
+        if failed:
+            # Qlib's optimiser returns the current weights when ECOS fails twice; on an empty book that is nothing to
+            # hold, so the benchmark weights (feasible under every limit) stand in.
+            weight = benchmark.copy()
         active = weight - benchmark
+        exposure = active @ exposures
+        names = getattr(self.risk_data, "factor_names", None)
+        named = {}
+        if names is not None:
+            industries = [position for position, name in enumerate(names) if name.startswith("industry_")]
+            named = {
+                "max_industry_active": float(np.abs(exposure[industries]).max()),
+                "size_active": float(exposure[names.index("size")]),
+            }
         self.optimizations.append(
             {
                 "datetime": trade_start_time,
                 "universe": len(universe),
+                "solved": not failed,
                 "holdings": int((weight > 0).sum()),
                 "turnover": float(np.abs(weight - current_weight).sum()),
                 "active_share": float(np.abs(active).sum() / 2.0),
@@ -168,13 +183,14 @@ class EnhancedIndexingStrategy(_WeightStrategyBase):  # type: ignore[misc,valid-
                     np.sqrt(
                         max(
                             0.0,
-                            (active @ exposures) @ factor_cov @ (active @ exposures)
+                            exposure @ factor_cov @ exposure
                             + (specific_risk**2) @ (active**2),
                         )
                     )
                     / 100.0
                     * np.sqrt(252.0)
                 ),
+                **named,
             }
         )
         return {stock: float(value) for stock, value in zip(universe, weight, strict=True) if value > 0}

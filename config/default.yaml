@@ -49,8 +49,19 @@ backtest:
   # universe against its own float-cap index with a 10-factor PCA risk model (`rquant report --strategy` overrides).
   strategy: topk-dropout
   enhanced_indexing:
+    # structured: Shenwan L1 industries + CNE6 styles built from the barra_cne6 factor store of the run's universe
+    # (build it first); statistical: Qlib's StructuredCovEstimator PCA factors of past returns.
+    risk_model: structured
     risk_lookback_days: 240
+    # PCA factors of the statistical model.
     risk_factors: 10
+    # Half-life in days of the structured model's factor covariance and specific risk weights.
+    risk_half_life: 90
+    # Structured model limits on the portfolio's active exposure: weight per Shenwan L1 industry, size in standard
+    # deviations, every other CNE6 style in standard deviations; null removes a limit.
+    industry_deviation: 0.03
+    size_deviation: 0.2
+    style_deviation: null
     # lamb: larger values trade expected return for a lower tracking error.
     risk_aversion: 1.0
     # Sum of |weight changes| allowed per rebalance (0.2 = 10% of the book bought and 10% sold); 2.0 removes it.

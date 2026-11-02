@@ -991,9 +991,23 @@ rquant report RUN_ID --n-drop 5 --rebalance-days 1
 rquant report RUN_ID --strategy enhanced-indexing
 ```
 
-- 风险模型：每个信号日用 Qlib `StructuredCovEstimator`（10 个 PCA 统计因子）拟合当日股票池过去 240 个交易日的
-  日收益，收益按股票截在 2.5%/97.5% 分位，与 Qlib `examples/portfolio/prepare_riskdata.py` 一致；停牌日价格沿用，
-  复牌日计入跨停牌的涨跌。
+- 风险模型（`risk_model`，命令行 `--risk-model`）：
+  - `structured`（默认）：结构化风险模型（`rquant.qlib_ext.riskmodel`）。因子是申万一级行业哑变量（按时点归属，
+    当日没有申万归属的股票归入 `industry_unknown`），加上用 `barra_cne6` 描述符合成的 19 个 CNE6 风格因子
+    （size、beta、动量、残差波动、流动性、价值、盈利、杠杆、成长、股息等，组成见 `CNE6_STYLES`）。
+    - 标准化：每个描述符按日截在 1%/99% 分位，按流通市值加权均值为 0、等权标准差为 1；风格取其描述符均值后
+      再标准化，缺失记为 0。
+    - 因子收益：每天把股票收益对前一日暴露做横截面回归，权重为流通市值的平方根。
+    - 协方差和特质风险：因子协方差是过去 `risk_lookback_days` 天因子收益的指数加权协方差，半衰期
+      `risk_half_life`（默认 90 天）；特质风险是回归残差的同口径加权均方。
+    - 用法：先为回测的股票池建好 `barra_cne6` 因子库（例如 `rquant --universe sh_main factors build
+      --factor-set barra_cne6`）。
+    - 偏离上限：通过 Qlib 优化器的 `f_dev` 限制组合相对基准的主动暴露。每个行业的主动权重不超过
+      `industry_deviation`（默认 3%），size 主动暴露不超过 `size_deviation`（默认 0.2 个标准差），
+      其他风格不超过 `style_deviation`（默认不限）。
+  - `statistical`：Qlib `StructuredCovEstimator`（`risk_factors` 个 PCA 统计因子）拟合当日股票池过去 240 个交易日的
+    日收益，收益按股票截在 2.5%/97.5% 分位，与 Qlib `examples/portfolio/prepare_riskdata.py` 一致；停牌日价格沿用，
+    复牌日计入跨停牌的涨跌。PCA 因子没有行业、市值含义，不能限制行业和市值暴露。
 - 基准：当日股票池按流通市值（参考数据 `daily_basic` 的 `circ_mv`）加权，csi300、main、sh_main 都适用；
   报告里对比的基准收益仍是 `data.benchmark`。
 - 优化：Qlib `EnhancedIndexingOptimizer`，最大化相对基准的预期收益减去 `risk_aversion` 倍跟踪方差；只做多、满仓，
@@ -1003,6 +1017,7 @@ rquant report RUN_ID --strategy enhanced-indexing
 - 需要参考数据（`rquant data build-reference`），以及 `ecos` 和 `scikit-learn`（已写入依赖，旧环境需重新
   `pip install -e ".[dev]"`）。
 - 每次调仓的股票池大小、持股数、换手、主动份额和事前年化跟踪误差写在 `optimizations.parquet`，报告里有平均值。
+  结构化模型还记录最大的行业主动权重和 size 主动暴露；求解失败的调仓保持原持仓（空仓时改持基准权重），次数也在报告里。
 
 小账户注意：增强指数通常持有上百只、单只权重很低，100 万初始资金下整手取整会让实际持仓偏离优化结果，
 可以把 `backtest.initial_capital` 调大再比较。

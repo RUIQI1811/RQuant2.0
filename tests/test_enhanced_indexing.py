@@ -10,15 +10,15 @@ HAS_STACK = all(importlib.util.find_spec(name) is not None for name in ("qlib", 
 FIELDS = ("open", "high", "low", "close", "volume", "amount", "vwap", "factor", "change", "limit_buy", "limit_sell")
 
 
-def write_provider(root: Path, rng):  # type: ignore[no-untyped-def]
-    """A Qlib day provider of 12 stocks and the benchmark over 70 trading days, plus reference float caps."""
+def write_provider(root: Path, rng, stocks: int = 12):  # type: ignore[no-untyped-def]
+    """A Qlib day provider of ``stocks`` stocks and the benchmark over 70 trading days, plus reference float caps."""
     import numpy as np
     import pandas as pd
 
     dates = pd.bdate_range("2021-01-04", periods=70)
     (root / "calendars").mkdir(parents=True)
     (root / "calendars" / "day.txt").write_text("".join(f"{day:%Y-%m-%d}\n" for day in dates), encoding="utf-8")
-    instruments = [f"SH6000{value:02d}" for value in range(12)]
+    instruments = [f"SH6000{value:02d}" for value in range(stocks)]
     (root / "instruments").mkdir()
     (root / "instruments" / "all.txt").write_text(
         "".join(f"{code}\t{dates[0]:%Y-%m-%d}\t{dates[-1]:%Y-%m-%d}\n" for code in [*instruments, "SH000300"]),

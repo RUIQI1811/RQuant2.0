@@ -12,6 +12,7 @@ from rquant.qlib_ext.exchange import AshareCostModel, AshareExchange
 from rquant.qlib_ext.loader import LABEL_EXPRESSIONS
 
 STRATEGIES = ("topk-dropout", "enhanced-indexing")
+RISK_MODELS = ("statistical", "structured")
 
 
 @dataclass(frozen=True)
@@ -34,8 +35,18 @@ class PortfolioConfig:
     # EnhancedIndexingOptimizer against the universe's float-cap index (rquant.qlib_ext.strategy); topk and n_drop are
     # then unused.
     strategy: str = "topk-dropout"
+    # "statistical": Qlib's StructuredCovEstimator (risk_factors PCA factors of past returns). "structured": Shenwan
+    # industries + CNE6 styles from the barra_cne6 factor store (rquant.qlib_ext.riskmodel), which the industry,
+    # size and style deviation limits apply to.
+    risk_model: str = "statistical"
     risk_lookback_days: int = 240
     risk_factors: int = 10
+    risk_half_life: float = 90.0
+    # Largest active weight per Shenwan level-1 industry, active size exposure (standard deviations) and active
+    # exposure to every other style; null removes a limit. Used by the structured risk model only.
+    industry_deviation: float | None = 0.03
+    size_deviation: float | None = 0.2
+    style_deviation: float | None = None
     risk_aversion: float = 1.0
     # Qlib's optimiser needs a number here; 2.0 (sell the whole book and buy a new one) leaves turnover unlimited.
     turnover_limit: float = 0.2
@@ -53,6 +64,14 @@ class PortfolioConfig:
             raise ValueError(f"strategy must be one of {STRATEGIES}, got {self.strategy}")
         if self.risk_lookback_days < 2 or self.risk_factors < 1:
             raise ValueError("risk_lookback_days must be at least 2 and risk_factors at least 1")
+        if self.risk_model not in RISK_MODELS:
+            raise ValueError(f"risk_model must be one of {RISK_MODELS}, got {self.risk_model}")
+        if self.risk_half_life <= 0:
+            raise ValueError(f"risk_half_life must be positive, got {self.risk_half_life}")
+        for name in ("industry_deviation", "size_deviation", "style_deviation"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must not be negative, got {value}")
         if self.risk_aversion < 0:
             raise ValueError(f"risk_aversion must not be negative, got {self.risk_aversion}")
         if self.turnover_limit < 0:
@@ -79,15 +98,22 @@ class PortfolioBacktestRunner:
         config: PortfolioConfig | None = None,
         reference_root: str | Path | None = None,
         horizon: str | None = None,
+        factor_root: str | Path | None = None,
     ) -> None:
-        """``horizon`` names the label the predictions were trained on; without it the signal is not scored."""
+        """``horizon`` names the label the predictions were trained on; without it the signal is not scored.
+        ``reference_root`` is ``<canonical>/reference``; the structured risk model also reads the canonical bars next
+        to it and the barra_cne6 store under ``factor_root`` (the run universe's factor root)."""
         self.qlib_root = Path(qlib_root)
         self.run_directory = Path(run_directory)
         self.config = config or PortfolioConfig()
         self.reference_root = Path(reference_root) if reference_root is not None else None
+        self.factor_root = Path(factor_root) if factor_root is not None else None
         self.horizon = horizon
         if self.config.strategy == "enhanced-indexing" and self.reference_root is None:
             raise DataContractError("enhanced-indexing needs the reference data root for float market caps")
+        if self.config.strategy == "enhanced-indexing" and self.config.risk_model == "structured":
+            if self.factor_root is None:
+                raise DataContractError("The structured risk model needs the factor root holding barra_cne6")
         if horizon is not None and horizon not in LABEL_EXPRESSIONS:
             raise DataContractError(f"Unsupported horizon: {horizon}")
 
@@ -142,13 +168,20 @@ class PortfolioBacktestRunner:
         optimization_log = OptimizationLog()
         if self.config.strategy == "enhanced-indexing":
             strategy_class = "LiquidatingEnhancedIndexingStrategy"
+            rebalance_dates = keep_rebalance_dates(signal, self.config.rebalance_days).index.get_level_values(
+                "datetime"
+            )
+            risk_data = self._risk_data(D, pd, predictions, start_time, end_time, rebalance_dates.unique())
+            optimizer_kwargs: dict[str, Any] = {
+                "lamb": self.config.risk_aversion,
+                "delta": self.config.turnover_limit,
+                "b_dev": self.config.benchmark_deviation,
+            }
+            if self.config.risk_model == "structured":
+                optimizer_kwargs["f_dev"] = risk_data.factor_deviation()
             strategy_kwargs: dict[str, Any] = {
-                "risk_data": self._risk_data(D, pd, predictions, start_time, end_time),
-                "optimizer_kwargs": {
-                    "lamb": self.config.risk_aversion,
-                    "delta": self.config.turnover_limit,
-                    "b_dev": self.config.benchmark_deviation,
-                },
+                "risk_data": risk_data,
+                "optimizer_kwargs": optimizer_kwargs,
                 "optimization_log": optimization_log,
                 "risk_degree": self.config.risk_degree,
             }
@@ -227,10 +260,10 @@ class PortfolioBacktestRunner:
         optimizations_path = None
         if self.config.strategy == "enhanced-indexing":
             optimizations_path = self.run_directory / "optimizations.parquet"
-            pd.DataFrame(
-                optimization_log.rows,
-                columns=["datetime", "universe", "holdings", "turnover", "active_share", "tracking_error"],
-            ).to_parquet(optimizations_path, index=False)
+            columns = ["datetime", "universe", "solved", "holdings", "turnover", "active_share", "tracking_error"]
+            if self.config.risk_model == "structured":
+                columns += ["max_industry_active", "size_active"]
+            pd.DataFrame(optimization_log.rows, columns=columns).to_parquet(optimizations_path, index=False)
 
         manifest = {
             "status": "complete",
@@ -285,24 +318,43 @@ class PortfolioBacktestRunner:
         atomic_write_json(self.run_directory / "backtest.json", manifest)
         return manifest
 
-    def _risk_data(self, D: Any, pd: Any, predictions: Any, start_time: Any, end_time: Any) -> Any:
-        """Prices, volumes and float caps of every predicted instrument, from ``risk_lookback_days`` rows before the
-        first signal through the last trading day."""
+    def _risk_data(
+        self, D: Any, pd: Any, predictions: Any, start_time: Any, end_time: Any, signal_dates: Any
+    ) -> Any:
+        """The risk model over every predicted instrument, from ``risk_lookback_days`` rows before the first signal
+        through the last trading day."""
         from rquant.qlib_ext.strategy import RiskModelData, load_float_cap
 
         assert self.reference_root is not None
+        # The structured model needs `lookback` daily factor returns, so one more day of prices and exposures.
+        rows = self.config.risk_lookback_days + (1 if self.config.risk_model == "structured" else 0)
         calendar = D.calendar(end_time=start_time, freq="day")
-        if len(calendar) < self.config.risk_lookback_days:
-            raise DataContractError(
-                f"The provider calendar holds fewer than {self.config.risk_lookback_days} days before {start_time}"
-            )
-        history_start = calendar[-self.config.risk_lookback_days]
+        if len(calendar) < rows:
+            raise DataContractError(f"The provider calendar holds fewer than {rows} days before {start_time}")
+        history_start = calendar[-rows]
         instruments = sorted(predictions["instrument"].unique())
         quotes = D.features(instruments, ["$close", "$volume"], start_time=history_start, end_time=end_time, freq="day")
         quotes.columns = ["close", "volume"]
         close = quotes["close"].unstack(level="instrument").sort_index()
         volume = quotes["volume"].unstack(level="instrument").sort_index()
         float_cap = load_float_cap(self.reference_root, history_start, end_time, instruments)
+        if self.config.risk_model == "structured":
+            from rquant.qlib_ext.riskmodel import StructuredRiskModelData, load_barra_descriptors, load_sector
+
+            assert self.factor_root is not None
+            return StructuredRiskModelData(
+                close=close,
+                volume=volume,
+                float_cap=float_cap,
+                sector=load_sector(self.reference_root.parent / "bars", history_start, end_time, instruments),
+                descriptors=load_barra_descriptors(self.factor_root, history_start, end_time),
+                signal_dates=signal_dates,
+                lookback=self.config.risk_lookback_days,
+                half_life=self.config.risk_half_life,
+                industry_deviation=self.config.industry_deviation,
+                size_deviation=self.config.size_deviation,
+                style_deviation=self.config.style_deviation,
+            )
         return RiskModelData(
             close=close,
             volume=volume,
@@ -460,11 +512,18 @@ def _labels(D: Any, pd: Any, signal: Any, horizon: str) -> Any:
 def _weighting_description(config: PortfolioConfig) -> str:
     if config.strategy == "topk-dropout":
         return f"equal weight across the top {config.topk}"
+    if config.risk_model == "structured":
+        risk = (
+            f"Shenwan L1 industry + CNE6 style risk model over {config.risk_lookback_days} days (half-life "
+            f"{config.risk_half_life}), active industry weight within {config.industry_deviation}, active size "
+            f"within {config.size_deviation} std, other styles within {config.style_deviation}"
+        )
+    else:
+        risk = f"{config.risk_factors} PCA risk factors over {config.risk_lookback_days} days"
     return (
         "Qlib EnhancedIndexingOptimizer against the universe float-cap index: "
         f"risk aversion {config.risk_aversion}, turnover limit {config.turnover_limit}, "
-        f"per-stock deviation {config.benchmark_deviation}, {config.risk_factors} PCA risk factors over "
-        f"{config.risk_lookback_days} days, risk degree {config.risk_degree}"
+        f"per-stock deviation {config.benchmark_deviation}, {risk}, risk degree {config.risk_degree}"
     )
 
 

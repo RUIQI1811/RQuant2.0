@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from rquant.config import ProjectPaths, load_config, resolve_paths
+from rquant.config import ProjectPaths, factor_root_for, load_config, resolve_paths
 from rquant.data.canonical import CanonicalBuilder
 from rquant.data.collector import TushareCollector
 from rquant.data.qlib_builder import QlibProviderBuilder
@@ -33,7 +33,13 @@ from rquant.io import atomic_write_json, sha256_file, stable_hash
 from rquant.reporting import build_report
 from rquant.runs import RunContext
 from rquant.universe import SUPPORTED_UNIVERSES
-from rquant.workflow.backtest import STRATEGIES, PortfolioBacktestRunner, PortfolioConfig, SignalAnalysisRunner
+from rquant.workflow.backtest import (
+    RISK_MODELS,
+    STRATEGIES,
+    PortfolioBacktestRunner,
+    PortfolioConfig,
+    SignalAnalysisRunner,
+)
 from rquant.workflow.runner import RollingWorkflowRunner
 from rquant.workflow.tasks import BUILT_IN_WORKFLOWS
 
@@ -142,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--strategy",
         choices=STRATEGIES,
         help="Override backtest.strategy: equal-weight top-K, or Qlib enhanced indexing with a risk model",
+    )
+    report.add_argument(
+        "--risk-model",
+        choices=RISK_MODELS,
+        help="Override backtest.enhanced_indexing.risk_model: PCA factors of past returns, or Shenwan industries + "
+        "CNE6 styles from the barra_cne6 store (industry and size limits)",
     )
     report.add_argument(
         "--signal-only",
@@ -653,7 +665,8 @@ def _report(args: argparse.Namespace) -> int:
         if not predictions_path.exists():
             raise DataContractError(f"Predictions do not exist: {predictions_path}")
         if args.signal_only:
-            if any(value is not None for value in (args.topk, args.n_drop, args.rebalance_days, args.strategy)):
+            portfolio_options = (args.topk, args.n_drop, args.rebalance_days, args.strategy, args.risk_model)
+            if any(value is not None for value in portfolio_options):
                 raise DataContractError("--signal-only runs no backtest; drop the portfolio options")
             return _signal_report(run, paths, args.run_id, run_directory, predictions_path)
         backtest = config.get("backtest", {})
@@ -671,7 +684,10 @@ def _report(args: argparse.Namespace) -> int:
             universe=_walk_forward_universe(run_directory, config),
             rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
             strategy=args.strategy or str(backtest.get("strategy", "topk-dropout")),
-            **_enhanced_indexing_options(backtest.get("enhanced_indexing") or {}),
+            **{
+                **_enhanced_indexing_options(backtest.get("enhanced_indexing") or {}),
+                **({"risk_model": args.risk_model} if args.risk_model else {}),
+            },
         )
         run.add_input("walk_forward_run_id", args.run_id)
         run.add_input("walk_forward_run_directory", str(run_directory))
@@ -684,6 +700,7 @@ def _report(args: argparse.Namespace) -> int:
             config=portfolio_config,
             reference_root=paths.canonical / "reference",
             horizon=_walk_forward_manifest(run_directory).get("horizon"),
+            factor_root=factor_root_for(paths.data, portfolio_config.universe),
         ).run()
         signal = portfolio.get("signal")
         report = build_report(run_directory)
@@ -768,8 +785,13 @@ def _require_factor_universe(manifest_path: Path, universe: str) -> None:
 
 
 ENHANCED_INDEXING_OPTIONS = {
+    "risk_model": str,
     "risk_lookback_days": int,
     "risk_factors": int,
+    "risk_half_life": float,
+    "industry_deviation": float,
+    "size_deviation": float,
+    "style_deviation": float,
     "risk_aversion": float,
     "turnover_limit": float,
     "benchmark_deviation": float,

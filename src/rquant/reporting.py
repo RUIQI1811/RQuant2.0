@@ -89,6 +89,11 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
                 column: float(optimizations[column].mean())
                 for column in ("universe", "holdings", "turnover", "active_share", "tracking_error")
             } | {"rebalances": len(optimizations)}
+            if "solved" in optimizations:
+                summary["optimizations"]["unsolved"] = int((~optimizations["solved"].astype(bool)).sum())
+            if "max_industry_active" in optimizations:
+                summary["optimizations"]["max_industry_active"] = float(optimizations["max_industry_active"].max())
+                summary["optimizations"]["max_abs_size_active"] = float(optimizations["size_active"].abs().max())
     atomic_write_json(run_dir / "report.json", summary)
     markdown = [
         "# RQuant Research Report",
@@ -112,9 +117,19 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
                 f"- Average one-way turnover per rebalance: {optimized['turnover'] / 2:.2%}",
                 f"- Average active share: {optimized['active_share']:.2%}",
                 f"- Average ex-ante tracking error (annualised): {optimized['tracking_error']:.2%}",
-                "",
             ]
         )
+        if "unsolved" in optimized:
+            markdown.append(
+                f"- Rebalances where the optimiser failed (held the current book, or the benchmark if empty): "
+                f"{optimized['unsolved']}"
+            )
+        if "max_industry_active" in optimized:
+            markdown.append(
+                f"- Largest active industry weight: {optimized['max_industry_active']:.2%}; largest active size "
+                f"exposure: {optimized['max_abs_size_active']:.3f} std"
+            )
+        markdown.append("")
     if "signal_analysis" in summary:
         markdown.extend(_signal_markdown(summary["signal_analysis"]))
     if "feature_importance" in summary:
