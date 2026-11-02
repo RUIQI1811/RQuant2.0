@@ -154,8 +154,9 @@ class NeuralWorkflowTests(unittest.TestCase):
                 if name == "tra":
                     runner.template["dataset"]["kwargs"]["batch_size"] = 128
                 with contextlib.ExitStack() as stack:
-                    if name == "hist" and not torch.cuda.is_available():
-                        # Qlib's HISTModel.forward asks torch.get_device for its device, which is -1 on the CPU.
+                    if name == "hist":
+                        # The test runs HIST on the CPU (GPU -1) even on a CUDA machine; Qlib's HISTModel.forward asks
+                        # torch.get_device for its device, which is -1 on the CPU.
                         stack.enter_context(mock.patch.object(torch, "get_device", lambda tensor: "cpu"))
                     manifest = runner.run(first_year=2021, last_year=2021, through=date(2021, 12, 20))
 
