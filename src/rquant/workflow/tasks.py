@@ -27,7 +27,17 @@ WORKFLOW_DIRECTORY = Path(__file__).resolve().parent / "workflows"
 BUILT_IN_WORKFLOWS = {
     "lgb": WORKFLOW_DIRECTORY / "lgb.yaml",
     "double-ensemble": WORKFLOW_DIRECTORY / "double_ensemble.yaml",
+    # PyTorch models (pip install -e ".[nn]"). The Alpha360 ones read qlib_alpha360 as 60 days x 6 fields.
+    "gru": WORKFLOW_DIRECTORY / "gru.yaml",
+    "alstm": WORKFLOW_DIRECTORY / "alstm.yaml",
+    "hist": WORKFLOW_DIRECTORY / "hist.yaml",
+    "tra": WORKFLOW_DIRECTORY / "tra.yaml",
+    # GRU over a TSDatasetH window of any factor set.
+    "gru-ts": WORKFLOW_DIRECTORY / "gru_ts.yaml",
 }
+
+# Datasets that feed a model a window of past rows per sample, and the kwarg naming its length in trading days.
+TIME_SERIES_DATASETS = {"TSDatasetH": "step_len", "MTSDatasetH": "seq_len"}
 
 # The label of each horizon is evaluated by KunQuantDataLoader; it needs this many trading days after the prediction
 # date, so a training segment must end this many days before the test segment starts (Qlib's ``trunc_days``).
@@ -38,6 +48,9 @@ ROLLING_DEFAULTS = {
     # whole training window (rquant.workflow.trainer). The window lengths are run settings (workflow.train_years and
     # workflow.validation_months in config/default.yaml).
     "refit": False,
+    # Train only up to `trunc_days` trading days before the validation months instead of through them, so a model
+    # that early-stops on the validation set (the neural networks) never trains on it.
+    "holdout_valid": False,
 }
 
 
@@ -141,6 +154,10 @@ def rolling_template(
             loader_kwargs["factor_set"] = factor_set
         if horizon is not None:
             loader_kwargs["horizon"] = horizon
+    dataset = task.get("dataset", {})
+    if _class_name(dataset) == "MTSDatasetH":
+        # MTSDatasetH can only guess the label horizon from Qlib expression fields, which KunQuantDataLoader has not.
+        dataset.setdefault("kwargs", {}).setdefault("horizon", TRUNC_DAYS[task_horizon(task)])
     task["record"] = [{"class": "SignalRecord", "module_path": "qlib.workflow.record_temp"}]
     return task
 
@@ -161,6 +178,21 @@ def task_factor_set(task: dict[str, Any]) -> str:
     return str(factor_set)
 
 
+def time_series_window(task: dict[str, Any]) -> int:
+    """Trading days of history a sample of the task's dataset spans (0 for a cross-sectional DatasetH)."""
+    dataset = task.get("dataset", {})
+    key = TIME_SERIES_DATASETS.get(_class_name(dataset))
+    if key is None:
+        return 0
+    default = 30 if key == "step_len" else 60  # TSDatasetH's and MTSDatasetH's defaults
+    return int(dataset.get("kwargs", {}).get(key) or default)
+
+
+def _class_name(config: dict[str, Any]) -> str:
+    value = config.get("class", "")
+    return value if isinstance(value, str) else getattr(value, "__name__", "")
+
+
 def _handler(task: dict[str, Any]) -> dict[str, Any]:
     handler = task.get("dataset", {}).get("kwargs", {}).get("handler")
     if not isinstance(handler, dict):
@@ -170,11 +202,18 @@ def _handler(task: dict[str, Any]) -> dict[str, Any]:
 
 def window_handler_mod(task: dict[str, Any], rolling_gen: Any) -> None:
     """``RollingGen``'s ``ds_extra_mod_func``: load the handler from the train start through the test end, and fit
-    every processor that takes a fit period (``ZScoreNorm``) on the train segment only."""
+    every processor that takes a fit period (``ZScoreNorm``) on the train segment only. A time-series dataset's
+    handler also starts its window length earlier, so the first training samples have full windows."""
     segments = task["dataset"]["kwargs"]["segments"]
     train, test = segments[rolling_gen.train_key], segments[rolling_gen.test_key]
     kwargs = _handler(task).setdefault("kwargs", {})
     kwargs["start_time"] = train[0]
+    window = time_series_window(task)
+    if window:
+        from qlib.workflow.task.utils import TimeAdjuster
+
+        adjuster = getattr(rolling_gen, "ta", None) or TimeAdjuster()
+        kwargs["start_time"] = adjuster.get(max(0, adjuster.align_idx(train[0]) - window))
     kwargs["end_time"] = test[1]
     for processor in kwargs.get("infer_processors", []) + kwargs.get("learn_processors", []):
         if isinstance(processor, dict) and "fit_start_time" in processor.get("kwargs", {}):
@@ -186,7 +225,8 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
     """Qlib's ``RollingGen`` with one test segment per calendar year instead of a fixed number of trading days.
 
     For prediction year Y the segments are train = Jan 1 of Y - train_years through Dec 31 of Y - 1, valid = the last
-    ``validation_months`` of it, and test = Y (clipped to ``through``), aligned to trading days. ``trunc_segments``
+    ``validation_months`` of it, and test = Y (clipped to ``through``), aligned to trading days. With
+    ``holdout_valid`` train stops before the validation months instead. ``trunc_segments``
     then ends train and valid ``trunc_days`` trading days before the test starts, so no training label looks into the
     test year, and ``window_handler_mod`` moves the handler's data and fit period with them.
     """
@@ -201,7 +241,9 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
         train_years: int = 3,
         validation_months: int = 6,
         formal_start_year: int = 2010,
+        holdout_valid: bool = False,
     ) -> None:
+        self.holdout_valid = holdout_valid
         if horizon not in TRUNC_DAYS:
             raise DataContractError(f"Unsupported horizon: {horizon}")
         super().__init__(step=1, ds_extra_mod_func=window_handler_mod, trunc_days=TRUNC_DAYS[horizon])
@@ -220,9 +262,10 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
 
         tasks = []
         for window in self.windows:
+            train_end = window.inner_train_end if self.holdout_valid else window.refit_end
             segments = self.ta.align_seg(
                 {
-                    self.train_key: (window.train_start, window.refit_end),
+                    self.train_key: (window.train_start, train_end),
                     "valid": (window.validation_start, window.validation_end),
                     self.test_key: (window.test_start, window.test_end),
                 }
@@ -230,6 +273,11 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
             if segments[self.test_key][0] > segments[self.test_key][1]:
                 continue  # no trading day of the year falls on or before `through`
             trunc_segments(self.ta, segments, self.trunc_days, self.test_key)
+            if self.holdout_valid:
+                # Train labels must not read into the validation months either.
+                segments[self.train_key] = self.ta.truncate(
+                    segments[self.train_key], segments["valid"][0], self.trunc_days
+                )
             rolled = self.task_copy_func(task)
             self._update_task_segs(rolled, segments)
             tasks.append(rolled)

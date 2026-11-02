@@ -620,6 +620,7 @@ def _walk_forward(args: argparse.Namespace) -> int:
             validation_months=int(workflow.get("validation_months", 6)),
             formal_start_year=_date_value(config.get("data", {}).get("formal_start", "2010-01-01")).year,
             universe=_universe(config),
+            canonical_root=paths.canonical,
         )
         run.add_input("qlib_manifest", _fingerprint(paths.qlib / "manifest.json"))
         run.add_input("factor_manifest", _fingerprint(paths.factors / runner.factor_set / "manifest.json"))

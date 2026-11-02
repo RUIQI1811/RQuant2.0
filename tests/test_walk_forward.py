@@ -10,15 +10,17 @@ from pathlib import Path
 HAS_STACK = all(importlib.util.find_spec(name) is not None for name in ("qlib", "lightgbm", "pyarrow"))
 
 
-def write_store(root: Path, *, stocks: int = 30, seed: int = 0) -> tuple[Path, Path, list]:  # type: ignore[type-arg]
-    """A Qlib day provider and a wq_alpha101 factor store whose first factor predicts the next-open return."""
+def write_store(
+    root: Path, *, stocks: int = 30, seed: int = 0, factor_set: str = "wq_alpha101", start: str = "2018-10-01"
+) -> tuple[Path, Path, list]:  # type: ignore[type-arg]
+    """A Qlib day provider and a ``factor_set`` store whose first factor predicts the next-open return."""
     import numpy as np
     import pandas as pd
 
     from rquant.factors.catalog import get_catalog
 
     rng = np.random.default_rng(seed)
-    dates = pd.bdate_range("2018-10-01", "2021-12-31")
+    dates = pd.bdate_range(start, "2021-12-31")
     qlib_root = root / "qlib"
     (qlib_root / "calendars").mkdir(parents=True)
     (qlib_root / "calendars" / "day.txt").write_text("".join(f"{day:%Y-%m-%d}\n" for day in dates), encoding="utf-8")
@@ -36,8 +38,8 @@ def write_store(root: Path, *, stocks: int = 30, seed: int = 0) -> tuple[Path, P
         directory.mkdir(parents=True)
         for field, values in (("open", price), ("close", price), ("factor", np.ones(len(dates)))):
             np.concatenate(([0.0], values)).astype(np.float32).tofile(directory / f"{field}.day.bin")
-    names = list(get_catalog().canonical_names("wq_alpha101"))
-    store = root / "factors" / "wq_alpha101"
+    names = list(get_catalog().canonical_names(factor_set))
+    store = root / "factors" / factor_set
     for year in sorted(set(dates.year)):
         days = dates[dates.year == year]
         index = pd.MultiIndex.from_product([days, instruments], names=["datetime", "instrument"])

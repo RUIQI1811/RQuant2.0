@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -131,7 +132,12 @@ def fit_task(model: Any, task: dict[str, Any], *, log_metrics: Any = None) -> An
         return fit_double_ensemble_window(model, load_panel, **window)
     dataset = init_instance_by_config(task["dataset"], accept_types=Dataset)
     model.fit(dataset)
-    return model.predict(dataset, segment="test") if "test" in segments else None
+    if "test" not in segments:
+        return None
+    # Qlib's time-series models (pytorch_*_ts) always predict the test segment and take no segment argument.
+    if "segment" in inspect.signature(model.predict).parameters:
+        return model.predict(dataset, segment="test")
+    return model.predict(dataset)
 
 
 def lean_window(task: dict[str, Any]) -> dict[str, Any] | None:

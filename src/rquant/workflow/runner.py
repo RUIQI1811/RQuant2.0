@@ -45,9 +45,12 @@ class RollingWorkflowRunner:
         validation_months: int = 6,
         formal_start_year: int = 2010,
         universe: str = "csi300",
+        canonical_root: str | Path | None = None,
     ) -> None:
-        """``workflow`` is a qrun workflow file or the name of a built-in one (``lgb``, ``double-ensemble``);
-        ``horizon`` and ``factor_set`` override its data loader's."""
+        """``workflow`` is a qrun workflow file or the name of a built-in one (``lgb``, ``double-ensemble``, ...);
+        ``horizon`` and ``factor_set`` override its data loader's. ``canonical_root`` is needed by HIST, whose
+        concepts come from the Shenwan industries of the canonical bars when the workflow names no concept file."""
+        self.canonical_root = Path(canonical_root) if canonical_root is not None else None
         self.qlib_root = Path(qlib_root)
         self.factor_root = Path(factor_root)
         self.run_directory = Path(run_directory)
@@ -71,7 +74,10 @@ class RollingWorkflowRunner:
             model_kwargs["seed"] = seed
         self.horizon = task_horizon(self.template)
         self.factor_set = task_factor_set(self.template)
-        get_catalog().select(self.factor_set)
+        factors = len(get_catalog().canonical_names(self.factor_set))
+        # A time-series model reads one row of factors per day; `d_feat: null` takes the factor set's width.
+        if "d_feat" in model_kwargs and model_kwargs["d_feat"] is None:
+            model_kwargs["d_feat"] = factors
 
     @property
     def experiment_name(self) -> str:
@@ -90,6 +96,8 @@ class RollingWorkflowRunner:
         except ImportError as exc:
             raise DependencyError("pyqlib==0.9.7, pandas and LightGBM are required for rolling training") from exc
 
+        if self.template["model"].get("class") == "HIST":
+            self._hist_concepts(through)
         tracking_uri = init_run_tracking(
             self.run_directory, self.experiment_name, provider_uri=self.qlib_root, region=REG_CN, qlib_module=qlib
         )
@@ -109,6 +117,7 @@ class RollingWorkflowRunner:
                 train_years=self.train_years,
                 validation_months=self.validation_months,
                 formal_start_year=self.formal_start_year,
+                holdout_valid=bool(self.workflow["rolling"]["holdout_valid"]),
             ),
         )
         if not tasks:
@@ -173,6 +182,21 @@ class RollingWorkflowRunner:
         atomic_write_json(self.run_directory / "walk_forward.json", manifest)
         release_run_tracking(self.run_directory)
         return manifest
+
+    def _hist_concepts(self, through: date) -> None:
+        """Point HIST at a stock-to-concept matrix: the workflow's own files, or else one built from the Shenwan
+        level-2 industries every instrument belonged to up to ``through`` (``<run>/hist``)."""
+        kwargs = self.template["model"]["kwargs"]
+        if kwargs.get("stock2concept") and kwargs.get("stock_index"):
+            return
+        if self.canonical_root is None:
+            raise DataContractError("HIST needs stock2concept and stock_index files, or the canonical data root")
+        from rquant.workflow.concepts import write_industry_concepts
+
+        kwargs["stock2concept"], kwargs["stock_index"] = (
+            str(path)
+            for path in write_industry_concepts(self.canonical_root / "bars", self.run_directory / "hist", through)
+        )
 
 
 def init_run_tracking(

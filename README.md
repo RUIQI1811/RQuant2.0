@@ -898,6 +898,39 @@ qrun src/rquant/workflow/workflows/lgb.yaml
 - `lgb`：LightGBM；
 - `double-ensemble`：Qlib DoubleEnsemble，参数取 Qlib Alpha158 基准配置（3 个子模型、每个 28 轮、学习率 0.2、样本重加权与特征选择都开启）。轮数固定，所以没有调参阶段，每年只拟合一次；特征选择要对每个因子打乱重算一遍预测，因子多、股票池大时明显比 `lgb` 慢，建议先在 csi300 上跑。
 
+### 神经网络时序模型（GRU / ALSTM / HIST / TRA）
+
+Qlib 的 PyTorch 模型也能直接滚动训练。先装 PyTorch：有 NVIDIA 显卡时先按 <https://pytorch.org> 装 CUDA 版
+（例如 `pip install torch --index-url https://download.pytorch.org/whl/cu128`），再 `pip install -e ".[nn]"`；
+模型发现 CUDA 就用第 0 块显卡，否则用 CPU（HIST 只能在 GPU 上跑）。
+
+| `--model` | Qlib 模型 | 输入 |
+| --- | --- | --- |
+| `gru` | `pytorch_gru.GRU` | `qlib_alpha360`，每行 360 列按 60 天 × 6 个字段读 |
+| `alstm` | `pytorch_alstm.ALSTM` | 同上 |
+| `hist` | `pytorch_hist.HIST` | 同上，另需股票-概念矩阵 |
+| `tra` | `pytorch_tra.TRAModel` | `MTSDatasetH`，同上的 60 天 × 6 字段序列 |
+| `gru-ts` | `pytorch_gru_ts.GRU` | `TSDatasetH`，任何因子集最近 20 天的因子行 |
+
+```bash
+rquant walk-forward --model hist --horizon 1d --first-year 2013 --last-year 2026 --through 2026-10-21
+rquant walk-forward --model gru-ts --factor-set jq240 --horizon 1d --through 2026-10-21
+```
+
+- 前四个模型的 workflow 默认因子集是 `qlib_alpha360`（Qlib 基准用的就是 Alpha360）；`--factor-set` 换成别的会因为
+  列数不是 360 而报错。`gru-ts` 的 `d_feat: null` 自动取因子集的列数。参数都取 Qlib Alpha360 / Alpha158 基准配置。
+- 时序窗口：`TSDatasetH` / `MTSDatasetH` 要在每段开头往前多读 `step_len` / `seq_len` 天，walk-forward 会把 handler 的
+  起点相应往前挪（gru-ts 20 天、TRA 60 天），所以训练段第一天的样本也有完整窗口，不会用 0 补齐。
+- 验证集独立：神经网络按验证集早停，所以这些 workflow 设了 `rolling.holdout_valid: true`，训练段在验证段开始前按标签
+  天数截断结束，不再像 LGB 那样“训练窗口含验证段、早停后重训”。
+- HIST 的预定义概念：Qlib 基准下载的是它自己整理的 csi300 概念表，RQuant 改用申万二级行业：每只股票属于它在最后
+  一个预测日之前所属过的所有二级行业，从未有行业的股票共用一个额外概念。文件写在运行目录 `hist/`
+  （`stock2concept.npy`、`stock_index.npy`）；想用自己的概念表就复制 `hist.yaml` 填上这两个路径。没有预训练的 LSTM，
+  主干从随机权重开始。
+- TRA 对所有段都读 handler 的 learn 视图（会去掉没有标签的行），所以运行最后两个交易日（1d 标签还没出来）没有预测。
+- 内存：这些模型走 Qlib 原生 `DatasetH`，handler 会把整个窗口的面板存两三份。16 GB 的机器建议先在 csi300 上跑；
+  sh_main 的 Alpha360 面板单份就有 9-10 GB。显存方面 8 GB 显卡够用。
+
 可选预测期限：
 
 - `1d`：下一交易日开盘到再下一交易日开盘的收益；

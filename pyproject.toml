@@ -33,6 +33,11 @@ dev = [
   "pytest-cov>=5,<7",
   "ruff>=0.6,<1",
 ]
+# Qlib's PyTorch models (walk-forward --model gru|alstm|hist|tra|gru-ts). For an NVIDIA GPU install the CUDA build
+# from https://pytorch.org first, e.g. pip install torch --index-url https://download.pytorch.org/whl/cu128
+nn = [
+  "torch>=2.3",
+]
 
 [project.scripts]
 rquant = "rquant.cli:main"
