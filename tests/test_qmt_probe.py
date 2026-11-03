@@ -32,6 +32,12 @@ class FakeContext:
     def get_stock_list_in_sector(self, name: str) -> list[str]:
         return ["600000.SH", "600519.SH", "000001.SZ"]
 
+    def set_universe(self, codes: list[str]) -> None:
+        self.universe = list(codes)
+
+    def get_history_data(self, length: int, period: str, field: str, dividend: int) -> dict[str, list[float]]:
+        return {code: [float(i) for i in range(length)] for code in self.universe}
+
     def get_market_data_ex(self, fields, codes, **kwargs):
         count = kwargs.get("count", 30)
         count = 30 if count in (-1, None) else count
@@ -72,3 +78,5 @@ def test_probe_runs_against_a_fake_context(capsys) -> None:
     assert sum(line == "[RQ] probe=end" for line in lines) == 1
     assert any(line.startswith("[RQ] bars.universe_320d.codes_returned=2") for line in lines)
     assert any(line.startswith("[RQ] score_speed.seconds=") for line in lines)
+    assert "[RQ] universe.set=2" in lines
+    assert "[RQ] hist.close.div0.codes=2" in lines

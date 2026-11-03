@@ -63,6 +63,12 @@ def init(ContextInfo):
             log("module." + name, getattr(module, "__version__", "ok"))
         except Exception as exc:
             log("module." + name, "MISSING %s: %s" % (type(exc).__name__, exc))
+    try:
+        codes = [code for code in ContextInfo.get_stock_list_in_sector(SECTOR_SH_A) if code.startswith("60")]
+        ContextInfo.set_universe(codes)
+        log("universe.set", len(codes))
+    except Exception as exc:
+        log("universe.set", "ERROR %s: %s" % (type(exc).__name__, exc))
 
 
 def handlebar(ContextInfo):
@@ -101,12 +107,30 @@ def _run(C):
     log("sh_main.count", len(sh_main))
     sample = sh_main[:5] or ["600000.SH", "600519.SH"]
 
+    _probe_history_data(C)
     _probe_bars(C, sample, sh_main)
     _probe_instrument(C, sample)
     _probe_financials(C, sample)
     _probe_history_on_date(C, sample)
     _probe_scoring_speed(len(sh_main) or 1700)
     _probe_memory()
+
+
+def _probe_history_data(C):
+    # get_history_data returns plain dicts of lists, so it may work when pandas is not installed.
+    for field in ("close", "open", "high", "low", "volume", "amount"):
+        for dividend in (0, 1, 2):  # none, front, back (QMT numeric codes)
+            label = "hist.%s.div%d" % (field, dividend)
+            data = _step(label, lambda f=field, d=dividend: C.get_history_data(320, "1d", f, d))
+            if not data:
+                continue
+            lengths = sorted(len(values) for values in data.values())
+            log(label + ".codes", len(data))
+            log(label + ".len_min_median_max", (lengths[0], lengths[len(lengths) // 2], lengths[-1]))
+            first = sorted(data)[0]
+            log(label + "." + first + ".tail", list(data[first])[-3:])
+            if field != "close":
+                break
 
 
 def _probe_bars(C, sample, universe):
