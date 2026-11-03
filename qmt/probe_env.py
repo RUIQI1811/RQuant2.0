@@ -1,4 +1,4 @@
-# coding: utf-8
+#encoding:gbk
 # RQuant2.0 QMT sandbox probe. READ-ONLY: this strategy never places, cancels or queries orders and never touches
 # files or the network. It only prints what the built-in Python environment offers, so we can decide how much of the
 # research pipeline (jq240 factors + LightGBM) can run inside QMT.
@@ -8,8 +8,8 @@
 #   2. Create a new Python strategy, paste this whole file, main chart 000300.SH, period 1d.
 #   3. Press run (not live trading). Copy every log line that starts with [RQ] and send it back.
 #
-# The file is ASCII-only on purpose so that the QMT editor's encoding (GBK or UTF-8) does not matter. Chinese sector
-# names are written as unicode escapes.
+# The file is ASCII-only and declares GBK, the encoding QMT saves strategy files in (a UTF-8 declaration fails to compile
+# there). Chinese sector names are written as unicode escapes.
 
 import sys
 import time
