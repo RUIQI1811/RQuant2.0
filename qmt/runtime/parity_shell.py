@@ -18,9 +18,38 @@ def _number(value):
     return "" if value != value else "%.7g" % value
 
 
+DIAGNOSE = ["600004.SH", "600006.SH", "600009.SH", "600010.SH"]
+
+
+def _dated(values):
+    return dict((ms_to_date(k).strftime("%Y%m%d"), v) for k, v in sorted((values or {}).items()))
+
+
+def diagnose(C, inputs):
+    """Print what the parity comparison needs to explain differences: mkt, turnover and statement versions."""
+    log("diag.mkt_tail", inputs["mkt"].tail(5).round(6).to_dict())
+    tail = inputs["close"].index[-3:]
+    qmt = qmt_turnover_panel(C, DIAGNOSE, tail)
+    log("diag.turnover_qmt", qmt.round(4).to_dict())
+    log("diag.turnover_used", inputs["basic_turnover_rate"].reindex(index=tail, columns=DIAGNOSE).round(4).to_dict())
+    fields = []
+    for table in (INCOME, BALANCE, CASHFLOW):
+        fields += [table + ".m_anntime", table + ".m_timetag"]
+    fields += [INCOME + ".revenue_inc", BALANCE + ".tot_shrhldr_eqy_excl_min_int", CASHFLOW + ".net_cash_flows_oper_act"]
+    for mode in ("report_time", "announce_time"):
+        raw = C.get_raw_financial_data(fields, DIAGNOSE, "20240101", AS_OF, mode) or {}
+        for code in DIAGNOSE:
+            for field in fields:
+                log("diag.%s.%s.%s" % (mode, code, field), _dated((raw.get(code) or {}).get(field)))
+
+
 def run_parity(C):
     began = time.time()
     inputs = build_inputs(C, AS_OF, DAYS, log)
+    try:
+        diagnose(C, inputs)
+    except Exception:
+        log("diag.error", traceback.format_exc())
     calculator = JQFactors(inputs)
     member = inputs["universe"].iloc[-1]
     codes = [code for code, inside in zip(member.index, member.values) if inside]

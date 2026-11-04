@@ -31,6 +31,11 @@ def to_ms(day: str | pd.Timestamp) -> int:
     return int((pd.Timestamp(day) - pd.Timedelta(hours=8)).value // 1_000_000)
 
 
+def local_labels(dates: pd.DatetimeIndex) -> list[str]:
+    """QMT's date labels on a machine on US Pacific time: the local date of Beijing midnight, the previous day."""
+    return list((dates - pd.Timedelta(days=1)).strftime("%Y%m%d"))
+
+
 def raw_bars(code: str) -> pd.DataFrame:
     rng = np.random.default_rng(sum(map(ord, code)))
     dates = CALENDAR[CALENDAR >= max(pd.Timestamp(LISTED[code]), CALENDAR[0])]
@@ -92,25 +97,26 @@ class FakeQMT:
                 frame = self.bars[code]
             start = pd.Timestamp(start_time or "19900101")
             frame = frame[(frame.index >= start) & (frame.index <= pd.Timestamp(end_time))]
-            frame = frame[fields].copy()
-            frame.index = frame.index.strftime("%Y%m%d")
+            frame = frame.assign(time=[float(to_ms(day)) for day in frame.index])[fields].copy()
+            frame.index = local_labels(frame.index)
             result[code] = frame
         return result
 
     def get_raw_financial_data(self, fields, codes, start, end, report_type="report_time"):
-        return {code: {f: self.statements[code].get(f, {}) for f in fields} for code in codes}
+        return {code: {f: self.statements[code].get(f, {}) for f in fields} for code in codes if code in LISTED}
 
     def get_turnover_rate(self, codes, start, end):
-        frame = pd.DataFrame({c: self.bars[c]["volume"] / 1e8 for c in codes})
+        frame = pd.DataFrame({c: self.bars[c]["volume"] / 1e8 for c in codes if c in LISTED})
         frame = frame[(frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))]
-        frame.index = [int(d.strftime("%Y%m%d")) for d in frame.index]
+        frame.index = [int(label) for label in local_labels(frame.index)]
         return frame
 
     def get_stock_list_in_sector(self, name):
         return list(LISTED)
 
     def get_instrumentdetail(self, code):
-        return {"OpenDate": int(LISTED[code].replace("-", "")), "InstrumentName": NAMES.get(code, "Name " + code)}
+        return {"OpenDate": int(LISTED[code].replace("-", "")), "InstrumentName": NAMES.get(code, "Name " + code),
+                "FloatVolume": 5.0e7, "TotalVolume": 6.0e7}
 
     def is_last_bar(self):
         return True
@@ -157,7 +163,7 @@ def test_shares_cap_and_turnover() -> None:
         assert inputs["basic_total_share"].loc[day, "600001.SH"] == shares
         assert inputs["cap"].loc[day, "600001.SH"] == pytest.approx(raw[day] * shares)
     assert inputs["basic_circ_mv"].loc["2011-01-04", "600001.SH"] == pytest.approx(raw["2011-01-04"] * 1.0e8)
-    turnover = context.bars["600001.SH"]["volume"]["2011-01-04"] / 1e8 * 100
+    turnover = context.bars["600001.SH"]["volume"]["2011-01-04"] * 100 / 1.0e8 * 100
     assert inputs["basic_turnover_rate"].loc["2011-01-04", "600001.SH"] == pytest.approx(turnover)
 
 
