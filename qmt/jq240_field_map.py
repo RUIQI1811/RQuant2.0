@@ -35,9 +35,10 @@ STATEMENT_FIELDS = {
         "ass_invest_income": INCOME + ".incl_inc_invest_assoc_jv_entp",
         "non_oper_income": INCOME + ".plus_non_oper_rev",
         "non_oper_exp": INCOME + ".less_non_oper_exp",
-        # QMT only carries bank-style interest lines; industrial companies' financial-expense split is absent.
-        "fin_exp_int_exp": INCOME + ".less_int_exp",
-        "fin_exp_int_inc": INCOME + ".int_inc",
+        # QMT has no interest split of the finance expense (less_int_exp / int_inc are bank lines), so
+        # net_interest_expense uses the whole finance expense.
+        "fin_exp_int_exp": INCOME + ".financial_expense",
+        "fin_exp_int_inc": None,
     },
     "balancesheet": {
         "total_share": CAPITAL + ".total_capital",
