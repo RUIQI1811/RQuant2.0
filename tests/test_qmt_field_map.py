@@ -40,3 +40,13 @@ def test_mapped_names_use_known_qmt_tables() -> None:
     for fields in mapping.values():
         for target in fields.values():
             assert target is None or pattern.match(target), target
+
+
+def test_field_probe_matches_the_map() -> None:
+    probe = Path(__file__).resolve().parents[1] / "qmt" / "probe_fields.py"
+    source = probe.read_bytes().decode("ascii")
+    ast.parse(source, feature_version=(3, 6))
+    mapping = runpy.run_path(str(FIELD_MAP))["STATEMENT_FIELDS"]
+    expected = sorted({target for fields in mapping.values() for target in fields.values() if target})
+    assert runpy.run_path(str(probe))["FIELDS"] == expected
+    assert "passorder" not in source and "open(" not in source
