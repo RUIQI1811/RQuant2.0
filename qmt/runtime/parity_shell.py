@@ -28,6 +28,14 @@ def _dated(values):
 def diagnose(C, inputs):
     """Print what the parity comparison needs to explain differences: mkt, turnover and statement versions."""
     log("diag.mkt_tail", inputs["mkt"].tail(5).round(6).to_dict())
+    probe = ["000001.SZ", "300750.SZ", "002594.SZ", "688981.SH", "600000.SH"]
+    bars = C.get_market_data_ex(["close", "volume"], probe, period="1d", count=3, dividend_type="none",
+                                fill_data=False, subscribe=False)
+    log("diag.market_bars", dict((code, len(bars.get(code, []))) for code in probe))
+    log("diag.market_floats", dict((code, instrument_info(C, code)["float"]) for code in probe))
+    every = [code for code in C.get_stock_list_in_sector(SECTOR_ALL_A) if not code.endswith(".BJ")]
+    log("diag.market_codes", "%d all-A, %d SZ, %d 688" % (len(every), sum(c.endswith(".SZ") for c in every),
+                                                         sum(c.startswith("688") for c in every)))
     tail = inputs["close"].index[-3:]
     qmt = qmt_turnover_panel(C, DIAGNOSE, tail)
     log("diag.turnover_qmt", qmt.round(4).to_dict())

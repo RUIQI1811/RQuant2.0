@@ -796,7 +796,7 @@ DAILY_INPUTS = {
 #   which is how Tushare's adj_factor moves; volume is raw shares / factor and amount is raw yuan;
 # * cap = raw close x total shares; basic_* are daily_basic in yuan, shares and percent;
 # * mkt is the circulating-cap-weighted return of all A shares listed 30+ days, weighted by the previous day's cap;
-# * statements are one row per stock and quarter end, dated by the latest of the three statements' announcements;
+# * statements are one row per stock and quarter end, dated by the earliest of the three statements' announcements;
 # * the cross-sectional universe is sh_main: 60xxxx.SH, no ST or delisting name, more than 60 trading days listed.
 # Known gaps: ST status is today's name for every day of the window, and stocks delisted before today are absent.
 import time
@@ -1013,7 +1013,10 @@ def fundamentals_frame(C, codes, end, total_points):
                 if not announced:
                     continue
                 end_date = ms_to_date(period)
-                row = {"instrument": code, "end_date": end_date, "ann_date": ms_to_date(max(announced))}
+                # QMT moves a quarter's m_anntime to the date of any later report that re-discloses it (a year-end
+                # balance sheet comes back as the next reports' opening balance), so the earliest of the three
+                # statements' dates is the first announcement; RQuant's first-reported rows share one date anyway.
+                row = {"instrument": code, "end_date": end_date, "ann_date": ms_to_date(min(announced))}
                 for name, target in targets.items():
                     value = (values.get(target) or {}).get(period)
                     row[name] = np.nan if value is None else float(value)
@@ -1160,6 +1163,14 @@ def _dated(values):
 def diagnose(C, inputs):
     """Print what the parity comparison needs to explain differences: mkt, turnover and statement versions."""
     log("diag.mkt_tail", inputs["mkt"].tail(5).round(6).to_dict())
+    probe = ["000001.SZ", "300750.SZ", "002594.SZ", "688981.SH", "600000.SH"]
+    bars = C.get_market_data_ex(["close", "volume"], probe, period="1d", count=3, dividend_type="none",
+                                fill_data=False, subscribe=False)
+    log("diag.market_bars", dict((code, len(bars.get(code, []))) for code in probe))
+    log("diag.market_floats", dict((code, instrument_info(C, code)["float"]) for code in probe))
+    every = [code for code in C.get_stock_list_in_sector(SECTOR_ALL_A) if not code.endswith(".BJ")]
+    log("diag.market_codes", "%d all-A, %d SZ, %d 688" % (len(every), sum(c.endswith(".SZ") for c in every),
+                                                         sum(c.startswith("688") for c in every)))
     tail = inputs["close"].index[-3:]
     qmt = qmt_turnover_panel(C, DIAGNOSE, tail)
     log("diag.turnover_qmt", qmt.round(4).to_dict())

@@ -82,6 +82,8 @@ class FakeQMT:
             for offset, name in enumerate(("ASHAREINCOME", "ASHAREBALANCESHEET", "ASHARECASHFLOW")):
                 table[f"{name}.m_anntime"] = {to_ms(q): float(to_ms(q + pd.Timedelta(days=30 + offset)))
                                               for q in quarters}
+            # A later report re-discloses the 2009 year-end balance sheet; QMT then moves its m_anntime.
+            table["ASHAREBALANCESHEET.m_anntime"][to_ms("2009-12-31")] = float(to_ms("2011-04-30"))
             table["CAPITALSTRUCTURE.total_capital"] = {to_ms(d): v for d, v in TOTAL.items()}
             table["CAPITALSTRUCTURE.circulating_capital"] = {to_ms(d): v for d, v in FLOAT.items()}
             self.statements[code] = table
@@ -93,8 +95,10 @@ class FakeQMT:
         for code in codes:
             if code == "000300.SH":
                 frame = pd.DataFrame({"close": np.ones(len(CALENDAR))}, index=CALENDAR)
-            else:
+            elif code in self.bars:
                 frame = self.bars[code]
+            else:
+                continue
             start = pd.Timestamp(start_time or "19900101")
             frame = frame[(frame.index >= start) & (frame.index <= pd.Timestamp(end_time))]
             frame = frame.assign(time=[float(to_ms(day)) for day in frame.index])[fields].copy()
@@ -115,6 +119,8 @@ class FakeQMT:
         return list(LISTED)
 
     def get_instrumentdetail(self, code):
+        if code not in LISTED:
+            return {}
         return {"OpenDate": int(LISTED[code].replace("-", "")), "InstrumentName": NAMES.get(code, "Name " + code),
                 "FloatVolume": 5.0e7, "TotalVolume": 6.0e7}
 
@@ -172,11 +178,13 @@ def test_fundamentals_rows() -> None:
     frame = inputs["fundamentals"]
     assert set(frame["instrument"]) == {"600001.SH", "600002.SH", "600003.SH", "600004.SH"}
     row = frame[(frame["instrument"] == "600001.SH") & (frame["end_date"] == pd.Timestamp("2010-06-30"))].iloc[0]
-    assert row["ann_date"] == pd.Timestamp("2010-08-01")  # the cash-flow statement, 32 days after quarter end
+    assert row["ann_date"] == pd.Timestamp("2010-07-30")  # the income statement, the earliest of the three
     assert row["total_share"] == 1.2e8
     early = frame[(frame["instrument"] == "600001.SH") & (frame["end_date"] == pd.Timestamp("2006-03-31"))].iloc[0]
     assert early["total_share"] == 1.0e8  # before QMT's share history: its first value
     assert np.isnan(row["oth_eqt_tools_p_shr"])
+    year_end = frame[(frame["instrument"] == "600001.SH") & (frame["end_date"] == pd.Timestamp("2009-12-31"))].iloc[0]
+    assert year_end["ann_date"] == pd.Timestamp("2010-01-30")
 
 
 def test_universe_is_sh_main() -> None:

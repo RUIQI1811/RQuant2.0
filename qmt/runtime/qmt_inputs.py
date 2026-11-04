@@ -7,7 +7,7 @@
 #   which is how Tushare's adj_factor moves; volume is raw shares / factor and amount is raw yuan;
 # * cap = raw close x total shares; basic_* are daily_basic in yuan, shares and percent;
 # * mkt is the circulating-cap-weighted return of all A shares listed 30+ days, weighted by the previous day's cap;
-# * statements are one row per stock and quarter end, dated by the latest of the three statements' announcements;
+# * statements are one row per stock and quarter end, dated by the earliest of the three statements' announcements;
 # * the cross-sectional universe is sh_main: 60xxxx.SH, no ST or delisting name, more than 60 trading days listed.
 # Known gaps: ST status is today's name for every day of the window, and stocks delisted before today are absent.
 import time
@@ -224,7 +224,10 @@ def fundamentals_frame(C, codes, end, total_points):
                 if not announced:
                     continue
                 end_date = ms_to_date(period)
-                row = {"instrument": code, "end_date": end_date, "ann_date": ms_to_date(max(announced))}
+                # QMT moves a quarter's m_anntime to the date of any later report that re-discloses it (a year-end
+                # balance sheet comes back as the next reports' opening balance), so the earliest of the three
+                # statements' dates is the first announcement; RQuant's first-reported rows share one date anyway.
+                row = {"instrument": code, "end_date": end_date, "ann_date": ms_to_date(min(announced))}
                 for name, target in targets.items():
                     value = (values.get(target) or {}).get(period)
                     row[name] = np.nan if value is None else float(value)
