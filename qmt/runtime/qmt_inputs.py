@@ -196,10 +196,12 @@ def qmt_turnover_panel(C, codes, dates):
 def fundamentals_frame(C, codes, end, total_points):
     """One row per stock and quarter end in Tushare column names, as rquant's fundamentals.parquet."""
     names = [name for endpoint in ("income", "balancesheet", "cashflow") for name in STATEMENT_FIELDS[endpoint]]
-    targets = {}
+    targets, absent = {}, []
     for endpoint in ("income", "balancesheet", "cashflow"):
         for name, target in STATEMENT_FIELDS[endpoint].items():
-            if target and not target.startswith(CAPITAL):
+            if target is None:
+                absent.append(name)
+            elif not target.startswith(CAPITAL):
                 targets[name] = target
     wanted = sorted(set(targets.values()))
     announcements = [table + ".m_anntime" for table in (INCOME, BALANCE, CASHFLOW)]
@@ -231,6 +233,9 @@ def fundamentals_frame(C, codes, end, total_points):
                 for name, target in targets.items():
                     value = (values.get(target) or {}).get(period)
                     row[name] = np.nan if value is None else float(value)
+                # Lines QMT does not carry count as zero on a published statement (see jq240_field_map).
+                for name in absent:
+                    row[name] = 0.0
                 known = [value for when, value in shares if when <= end_date]
                 row["total_share"] = known[-1] if known else (shares[0][1] if shares else np.nan)
                 rows.append(row)

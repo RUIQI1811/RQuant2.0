@@ -985,10 +985,12 @@ def qmt_turnover_panel(C, codes, dates):
 def fundamentals_frame(C, codes, end, total_points):
     """One row per stock and quarter end in Tushare column names, as rquant's fundamentals.parquet."""
     names = [name for endpoint in ("income", "balancesheet", "cashflow") for name in STATEMENT_FIELDS[endpoint]]
-    targets = {}
+    targets, absent = {}, []
     for endpoint in ("income", "balancesheet", "cashflow"):
         for name, target in STATEMENT_FIELDS[endpoint].items():
-            if target and not target.startswith(CAPITAL):
+            if target is None:
+                absent.append(name)
+            elif not target.startswith(CAPITAL):
                 targets[name] = target
     wanted = sorted(set(targets.values()))
     announcements = [table + ".m_anntime" for table in (INCOME, BALANCE, CASHFLOW)]
@@ -1020,6 +1022,9 @@ def fundamentals_frame(C, codes, end, total_points):
                 for name, target in targets.items():
                     value = (values.get(target) or {}).get(period)
                     row[name] = np.nan if value is None else float(value)
+                # Lines QMT does not carry count as zero on a published statement (see jq240_field_map).
+                for name in absent:
+                    row[name] = 0.0
                 known = [value for when, value in shares if when <= end_date]
                 row["total_share"] = known[-1] if known else (shares[0][1] if shares else np.nan)
                 rows.append(row)
@@ -1178,8 +1183,10 @@ def diagnose(C, inputs):
     fields = []
     for table in (INCOME, BALANCE, CASHFLOW):
         fields += [table + ".m_anntime", table + ".m_timetag"]
-    fields += [INCOME + ".revenue_inc", BALANCE + ".tot_shrhldr_eqy_excl_min_int", CASHFLOW + ".net_cash_flows_oper_act"]
-    for mode in ("report_time", "announce_time"):
+    fields += [INCOME + ".revenue_inc", INCOME + ".total_operating_cost", INCOME + ".less_gerl_admin_exp",
+               INCOME + ".research_expenses", CASHFLOW + ".depr_fa_coga_dpba", CASHFLOW + ".amort_intang_assets",
+               CASHFLOW + ".amort_lt_deferred_exp", CASHFLOW + ".net_cash_flows_oper_act"]
+    for mode in ("report_time",):
         raw = C.get_raw_financial_data(fields, DIAGNOSE, "20240101", AS_OF, mode) or {}
         for code in DIAGNOSE:
             for field in fields:

@@ -43,8 +43,10 @@ def diagnose(C, inputs):
     fields = []
     for table in (INCOME, BALANCE, CASHFLOW):
         fields += [table + ".m_anntime", table + ".m_timetag"]
-    fields += [INCOME + ".revenue_inc", BALANCE + ".tot_shrhldr_eqy_excl_min_int", CASHFLOW + ".net_cash_flows_oper_act"]
-    for mode in ("report_time", "announce_time"):
+    fields += [INCOME + ".revenue_inc", INCOME + ".total_operating_cost", INCOME + ".less_gerl_admin_exp",
+               INCOME + ".research_expenses", CASHFLOW + ".depr_fa_coga_dpba", CASHFLOW + ".amort_intang_assets",
+               CASHFLOW + ".amort_lt_deferred_exp", CASHFLOW + ".net_cash_flows_oper_act"]
+    for mode in ("report_time",):
         raw = C.get_raw_financial_data(fields, DIAGNOSE, "20240101", AS_OF, mode) or {}
         for code in DIAGNOSE:
             for field in fields:

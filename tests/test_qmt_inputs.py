@@ -182,7 +182,7 @@ def test_fundamentals_rows() -> None:
     assert row["total_share"] == 1.2e8
     early = frame[(frame["instrument"] == "600001.SH") & (frame["end_date"] == pd.Timestamp("2006-03-31"))].iloc[0]
     assert early["total_share"] == 1.0e8  # before QMT's share history: its first value
-    assert np.isnan(row["oth_eqt_tools_p_shr"])
+    assert row["oth_eqt_tools_p_shr"] == 0.0  # QMT has no such line: zero on a published statement
     year_end = frame[(frame["instrument"] == "600001.SH") & (frame["end_date"] == pd.Timestamp("2009-12-31"))].iloc[0]
     assert year_end["ann_date"] == pd.Timestamp("2010-01-30")
 
