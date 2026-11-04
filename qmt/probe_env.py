@@ -110,7 +110,7 @@ def _run(C):
     _probe_history_data(C)
     _probe_bars(C, sample, sh_main)
     _probe_instrument(C, sample)
-    _probe_financials(C, sample)
+    _probe_financials(C, sample, sh_main)
     _probe_history_on_date(C, sample)
     _probe_scoring_speed(len(sh_main) or 1700)
     _probe_memory()
@@ -197,7 +197,19 @@ def _probe_instrument(C, sample):
         _step("csi300_members", lambda: log("csi300_members.count", len(C.get_sector("000300.SH"))))
 
 
-def _probe_financials(C, sample):
+def _describe(label, data):
+    log(label + ".type", type(data).__name__)
+    shape = getattr(data, "shape", None)
+    if shape is not None:
+        log(label + ".shape", shape)
+    try:
+        text = data.tail(3) if hasattr(data, "tail") else data
+        log(label + ".value", str(text).replace("\n", " | "))
+    except Exception as exc:
+        log(label + ".value", "unprintable %s: %r" % (type(exc).__name__, exc))
+
+
+def _probe_financials(C, sample, universe):
     codes = sample[:2]
     for field in FINANCIAL_FIELDS:
         for report_type in ("announce_time", "report_time"):
@@ -207,19 +219,28 @@ def _probe_financials(C, sample):
                 lambda f=field, r=report_type: C.get_financial_data([f], codes, "20240101", "20261031", r),
             )
             if data is not None:
-                try:
-                    log(label + ".value", data.tail(3) if hasattr(data, "tail") else data)
-                except Exception as exc:
-                    log(label + ".value", "unprintable %s" % exc)
+                _describe(label, data)
                 break
+    single = _step(
+        "fin.single",
+        lambda: C.get_financial_data(["ASHAREINCOME.net_profit_excl_min_int_inc"], [codes[0]], "20200101", "20261031",
+                                     "announce_time"),
+    )
+    if single is not None:
+        _describe("fin.single", single)
     if hasattr(C, "get_raw_financial_data"):
-        _step(
-            "fin.raw",
-            lambda: log(
-                "fin.raw.value",
-                C.get_raw_financial_data(["Income.net_profit_excl_min_int_inc"], codes, "20240101", "20261031"),
-            ),
-        )
+        fields = ["ASHAREINCOME.net_profit_excl_min_int_inc", "ASHAREBALANCESHEET.tot_assets"]
+        raw = _step("fin.raw", lambda: C.get_raw_financial_data(fields, codes, "20200101", "20261031"))
+        if raw is not None:
+            log("fin.raw.value", raw)
+        if universe:
+            full = _step(
+                "fin.raw_universe",
+                lambda: C.get_raw_financial_data(fields, universe, "20200101", "20261031"),
+            )
+            if full is not None:
+                filled = [code for code in full if any(full[code].get(f) for f in fields)]
+                log("fin.raw_universe.codes_with_data", (len(filled), len(full)))
 
 
 def _probe_history_on_date(C, sample):

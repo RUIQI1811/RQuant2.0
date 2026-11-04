@@ -51,6 +51,9 @@ class FakeContext:
     def get_financial_data(self, fields, codes, start, end, report_type):
         raise KeyError(fields[0])
 
+    def get_raw_financial_data(self, fields, codes, start, end):
+        return {code: {field: ({"20250430": 1.0} if code == "600000.SH" else {}) for field in fields} for code in codes}
+
 
 def test_probe_is_ascii_and_python36_syntax() -> None:
     source = PROBE.read_bytes()
@@ -80,3 +83,4 @@ def test_probe_runs_against_a_fake_context(capsys) -> None:
     assert any(line.startswith("[RQ] score_speed.seconds=") for line in lines)
     assert "[RQ] universe.set=2" in lines
     assert "[RQ] hist.close.div0.codes=2" in lines
+    assert "[RQ] fin.raw_universe.codes_with_data=(1, 2)" in lines
