@@ -464,9 +464,18 @@ def test_live_buys_are_capped_at_a_slot_and_idle_money_tops_up_small_holdings(ca
                        {"A.SH": 1.0, "B.SH": 1.0, "C.SH": 1.0}, {"C.SH": True}, {})
     limits = {code: (11.0, 9.0) for code in ("A.SH", "B.SH", "C.SH")}
     sold = {"day": day, "limits": limits, "buys": [("B.SH", 10_000.0)], "sold": 0.0, "kept": {"A.SH": 100, "C.SH": 100},
-            "value_after": 2_000.0}
+            "value_after": 2_000.0, "capital": 100_000.0}
     names["live_buy"](None, sold, "1234567890", "RQ20110701")
     # Slot = (2,000 held + 98,000 budget) / 4 = 25,000: B gets one slot, not the 100,000 the backtest would give it.
     # The idle money then tops A up to a slot; C opened limit-up and is left alone.
     assert [(op, code, volume) for op, code, volume, _ in sent] == [(23, "B.SH", 2400), (23, "A.SH", 2300)]
     assert "[RQ] live.topup=A.SH 2300 shares" in capsys.readouterr().out
+
+
+def test_live_capital_zero_uses_the_whole_account(capsys) -> None:
+    context, names, _ = live_strategy(["20110701200000"], {"600002.SH": (300, 300)}, cash=230_000.0, dry_run=True)
+    names.update(LIVE_CAPITAL=0)
+    names["handlebar"](context)
+    out = capsys.readouterr().out
+    account = next(line for line in out.splitlines() if line.startswith("[RQ] live.account="))
+    assert account.endswith("budget 230000.00"), account

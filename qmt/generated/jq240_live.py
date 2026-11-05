@@ -1640,7 +1640,7 @@ def handlebar(C):
 # Set it to False in the QMT editor only after a dry run looks right. The account number stays in the QMT editor.
 LIVE_DRY_RUN = True
 LIVE_ACCOUNT = ""  # empty: the account selected for the strategy in QMT
-LIVE_CAPITAL = 150000.0  # the most the strategy may hold, holdings at market plus cash it spends
+LIVE_CAPITAL = 0  # the most the strategy may hold (holdings at market plus cash); 0 = all its holdings and cash
 LIVE_TOPK = 30
 LIVE_N_DROP = 3
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SH"])
@@ -1648,7 +1648,7 @@ LIVE_SELL_AT = "093005"
 LIVE_BUY_AT = "093025"
 LIVE_STOP_AT = "100000"
 LIVE_SLIP = 0.01  # limit price offset from the last price; capped at the daily limit
-LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (LIVE_CAPITAL / LIVE_TOPK)
+LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
 LIVE_TAG = "RQ"
 BUY_OP, SELL_OP, BY_SHARES, LIMIT_PRICE, RIGHT_AWAY = 23, 24, 1101, 11, 2
 _live = {"day": None, "planned": False, "plan": None, "sold": None, "done": False}
@@ -1753,7 +1753,8 @@ def live_sell(C, plan, account, tag):
     if sum(1 for code in plan["scores"].index if code in day.open) < 0.5 * len(plan["scores"]):
         return None  # the market has not opened
     value = sum(positions[code][0] * day.close[code] for code in held if day.close[code] == day.close[code])
-    budget = max(0.0, min(cash, LIVE_CAPITAL - value))
+    capital = LIVE_CAPITAL if LIVE_CAPITAL > 0 else cash + value
+    budget = max(0.0, min(cash, capital - value))
     log("live.account", "%s cash %.2f holdings %d value %.2f budget %.2f" % (
         masked(account), cash, len(held), value, budget))
     book = Book(budget, dict((code, float(positions[code][0])) for code in held),
@@ -1772,7 +1773,8 @@ def live_sell(C, plan, account, tag):
             if kept[code] <= 0:
                 kept.pop(code)
     value_after = sum(kept[code] * day.close[code] for code in kept if day.close[code] == day.close[code])
-    return {"day": day, "limits": limits, "buys": buys, "sold": sold, "kept": kept, "value_after": value_after}
+    return {"day": day, "limits": limits, "buys": buys, "sold": sold, "kept": kept, "value_after": value_after,
+            "capital": capital}
 
 
 def _lots(shares):
@@ -1787,9 +1789,9 @@ def live_buy(C, sold, account, tag):
     if LIVE_DRY_RUN:
         cash += sold["sold"]  # nothing was really sold
     day, limits, kept = sold["day"], sold["limits"], sold["kept"]
-    budget = max(0.0, min(cash, LIVE_CAPITAL - sold["value_after"]))
+    budget = max(0.0, min(cash, sold["capital"] - sold["value_after"]))
     slot = (sold["value_after"] + budget) / LIVE_TOPK
-    ceiling = LIVE_MAX_ORDER * LIVE_CAPITAL / LIVE_TOPK
+    ceiling = LIVE_MAX_ORDER * sold["capital"] / LIVE_TOPK
 
     def price_of(code):
         return min(limits[code][0], round(day.close[code] * (1 + LIVE_SLIP), 2))
