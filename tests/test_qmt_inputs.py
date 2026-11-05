@@ -266,7 +266,7 @@ def test_parity_strategy_scores_with_an_exported_model(capsys) -> None:
     assert any(line.startswith("[RQ] score.model=fake year=2010") for line in lines)
 
 
-def test_paper_strategy_replays_the_book_and_plans_the_next_open(capsys) -> None:
+def paper_strategy(now: str) -> tuple[object, dict]:
     context, _ = built()
     names: dict = {}
     source = build_jq240.build_strategy(build_jq240.PAPER_PARTS)
@@ -275,16 +275,22 @@ def test_paper_strategy_replays_the_book_and_plans_the_next_open(capsys) -> None
     names.update(
         MARKET_MIN_STOCKS=1, PAPER_DAYS=DAYS, PAPER_START="20110601", PAPER_CAPITAL=100_000.0, PAPER_TOPK=2,
         PAPER_N_DROP=1,
-        beijing_today=lambda: END,
+        beijing_now=lambda: now,
         MODEL={"run": "fake", "prediction_year": 2011, "fit_period": ["2010-01-01", "2010-12-31"],
                "features": features, "mean": [0.0] * 233, "std": [1.0] * 233,
                "trees": [{"feature": [0], "threshold": [0.0], "left": [~0], "right": [~1], "leaf": [-1.0, 1.0]}]},
     )
+    return context, names
+
+
+def test_paper_strategy_replays_the_book_and_plans_the_next_open(capsys) -> None:
+    context, names = paper_strategy(END + "1600")
     names["init"](context)
     names["handlebar"](context)
     lines = capsys.readouterr().out.splitlines()
     assert "[RQ] paper=end" in lines and not any("error" in line.lower() for line in lines), lines[-5:]
     assert "[RQ] paper.data_through=20110630" in lines
+    assert not any(line.startswith("[RQ] paper.skipped_days=") for line in lines)
     trading_days = CALENDAR[(CALENDAR > "2011-06-01") & (CALENDAR <= "2011-06-30")]
     navs = [line for line in lines if line.startswith("[RQ] paper.nav.")]
     assert len(navs) == len(trading_days)
@@ -294,3 +300,29 @@ def test_paper_strategy_replays_the_book_and_plans_the_next_open(capsys) -> None
     value = float(next(line for line in lines if line.startswith("[RQ] paper.value=")).split("=")[1].split()[0])
     assert 50_000 < value < 200_000
     assert any(line.startswith("[RQ] paper.top2=") for line in lines)
+
+
+def test_paper_strategy_leaves_out_a_session_still_open(capsys) -> None:
+    context, names = paper_strategy(END + "1424")
+    names["init"](context)
+    names["handlebar"](context)
+    lines = capsys.readouterr().out.splitlines()
+    assert "[RQ] paper=end" in lines and not any("error" in line.lower() for line in lines), lines[-5:]
+    assert "[RQ] paper.data_through=20110629" in lines
+    assert any(line.startswith("[RQ] paper.skipped_days=20110630 ") for line in lines)
+    assert not any(line.startswith("[RQ] paper.nav.20110630=") for line in lines)
+    assert any(line.startswith("[RQ] paper.next.buy=") or line.startswith("[RQ] paper.next.sell=")
+               or line.startswith("[RQ] paper.next.backups=") for line in lines)
+
+
+def test_complete_days_drops_days_without_daily_bars() -> None:
+    _, names = paper_strategy(END + "1600")
+    dates = pd.DatetimeIndex(["2026-11-03", "2026-11-04", "2026-11-05"])
+    close = pd.DataFrame({"600000.SH": [10.0, 10.5, np.nan], "600004.SH": [np.nan, 8.0, np.nan]}, index=dates)
+    complete = names["complete_days"]
+    # QMT lists today before its daily bars arrive: even after 15:00 a day with no close at all is left out.
+    assert list(complete({"close": close}, "202611051600")) == list(dates[:2])
+    assert list(complete({"close": close}, "202611060900")) == list(dates[:2])
+    full = close.fillna(9.0)
+    assert list(complete({"close": full}, "202611051459")) == list(dates[:2])
+    assert list(complete({"close": full}, "202611051500")) == list(dates)

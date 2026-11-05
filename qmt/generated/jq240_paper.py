@@ -1437,8 +1437,19 @@ def log(key, value=""):
     print("%s %s=%s" % (TAG, key, value))
 
 
-def beijing_today():
-    return time.strftime("%Y%m%d", time.gmtime(time.time() + 8 * 3600))
+def beijing_now():
+    """Beijing wall-clock time as YYYYMMDDHHMM."""
+    return time.strftime("%Y%m%d%H%M", time.gmtime(time.time() + 8 * 3600))
+
+
+def complete_days(inputs, now):
+    """Trading days with finished daily bars: a day with no close for any stock (QMT lists today in the calendar
+    before its daily bars arrive) is dropped, and so is today while its session is still open (before 15:00)."""
+    close = inputs["close"]
+    dates = close.index[close.notna().any(axis=1).values]
+    if len(dates) and dates[-1] == pd.Timestamp(now[:8]) and now[8:] < "1500":
+        dates = dates[:-1]
+    return dates
 
 
 def limit_price(pre_close, pct):
@@ -1499,9 +1510,17 @@ def _shares(book, code, factor):
 
 def run_paper(C):
     began = time.time()
-    end = beijing_today()
-    inputs = build_inputs(C, end, PAPER_DAYS, log)
-    dates = inputs["close"].index
+    now = beijing_now()
+    inputs = build_inputs(C, now[:8], PAPER_DAYS, log)
+    listed = inputs["close"].index
+    dates = complete_days(inputs, now)
+    if not len(dates):
+        log("paper.error", "no trading day with daily bars")
+        return
+    skipped = listed[listed > dates[-1]]
+    if len(skipped):
+        log("paper.skipped_days", "%s (session open or daily bars not in yet)" % ",".join(
+            day.strftime("%Y%m%d") for day in skipped))
     last = dates[-1]
     log("paper.data_through", last.strftime("%Y%m%d"))
     log("paper.model", "%s year=%s fit=%s" % (MODEL["run"], MODEL["prediction_year"], "..".join(MODEL["fit_period"])))
