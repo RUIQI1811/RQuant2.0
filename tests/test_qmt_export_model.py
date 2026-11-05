@@ -126,3 +126,28 @@ def test_lgb_numpy_is_python36_ascii() -> None:
     tree = ast.parse(source, feature_version=(3, 6))
     imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     assert imported == {"numpy"}
+
+
+def test_chunked_statistics_equal_the_whole_panel_fit(tmp_path: Path) -> None:
+    from rquant.qlib_ext.processors import ProcessInf, ZScoreNorm
+
+    store = tmp_path / "jq240"
+    rng = np.random.default_rng(5)
+    dates = pd.bdate_range("2023-01-02", "2023-06-30")
+    index = pd.MultiIndex.from_product([dates, [f"SH600{n:03d}" for n in range(30)]], names=["datetime", "instrument"])
+    names = [f"jq_{n:03d}" for n in range(1, 41)]
+    values = rng.normal(size=(len(index), len(names))) * rng.uniform(0.01, 1000, size=len(names))
+    values[rng.random(values.shape) < 0.05] = np.nan
+    values[rng.random(values.shape) < 0.003] = -np.inf
+    frame = pd.DataFrame(values, index=index, columns=names).reset_index()
+    (store / "year=2023").mkdir(parents=True)
+    frame.sample(frac=1.0, random_state=2).to_parquet(store / "year=2023" / "factors.parquet", index=False)
+
+    panel = export_model.load_panel(store, "2023-01-01", "2023-06-30", names)
+    ProcessInf()(panel)
+    whole = ZScoreNorm("2023-01-01", "2023-06-30")
+    whole.fit(panel)
+    rows = export_model.StoreRows(store, "2023-01-01", "2023-06-30")
+    mean, std = export_model.zscore_statistics(rows, "2023-01-01", "2023-06-30", names)
+    np.testing.assert_array_equal(mean, whole.mean_train)
+    np.testing.assert_array_equal(std, whole.std_train)

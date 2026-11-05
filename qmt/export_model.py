@@ -66,50 +66,80 @@ def store_columns(store: Path) -> list[str]:
     return [name for name in pq.ParquetFile(first).schema_arrow.names if name not in {"datetime", "instrument"}]
 
 
+class StoreRows:
+    """The store's rows dated in [start, end], in (datetime, instrument) order as KunQuantDataLoader sorts them."""
+
+    def __init__(self, store: Path, start: str, end: str) -> None:
+        first, last = pd.Timestamp(start), pd.Timestamp(end)
+        self.pieces = []
+        for path in sorted(store.glob("year=*/factors.parquet")):
+            year = int(path.parent.name.removeprefix("year="))
+            if year < first.year or year > last.year:
+                continue
+            keys = pd.read_parquet(path, columns=["datetime", "instrument"])
+            keys["datetime"] = pd.to_datetime(keys["datetime"])
+            keep = ((keys["datetime"] >= first) & (keys["datetime"] <= last)).to_numpy()
+            if keep.any():
+                self.pieces.append((path, keep, int(keep.sum())))
+                keys = keys[keep]
+                self.pieces[-1] += (keys,)
+        if not self.pieces:
+            raise ValueError(f"No store rows between {start} and {end} in {store}")
+        keys = pd.concat([piece[3] for piece in self.pieces], ignore_index=True)
+        self.order = np.lexsort((keys["instrument"].to_numpy(), keys["datetime"].to_numpy()))
+        self.index = pd.MultiIndex.from_arrays(
+            [keys["datetime"].to_numpy()[self.order], keys["instrument"].to_numpy()[self.order]],
+            names=["datetime", "instrument"],
+        )
+        for position, piece in enumerate(self.pieces):
+            self.pieces[position] = piece[:3]
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def frame(self, names: list[str]) -> pd.DataFrame:
+        """``names`` as one float32 column-major block (the store is float64; training rounds to float32)."""
+        import pyarrow.parquet as pq
+
+        block = np.empty((len(self.order), len(names)), dtype=np.float32, order="F")
+        offset = 0
+        for path, keep, count in self.pieces:
+            parquet = pq.ParquetFile(path)
+            for begin in range(0, len(names), 32):
+                chunk = names[begin : begin + 32]
+                table = parquet.read(columns=chunk)
+                for position, name in enumerate(chunk, begin):
+                    block[offset : offset + count, position] = table.column(name).to_numpy()[keep]
+                del table
+            offset += count
+        block = np.asfortranarray(block[self.order])
+        return pd.DataFrame(block, index=self.index, columns=names, copy=False)
+
+
 def load_panel(store: Path, start: str, end: str, names: list[str]) -> pd.DataFrame:
     """Rows of the store dated in [start, end] as one float32 column-major block, sorted by (datetime, instrument),
     as KunQuantDataLoader builds the training panel."""
-    import pyarrow.parquet as pq
-
-    first, last = pd.Timestamp(start), pd.Timestamp(end)
-    pieces = []
-    for path in sorted(store.glob("year=*/factors.parquet")):
-        year = int(path.parent.name.removeprefix("year="))
-        if year < first.year or year > last.year:
-            continue
-        keys = pd.read_parquet(path, columns=["datetime", "instrument"])
-        keys["datetime"] = pd.to_datetime(keys["datetime"])
-        keep = ((keys["datetime"] >= first) & (keys["datetime"] <= last)).to_numpy()
-        if keep.any():
-            pieces.append((path, keep, keys[keep]))
-    if not pieces:
-        raise ValueError(f"No store rows between {start} and {end} in {store}")
-    keys = pd.concat([frame for _, _, frame in pieces], ignore_index=True)
-    order = np.lexsort((keys["instrument"].to_numpy(), keys["datetime"].to_numpy()))
-    block = np.empty((len(keys), len(names)), dtype=np.float32, order="F")
-    offset = 0
-    for path, keep, frame in pieces:
-        parquet = pq.ParquetFile(path)
-        for begin in range(0, len(names), 32):
-            chunk = names[begin : begin + 32]
-            table = parquet.read(columns=chunk)
-            for position, name in enumerate(chunk, begin):
-                block[offset : offset + len(frame), position] = table.column(name).to_numpy()[keep]
-        offset += len(frame)
-    block = np.asfortranarray(block[order])
-    index = pd.MultiIndex.from_arrays(
-        [keys["datetime"].to_numpy()[order], keys["instrument"].to_numpy()[order]], names=["datetime", "instrument"]
-    )
-    return pd.DataFrame(block, index=index, columns=names, copy=False)
+    return StoreRows(store, start, end).frame(names)
 
 
-def zscore_statistics(panel: pd.DataFrame, start: str, end: str) -> tuple[np.ndarray, np.ndarray]:
+def zscore_statistics(rows: StoreRows, start: str, end: str, names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """ProcessInf then ``ZScoreNorm.fit`` over the fit-period rows, 16 columns at a time.
+
+    ZScoreNorm already fits 16 columns at a time and ProcessInf works column by column, so loading the panel in the
+    same 16-column blocks gives the same statistics while holding about 1/15 of the panel in memory.
+    """
     from rquant.qlib_ext.processors import ProcessInf, ZScoreNorm
 
-    ProcessInf()(panel)
-    norm = ZScoreNorm(fit_start_time=start, fit_end_time=end)
-    norm.fit(panel)
-    return np.asarray(norm.mean_train, dtype=np.float32), np.asarray(norm.std_train, dtype=np.float32)
+    means, stds = [], []
+    for begin in range(0, len(names), 16):
+        panel = rows.frame(names[begin : begin + 16])
+        ProcessInf()(panel)
+        norm = ZScoreNorm(fit_start_time=start, fit_end_time=end)
+        norm.fit(panel)
+        means.append(np.asarray(norm.mean_train, dtype=np.float32))
+        stds.append(np.asarray(norm.std_train, dtype=np.float32))
+        del panel
+    return np.concatenate(means), np.concatenate(stds)
 
 
 def flat_trees(booster: Any) -> list[dict[str, list]]:
@@ -175,10 +205,10 @@ def export(run: Path, year: int, store: Path, day: str | None = None) -> dict[st
     if booster.num_feature() != len(names):
         raise ValueError(f"Booster has {booster.num_feature()} features, store {store} has {len(names)}")
     start, end = fit_period(window)
-    panel = load_panel(store, start, end, names)
-    mean, std = zscore_statistics(panel, start, end)
-    fitted_rows = len(panel)
-    del panel
+    rows = StoreRows(store, start, end)
+    mean, std = zscore_statistics(rows, start, end, names)
+    fitted_rows = len(rows)
+    del rows
     model = {
         "format": FORMAT,
         "run": run.name,
