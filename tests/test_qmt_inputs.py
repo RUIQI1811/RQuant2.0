@@ -326,3 +326,104 @@ def test_complete_days_drops_days_without_daily_bars() -> None:
     full = close.fillna(9.0)
     assert list(complete({"close": full}, "202611051459")) == list(dates[:2])
     assert list(complete({"close": full}, "202611051500")) == list(dates)
+
+
+class Row:
+    def __init__(self, **values) -> None:
+        self.__dict__.update(values)
+
+
+class LiveQMT(FakeQMT):
+    """FakeQMT plus live ticks: the next session opens 1% above the last close and trades 0.5% above it."""
+
+    def get_full_tick(self, codes):
+        ticks = {}
+        for code in codes:
+            if code in self.bars:
+                close = float(self.bars[code]["close"].iloc[-1])
+                ticks[code] = {"lastClose": close, "open": close * 1.01, "lastPrice": close * 1.005}
+        return ticks
+
+
+def live_strategy(clock: list[str], positions: dict, cash: float = 50_000.0, dry_run: bool = False):
+    context = LiveQMT()
+    names: dict = {}
+    source = build_jq240.build_strategy(build_jq240.LIVE_PARTS)
+    exec(compile(source, str(build_jq240.LIVE_OUTPUT), "exec"), names)  # noqa: S102 - our own generated file
+    sent: list[tuple] = []
+    orders: list[Row] = []
+
+    def get_trade_detail_data(account, kind, data):
+        assert account == "1234567890" and kind == "stock"
+        if data == "account":
+            return [Row(m_dAvailable=cash)]
+        if data == "position":
+            return [Row(m_strInstrumentID=code[:6], m_strExchangeID=code[7:], m_nVolume=shares, m_nCanUseVolume=free)
+                    for code, (shares, free) in positions.items()]
+        return orders
+
+    def passorder(op, kind, account, code, price_type, price, volume, name, quick, remark, ctx):
+        sent.append((op, code, volume, price))
+        orders.append(Row(m_strRemark=remark))
+
+    features = [f"jq_{ordinal:03d}" for ordinal in range(1, 234)]
+    names.update(
+        MARKET_MIN_STOCKS=1, PAPER_DAYS=DAYS, LIVE_TOPK=2, LIVE_N_DROP=1, LIVE_CAPITAL=100_000.0,
+        LIVE_DRY_RUN=dry_run, account="1234567890", beijing_clock=lambda: clock[0],
+        get_trade_detail_data=get_trade_detail_data, passorder=passorder,
+        MODEL={"run": "fake", "prediction_year": 2011, "fit_period": ["2010-01-01", "2010-12-31"],
+               "features": features, "mean": [0.0] * 233, "std": [1.0] * 233,
+               "trees": [{"feature": [0], "threshold": [0.0], "left": [~0], "right": [~1], "leaf": [-1.0, 1.0]}]},
+    )
+    return context, names, sent
+
+
+def test_live_strategy_sells_at_the_open_then_buys(capsys) -> None:
+    clock = ["20110701091500"]
+    # 600002 is an ST name, out of the universe, so it goes first; the SZ holding is not the strategy's.
+    context, names, sent = live_strategy(clock, {"600002.SH": (300, 300), "000001.SZ": (500, 500)})
+    names["init"](context)
+    names["handlebar"](context)  # plans, then waits for the open
+    assert sent == []
+    clock[0] = "20110701093010"
+    names["handlebar"](context)
+    assert [(op, code, volume) for op, code, volume, _ in sent] == [(24, "600002.SH", 300)]
+    clock[0] = "20110701093030"
+    names["handlebar"](context)
+    buys = [order for order in sent if order[0] == 23]
+    assert 1 <= len(buys) <= 2 and all(volume % 100 == 0 and volume > 0 for _, _, volume, _ in buys)
+    assert {code for _, code, _, _ in buys} <= {"600001.SH", "600003.SH", "600004.SH"}
+    # The buys spend no more than the cash on hand (the fake account does not credit the sale).
+    assert sum(volume * price for _, _, volume, price in buys) <= 50_000.0
+    count = len(sent)
+    names["handlebar"](context)
+    assert len(sent) == count
+    lines = capsys.readouterr().out.splitlines()
+    assert "[RQ] live.data_through=20110630" in lines and not any("error" in line for line in lines), lines[-8:]
+    assert not any("1234567890" in line for line in lines)
+
+
+def test_live_dry_run_prints_orders_and_sends_nothing(capsys) -> None:
+    context, names, sent = live_strategy(["20110701200000"], {}, cash=100_000.0, dry_run=True)
+    names["init"](context)
+    names["handlebar"](context)
+    lines = capsys.readouterr().out.splitlines()
+    assert sent == []
+    assert len([line for line in lines if line.startswith("[RQ] live.dry_buy=")]) == 2, lines[-8:]
+    assert "[RQ] live.done=dry run, nothing sent" in lines
+
+
+def test_live_strategy_refuses_stale_data_late_starts_and_repeats(capsys) -> None:
+    context, names, sent = live_strategy(["20110701093010"], {})
+    names["complete_days"] = lambda inputs, now: inputs["close"].index[:-1]
+    names["handlebar"](context)
+    assert sent == [] and "daily bars of 20110630 are missing" in capsys.readouterr().out
+
+    context, names, sent = live_strategy(["20110701100100"], {})
+    names["handlebar"](context)
+    assert sent == [] and "[RQ] live.skip=past 100000 Beijing time: no orders today" in capsys.readouterr().out
+
+    context, names, sent = live_strategy(["20110701093010"], {"600002.SH": (300, 300)})
+    names["get_trade_detail_data"]("1234567890", "stock", "order").append(Row(m_strRemark="RQ20110701"))
+    names["handlebar"](context)
+    assert sent == [] and "orders tagged RQ20110701 already sent today" in capsys.readouterr().out

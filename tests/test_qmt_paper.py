@@ -104,3 +104,12 @@ def test_paper_modules_are_python36_ascii() -> None:
         imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
         assert imported <= {"numpy", "pandas", "time", "traceback"}
         assert "passorder" not in source and "order_target" not in source
+
+
+def test_live_shell_is_python36_ascii_and_dry_by_default() -> None:
+    source = (ROOT / "qmt" / "runtime" / "live_shell.py").read_bytes().decode("ascii")
+    tree = ast.parse(source, feature_version=(3, 6))
+    assert not [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert "\nLIVE_DRY_RUN = True\n" in source and '\nLIVE_ACCOUNT = ""' in source
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    assert len([call for call in calls if getattr(call.func, "id", "") == "passorder"]) == 1

@@ -50,6 +50,9 @@ PAPER_PARTS = (
     ROOT / "qmt" / "runtime" / "paper_shell.py",
 )
 PAPER_OUTPUT = ROOT / "qmt" / "generated" / "jq240_paper.py"
+# The live strategy: the paper strategy's parts plus the live shell, whose init/handlebar replace the paper ones.
+LIVE_PARTS = PAPER_PARTS + (ROOT / "qmt" / "runtime" / "live_shell.py",)
+LIVE_OUTPUT = ROOT / "qmt" / "generated" / "jq240_live.py"
 DROPPED_CLASSES = {"JQ240Library", "StatementResults"}
 DROPPED_MODULES = {"__future__", "typing", "collections.abc", "importlib", "inspect", "pathlib"}
 
@@ -166,7 +169,8 @@ def model_literal(path: Path = MODEL_PATH) -> dict | None:
 
 def main() -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    outputs = ((OUTPUT, build()), (PARITY_OUTPUT, build_strategy()), (PAPER_OUTPUT, build_strategy(PAPER_PARTS)))
+    outputs = ((OUTPUT, build()), (PARITY_OUTPUT, build_strategy()), (PAPER_OUTPUT, build_strategy(PAPER_PARTS)),
+               (LIVE_OUTPUT, build_strategy(LIVE_PARTS)))
     for path, source in outputs:
         path.write_text(source, encoding="ascii")
         print(f"wrote {path.relative_to(ROOT)} ({path.stat().st_size} bytes)")
