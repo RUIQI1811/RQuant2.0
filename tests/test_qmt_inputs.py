@@ -427,3 +427,31 @@ def test_live_strategy_refuses_stale_data_late_starts_and_repeats(capsys) -> Non
     names["get_trade_detail_data"]("1234567890", "stock", "order").append(Row(m_strRemark="RQ20110701"))
     names["handlebar"](context)
     assert sent == [] and "orders tagged RQ20110701 already sent today" in capsys.readouterr().out
+
+
+def test_start_refreshes_recent_daily_bars(capsys) -> None:
+    context, names, _ = live_strategy(["20110701200000"], {}, dry_run=True)
+    fetched: list[tuple] = []
+
+    def batch(codes, period, start, end):
+        raise RuntimeError("not supported")
+
+    names.update(download_history_data2=batch, download_history_data=lambda *args: fetched.append(args))
+    names["download_recent_bars"](context)
+    assert ("000300.SH", "1d") in {(code, period) for code, period, _, _ in fetched}
+    assert len(fetched) == len(set(context.get_stock_list_in_sector("")) | {"000300.SH"})
+    assert all(len(start) == 8 and end == "" for _, _, start, end in fetched)
+    out = capsys.readouterr().out
+    assert "[RQ] download.batch_error=RuntimeError: not supported" in out and "[RQ] download.bars=from " in out
+
+
+def test_live_strategy_left_running_plans_again_each_day(capsys) -> None:
+    clock = ["20110701200000"]
+    context, names, _ = live_strategy(clock, {}, cash=100_000.0, dry_run=True)
+    names["handlebar"](context)
+    names["handlebar"](context)
+    clock[0] = "20110702200000"
+    names["handlebar"](context)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines.count("[RQ] live.done=dry run, nothing sent") == 2
+    assert len([line for line in lines if line.startswith("[RQ] live.plan_seconds=")]) == 2

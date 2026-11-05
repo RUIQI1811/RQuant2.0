@@ -11,6 +11,8 @@ PAPER_TOPK = 30
 PAPER_N_DROP = 3
 PAPER_BACKUPS = 5
 PAPER_DAYS = 1100
+DOWNLOAD_DAYS = 15  # calendar days of daily bars to refresh through QMT's own data service on start; 0 = off
+DOWNLOAD_SECONDS = 600
 TAG = "[RQ]"
 _state = {"done": False}
 
@@ -22,6 +24,38 @@ def log(key, value=""):
 def beijing_now():
     """Beijing wall-clock time as YYYYMMDDHHMM."""
     return time.strftime("%Y%m%d%H%M", time.gmtime(time.time() + 8 * 3600))
+
+
+def download_recent_bars(C):
+    """Ask QMT to fetch the last DOWNLOAD_DAYS of daily bars (the same as its data manager's download) for every
+    A share and the calendar index, so that the last session's bars are in before scoring."""
+    if DOWNLOAD_DAYS <= 0:
+        return
+    many, one = globals().get("download_history_data2"), globals().get("download_history_data")
+    if many is None and one is None:
+        log("download.skip", "this QMT has no download_history_data")
+        return
+    began = time.time()
+    start = time.strftime("%Y%m%d", time.gmtime(time.time() + 8 * 3600 - DOWNLOAD_DAYS * 86400))
+    codes = sorted(set(C.get_stock_list_in_sector(SECTOR_ALL_A)) | set([CALENDAR_CODE]))
+    failed = 0
+    if many is not None:
+        try:
+            many(codes, "1d", start, "")
+            codes = []
+        except Exception:
+            log("download.batch_error", traceback.format_exc().splitlines()[-1])
+            if one is None:
+                return
+    for position, code in enumerate(codes):
+        if time.time() - began > DOWNLOAD_SECONDS:
+            log("download.stopped", "after %d of %d codes" % (position, len(codes)))
+            break
+        try:
+            one(code, "1d", start, "")
+        except Exception:
+            failed += 1
+    log("download.bars", "from %s, %d failed, %.1f s" % (start, failed, time.time() - began))
 
 
 def complete_days(inputs, now):
@@ -92,6 +126,7 @@ def _shares(book, code, factor):
 
 def run_paper(C):
     began = time.time()
+    download_recent_bars(C)
     now = beijing_now()
     inputs = build_inputs(C, now[:8], PAPER_DAYS, log)
     listed = inputs["close"].index

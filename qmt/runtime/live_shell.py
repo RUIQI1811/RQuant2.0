@@ -1,7 +1,8 @@
 # jq240 + LightGBM live trading inside QMT (run in QMT's live-trading mode with the account selected).
 #
-# Start it each trading day before 09:15 Beijing time. On the first bar it scores sh_main with the last finished
-# session's data (about 8 minutes). At 09:30:05 it reads the account, decides like the backtest's TopkDropoutStrategy
+# Start it before 09:15 Beijing time and leave it running; each Beijing day it plans afresh. On the day's first bar
+# it refreshes recent daily bars and scores sh_main with the last finished session's data (several minutes, so start
+# by 09:00). At 09:30:05 it reads the account, decides like the backtest's TopkDropoutStrategy
 # (top LIVE_TOPK, drop at most LIVE_N_DROP a day) against the real holdings and the real open, and sends the sells; at
 # 09:30:25 it sends the buys with the cash then available. Orders are marketable limit orders. It trades at most once
 # a day and never after LIVE_STOP_AT.
@@ -21,7 +22,7 @@ LIVE_SLIP = 0.01  # limit price offset from the last price; capped at the daily 
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (LIVE_CAPITAL / LIVE_TOPK)
 LIVE_TAG = "RQ"
 BUY_OP, SELL_OP, BY_SHARES, LIMIT_PRICE, RIGHT_AWAY = 23, 24, 1101, 11, 2
-_live = {"planned": False, "plan": None, "sold": None, "done": False}
+_live = {"day": None, "planned": False, "plan": None, "sold": None, "done": False}
 
 
 def beijing_clock():
@@ -65,6 +66,7 @@ def sent_today(account, tag):
 def live_plan(C):
     """Scores of the last finished session, or None (logged) when the data is not current."""
     began = time.time()
+    download_recent_bars(C)
     clock = beijing_clock()
     inputs = build_inputs(C, clock[:8], PAPER_DAYS, log)
     listed = inputs["close"].index
@@ -199,7 +201,13 @@ def init(C):
 
 
 def handlebar(C):
-    if _live["done"] or not C.is_last_bar():
+    if not C.is_last_bar():
+        return
+    day = beijing_clock()[:8]
+    if _live["day"] != day:
+        # A new Beijing day: plan afresh, so a strategy left running trades each day on that day's plan.
+        _live.update(day=day, planned=False, plan=None, sold=None, done=False)
+    if _live["done"]:
         return
     if not _live["planned"]:
         _live["planned"] = True
