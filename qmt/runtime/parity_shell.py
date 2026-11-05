@@ -6,6 +6,7 @@ import traceback
 AS_OF = "20261021"
 DAYS = 1100
 PER_LINE = 200
+TOP_N = 30
 TAG = "[RQ]"
 _state = {"done": False}
 
@@ -66,6 +67,7 @@ def run_parity(C):
     log("parity.date", inputs["close"].index[-1].strftime("%Y%m%d"))
     for first in range(0, len(codes), PER_LINE):
         log("parity.codes.%d" % (first // PER_LINE), ",".join(codes[first:first + PER_LINE]))
+    last = {}
     for ordinal, name in enumerate(JQ240_NAMES, 1):
         key = "parity.jq_%03d" % ordinal
         try:
@@ -73,9 +75,29 @@ def run_parity(C):
         except Exception as exc:
             log(key, "ERROR %s: %r" % (type(exc).__name__, exc))
             continue
+        last["jq_%03d" % ordinal] = values
         for first in range(0, len(codes), PER_LINE):
             log("%s.%d" % (key, first // PER_LINE), ",".join(_number(v) for v in values[first:first + PER_LINE]))
     log("parity.seconds", round(time.time() - began, 2))
+    if MODEL is not None:
+        score_day(codes, last)
+
+
+def score_day(codes, last):
+    """Score the day's universe with the exported LightGBM window and print the scores and the top picks."""
+    prepared = prepare_model(MODEL)
+    missing = [name for name in prepared["features"] if name not in last]
+    if missing:
+        log("score.missing_factors", ",".join(missing))
+    nan = np.full(len(codes), np.nan)
+    matrix = np.column_stack([last.get(name, nan) for name in prepared["features"]])
+    scores = predict(prepared, normalise(matrix, prepared))
+    log("score.model", "%s year=%s fit=%s trees=%d" % (MODEL["run"], MODEL["prediction_year"],
+                                                        "..".join(MODEL["fit_period"]), len(prepared["trees"])))
+    for first in range(0, len(codes), PER_LINE):
+        log("score.%d" % (first // PER_LINE), ",".join("%.10g" % v for v in scores[first:first + PER_LINE]))
+    order = np.argsort(-scores, kind="mergesort")
+    log("score.top%d" % TOP_N, ",".join(codes[i] for i in order[:TOP_N]))
 
 
 def init(C):

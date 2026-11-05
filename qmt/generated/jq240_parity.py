@@ -669,6 +669,8 @@ def annual_trend(values, years=5):
     return np.where(complete, ratio(slope, scale), np.nan)
 
 
+MODEL = None
+
 # Tushare statement fields used by RQuant (rquant.data.contracts.FUNDAMENTAL_ENDPOINT_FIELDS) mapped to the QMT
 # built-in financial tables. Table and field names come from the QMT client's own definitions
 # (config/shareincome_new_1.ini, sharebalance_new_1.ini, cashflow_new_1.ini, captial_structure_1.ini).
@@ -1138,6 +1140,74 @@ def build_inputs(C, end, days, log=print, codes=None):
     log("inputs.seconds", round(time.time() - began, 2))
     return inputs
 
+# Score a walk-forward LightGBM window inside QMT, where lightgbm is not installed: the window's inference steps
+# (ProcessInf, ZScoreNorm with the fit-period statistics, Fillna 0) and the booster's trees, in numpy 1.19.
+# The model dict comes from qmt/export_model.py; it holds no code.
+import numpy as np
+
+
+def prepare_model(model):
+    """Turn the exported lists into numpy arrays once."""
+    trees = []
+    for tree in model["trees"]:
+        trees.append({
+            "feature": np.asarray(tree["feature"], dtype=np.int64),
+            "threshold": np.asarray(tree["threshold"], dtype=np.float64),
+            "left": np.asarray(tree["left"], dtype=np.int64),
+            "right": np.asarray(tree["right"], dtype=np.int64),
+            "leaf": np.asarray(tree["leaf"], dtype=np.float64),
+        })
+    return {
+        "features": list(model["features"]),
+        "mean": np.asarray(model["mean"], dtype=np.float32),
+        "std": np.asarray(model["std"], dtype=np.float32),
+        "trees": trees,
+    }
+
+
+def normalise(values, prepared):
+    """Rows x features factor values of one day -> the float32 matrix the booster was trained on.
+
+    +/-inf becomes the mean of the column's finite values that day (ProcessInf), then the fit-period z-score is applied
+    in single precision, as the training panel was, and missing values become 0 (Fillna).
+    """
+    block = np.array(values, dtype=np.float32)
+    infinite = np.isinf(block)
+    if infinite.any():
+        finite = np.where(infinite, np.nan, block)
+        for column in np.nonzero(infinite.any(axis=0))[0]:
+            kept = finite[:, column]
+            kept = kept[~np.isnan(kept)]
+            fill = kept.mean(dtype=np.float32) if len(kept) else np.float32(np.nan)
+            block[infinite[:, column], column] = fill
+    block = (block - prepared["mean"]) / prepared["std"]
+    block[np.isnan(block)] = 0
+    return block
+
+
+def predict(prepared, matrix):
+    """Sum of the trees' leaf values for each row of ``matrix`` (numerical splits, ``value <= threshold`` goes left).
+
+    Child indices >= 0 are internal nodes; a negative child c is leaf ~c. LightGBM compares in double precision, and
+    with missing type None it reads NaN as 0, which ``normalise`` has already done.
+    """
+    values = np.asarray(matrix, dtype=np.float64)
+    rows = np.arange(len(values))
+    total = np.zeros(len(values))
+    for tree in prepared["trees"]:
+        if len(tree["feature"]) == 0:
+            total += tree["leaf"][0]
+            continue
+        node = np.zeros(len(values), dtype=np.int64)
+        active = np.ones(len(values), dtype=bool)
+        while active.any():
+            current = node[active]
+            goes_left = values[rows[active], tree["feature"][current]] <= tree["threshold"][current]
+            node[active] = np.where(goes_left, tree["left"][current], tree["right"][current])
+            active = node >= 0
+        total += tree["leaf"][~node]
+    return total
+
 # jq240 parity run: computes every jq240 factor for sh_main as of AS_OF inside QMT and prints the last day's values,
 # to compare with the factor store RQuant built from Tushare on Windows. READ-ONLY: no orders, no files, no network.
 import time
@@ -1146,6 +1216,7 @@ import traceback
 AS_OF = "20261021"
 DAYS = 1100
 PER_LINE = 200
+TOP_N = 30
 TAG = "[RQ]"
 _state = {"done": False}
 
@@ -1206,6 +1277,7 @@ def run_parity(C):
     log("parity.date", inputs["close"].index[-1].strftime("%Y%m%d"))
     for first in range(0, len(codes), PER_LINE):
         log("parity.codes.%d" % (first // PER_LINE), ",".join(codes[first:first + PER_LINE]))
+    last = {}
     for ordinal, name in enumerate(JQ240_NAMES, 1):
         key = "parity.jq_%03d" % ordinal
         try:
@@ -1213,9 +1285,29 @@ def run_parity(C):
         except Exception as exc:
             log(key, "ERROR %s: %r" % (type(exc).__name__, exc))
             continue
+        last["jq_%03d" % ordinal] = values
         for first in range(0, len(codes), PER_LINE):
             log("%s.%d" % (key, first // PER_LINE), ",".join(_number(v) for v in values[first:first + PER_LINE]))
     log("parity.seconds", round(time.time() - began, 2))
+    if MODEL is not None:
+        score_day(codes, last)
+
+
+def score_day(codes, last):
+    """Score the day's universe with the exported LightGBM window and print the scores and the top picks."""
+    prepared = prepare_model(MODEL)
+    missing = [name for name in prepared["features"] if name not in last]
+    if missing:
+        log("score.missing_factors", ",".join(missing))
+    nan = np.full(len(codes), np.nan)
+    matrix = np.column_stack([last.get(name, nan) for name in prepared["features"]])
+    scores = predict(prepared, normalise(matrix, prepared))
+    log("score.model", "%s year=%s fit=%s trees=%d" % (MODEL["run"], MODEL["prediction_year"],
+                                                        "..".join(MODEL["fit_period"]), len(prepared["trees"])))
+    for first in range(0, len(codes), PER_LINE):
+        log("score.%d" % (first // PER_LINE), ",".join("%.10g" % v for v in scores[first:first + PER_LINE]))
+    order = np.argsort(-scores, kind="mergesort")
+    log("score.top%d" % TOP_N, ",".join(codes[i] for i in order[:TOP_N]))
 
 
 def init(C):

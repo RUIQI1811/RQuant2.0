@@ -78,7 +78,7 @@ class FakeQMT:
         fields = namespace()["STATEMENT_FIELDS"]
         targets = {t for endpoint in fields.values() for t in endpoint.values() if t and not t.startswith("CAPITAL")}
         for code in LISTED:
-            table = {t: {to_ms(q): float(rng.uniform(1e6, 1e8)) for q in quarters} for t in targets}
+            table = {t: {to_ms(q): float(rng.uniform(1e6, 1e8)) for q in quarters} for t in sorted(targets)}
             for offset, name in enumerate(("ASHAREINCOME", "ASHAREBALANCESHEET", "ASHARECASHFLOW")):
                 table[f"{name}.m_anntime"] = {to_ms(q): float(to_ms(q + pd.Timedelta(days=30 + offset)))
                                               for q in quarters}
@@ -239,3 +239,28 @@ def test_committed_strategy_is_current_and_python36() -> None:
     imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     assert imported <= {"numpy", "pandas", "time", "traceback"}
     assert "open(" not in source and "passorder" not in source and "order_" not in source
+
+
+def test_parity_strategy_scores_with_an_exported_model(capsys) -> None:
+    context, _ = built()
+    names = namespace()
+    features = [f"jq_{ordinal:03d}" for ordinal in range(1, 234)]
+    # One split on the first factor's z-score: above the mean scores 1, else -1.
+    model = {"run": "fake", "prediction_year": 2010, "fit_period": ["2009-01-01", "2009-12-31"],
+             "features": features, "mean": [0.0] * 233, "std": [1.0] * 233,
+             "trees": [{"feature": [0], "threshold": [0.0], "left": [~0], "right": [~1], "leaf": [-1.0, 1.0]}]}
+    saved = names["MODEL"], names["_state"]["done"]
+    names["MODEL"], names["_state"]["done"] = model, False
+    try:
+        names["handlebar"](context)
+    finally:
+        names["MODEL"], names["_state"]["done"] = saved
+    lines = capsys.readouterr().out.splitlines()
+    assert not any("error" in line.lower() for line in lines)
+    first = next(line for line in lines if line.startswith("[RQ] parity.jq_001.0="))
+    factor = [float(value) if value else np.nan for value in first.split("=", 1)[1].split(",")]
+    scores = next(line for line in lines if line.startswith("[RQ] score.0=")).split("=", 1)[1].split(",")
+    assert [float(value) for value in scores] == [1.0 if value > 0 else -1.0 for value in factor]
+    top = next(line for line in lines if line.startswith("[RQ] score.top30=")).split("=", 1)[1].split(",")
+    assert sorted(top) == ["600001.SH", "600003.SH", "600004.SH"]
+    assert any(line.startswith("[RQ] score.model=fake year=2010") for line in lines)
