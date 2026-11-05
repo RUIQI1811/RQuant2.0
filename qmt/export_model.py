@@ -70,49 +70,63 @@ class StoreRows:
     """The store's rows dated in [start, end], in (datetime, instrument) order as KunQuantDataLoader sorts them."""
 
     def __init__(self, store: Path, start: str, end: str) -> None:
-        first, last = pd.Timestamp(start), pd.Timestamp(end)
+        import pyarrow.parquet as pq
+
+        first, last = np.datetime64(pd.Timestamp(start)), np.datetime64(pd.Timestamp(end))
         self.pieces = []
+        dates, instruments = [], []
         for path in sorted(store.glob("year=*/factors.parquet")):
             year = int(path.parent.name.removeprefix("year="))
-            if year < first.year or year > last.year:
+            if year < pd.Timestamp(start).year or year > pd.Timestamp(end).year:
                 continue
-            keys = pd.read_parquet(path, columns=["datetime", "instrument"])
-            keys["datetime"] = pd.to_datetime(keys["datetime"])
-            keep = ((keys["datetime"] >= first) & (keys["datetime"] <= last)).to_numpy()
+            # Instruments as dictionary codes: millions of Python strings would cost far more than the factor blocks.
+            table = pq.read_table(path, columns=["datetime", "instrument"], read_dictionary=["instrument"])
+            day = table.column("datetime").to_numpy().astype("datetime64[ns]")
+            keep = (day >= first) & (day <= last)
             if keep.any():
                 self.pieces.append((path, keep, int(keep.sum())))
-                keys = keys[keep]
-                self.pieces[-1] += (keys,)
+                dates.append(day[keep])
+                code = table.column("instrument").combine_chunks()
+                names = np.asarray(code.dictionary.to_pylist(), dtype=object)
+                instruments.append(names[code.indices.to_numpy()[keep]])
+            del table
         if not self.pieces:
             raise ValueError(f"No store rows between {start} and {end} in {store}")
-        keys = pd.concat([piece[3] for piece in self.pieces], ignore_index=True)
-        self.order = np.lexsort((keys["instrument"].to_numpy(), keys["datetime"].to_numpy()))
+        day = np.concatenate(dates)
+        instrument = pd.Categorical(np.concatenate(instruments))
+        del dates, instruments
+        # Category codes follow the sorted instrument names, so sorting by code sorts by name.
+        self.order = np.lexsort((instrument.codes, day))
         self.index = pd.MultiIndex.from_arrays(
-            [keys["datetime"].to_numpy()[self.order], keys["instrument"].to_numpy()[self.order]],
-            names=["datetime", "instrument"],
+            [day[self.order], instrument[self.order]], names=["datetime", "instrument"]
         )
-        for position, piece in enumerate(self.pieces):
-            self.pieces[position] = piece[:3]
 
     def __len__(self) -> int:
         return len(self.index)
 
     def frame(self, names: list[str]) -> pd.DataFrame:
-        """``names`` as one float32 column-major block (the store is float64; training rounds to float32)."""
+        """``names`` as one float32 column-major block (the store is float64; training rounds to float32).
+
+        Read one column at a time through the system allocator: Arrow's default pool keeps decoded pages after they
+        are freed, which on a 16 GB machine is the difference between fitting and not.
+        """
+        import pyarrow
         import pyarrow.parquet as pq
 
         block = np.empty((len(self.order), len(names)), dtype=np.float32, order="F")
-        offset = 0
-        for path, keep, count in self.pieces:
-            parquet = pq.ParquetFile(path)
-            for begin in range(0, len(names), 32):
-                chunk = names[begin : begin + 32]
-                table = parquet.read(columns=chunk)
-                for position, name in enumerate(chunk, begin):
-                    block[offset : offset + count, position] = table.column(name).to_numpy()[keep]
-                del table
-            offset += count
-        block = np.asfortranarray(block[self.order])
+        column = np.empty(len(self.order), dtype=np.float32)
+        previous = pyarrow.default_memory_pool()
+        pyarrow.set_memory_pool(pyarrow.system_memory_pool())
+        try:
+            files = [(pq.ParquetFile(path), keep, count) for path, keep, count in self.pieces]
+            for position, name in enumerate(names):
+                offset = 0
+                for parquet, keep, count in files:
+                    column[offset : offset + count] = parquet.read(columns=[name]).column(0).to_numpy()[keep]
+                    offset += count
+                block[:, position] = column[self.order]
+        finally:
+            pyarrow.set_memory_pool(previous)
         return pd.DataFrame(block, index=self.index, columns=names, copy=False)
 
 
