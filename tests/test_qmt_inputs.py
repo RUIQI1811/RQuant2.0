@@ -455,3 +455,18 @@ def test_live_strategy_left_running_plans_again_each_day(capsys) -> None:
     lines = capsys.readouterr().out.splitlines()
     assert lines.count("[RQ] live.done=dry run, nothing sent") == 2
     assert len([line for line in lines if line.startswith("[RQ] live.plan_seconds=")]) == 2
+
+
+def test_live_buys_are_capped_at_a_slot_and_idle_money_tops_up_small_holdings(capsys) -> None:
+    _, names, sent = live_strategy(["20110701093030"], {}, cash=99_000.0)
+    names.update(LIVE_TOPK=4)
+    day = names["Day"](None, {"A.SH": 10.0, "B.SH": 10.0, "C.SH": 10.0}, {"A.SH": 10.0, "B.SH": 10.0, "C.SH": 10.0},
+                       {"A.SH": 1.0, "B.SH": 1.0, "C.SH": 1.0}, {"C.SH": True}, {})
+    limits = {code: (11.0, 9.0) for code in ("A.SH", "B.SH", "C.SH")}
+    sold = {"day": day, "limits": limits, "buys": [("B.SH", 10_000.0)], "sold": 0.0, "kept": {"A.SH": 100, "C.SH": 100},
+            "value_after": 2_000.0}
+    names["live_buy"](None, sold, "1234567890", "RQ20110701")
+    # Slot = (2,000 held + 98,000 budget) / 4 = 25,000: B gets one slot, not the 100,000 the backtest would give it.
+    # The idle money then tops A up to a slot; C opened limit-up and is left alone.
+    assert [(op, code, volume) for op, code, volume, _ in sent] == [(23, "B.SH", 2400), (23, "A.SH", 2300)]
+    assert "[RQ] live.topup=A.SH 2300 shares" in capsys.readouterr().out
