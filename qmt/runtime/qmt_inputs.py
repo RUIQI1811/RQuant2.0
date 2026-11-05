@@ -129,7 +129,8 @@ def canonical_factor(close, pre_close, traded):
 
 def price_panels(C, codes, dates, end, calendar):
     """Canonical and raw daily panels on ``dates``; days without a traded bar are missing."""
-    columns = {name: {} for name in ("open", "high", "low", "close", "volume", "amount", "raw_close", "raw_volume")}
+    columns = {name: {} for name in ("open", "high", "low", "close", "volume", "amount", "raw_close", "raw_volume",
+                                     "raw_open", "raw_pre_close", "factor")}
     for code, frame in _bar_frames(C, BAR_FIELDS, codes, DATA_START, end, calendar):
         traded = _traded(frame)
         factor = canonical_factor(frame["close"], frame["preClose"], traded)
@@ -145,6 +146,9 @@ def price_panels(C, codes, dates, end, calendar):
         columns["amount"][code] = pd.Series(raw["amount"], index=index)
         columns["raw_close"][code] = pd.Series(raw["close"], index=index)
         columns["raw_volume"][code] = pd.Series(raw["volume"] * 100.0, index=index)
+        columns["raw_open"][code] = pd.Series(raw["open"], index=index)
+        columns["raw_pre_close"][code] = pd.Series(np.asarray(frame["preClose"], dtype=float)[keep], index=index)
+        columns["factor"][code] = pd.Series(factor, index=index)
     return {name: pd.DataFrame(values).reindex(index=dates, columns=codes) for name, values in columns.items()}
 
 
@@ -325,7 +329,11 @@ def build_inputs(C, end, days, log=print, codes=None):
                          {code: details[code]["float"] for code in codes})
     raw_close = panels.pop("raw_close")
     raw_volume = panels.pop("raw_volume")
+    # What the paper book trades on; the factor calculator ignores it.
+    quotes = {name: panels.pop(name) for name in ("raw_open", "raw_pre_close", "factor")}
+    quotes["st"] = set(code for code in codes if u"ST" in details[code]["name"].upper())
     inputs = dict(panels)
+    inputs["quotes"] = quotes
     inputs["cap"] = raw_close * total
     inputs["basic_close"] = raw_close
     inputs["basic_total_share"] = total.where(raw_close.notna())

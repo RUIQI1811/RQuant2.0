@@ -38,6 +38,41 @@
 - QMT 装在 `Program Files` 下时，非管理员身份无法保存或编译改过的策略。
 - 国金 2026-10-24 的通知说，2.1.33.0 版客户端支持 Python 3.12。下一步先拿这个版本，确认它是否自带 numpy 和 pandas。
 
+## 模型导出与打分（`export_model.py`、`runtime/lgb_numpy.py`）
+
+QMT 里没有 lightgbm，所以把 walk-forward 某一年窗口的 LightGBM 导出成 JSON，在 QMT 里用 numpy 打分。
+
+- 在 Windows 上，从仓库根目录运行（需要 rquant 环境）：
+  `python qmt/export_model.py --run runs/walk-forward/<run> --year 2026 --store data/factors-sh_main/jq240 --out qmt_model_2026.json`
+- 导出文件包含因子名顺序、该窗口训练期的 ZScoreNorm 均值和标准差（按训练方式从因子库重新计算，每次 16 列，峰值约 1.1 GB），以及展平后的树。
+- 导出后会自检：用 numpy 给最后一天打分，再和 booster 以及回测保存的预测对比，两项都必须完全相同才打印 OK。
+- 把导出的 JSON 放到 `qmt/models/lgb_jq240_sh_main.json`，然后运行 `python qmt/build_jq240.py`，模型就会写进生成的策略。
+- 2026 年窗口（run `20261101T210410Z-aada1bdd`，训练期 2023-01-03..2025-12-30）只有 8 棵树，所以很多股票分数相同。
+
+## 一致性核对（`generated/jq240_parity.py`）
+
+在 QMT 里按 `AS_OF` 那一天计算全部 jq240 因子和模型打分，打印出来后与 Windows 因子库、回测预测比对。
+2026-10-21 的核对结果：QMT 算出的 top10、top20、top30、top50 和回测完全相同，96% 的分数逐位一致。
+QMT 没有折旧摊销数据，所以 EBITDA 实际等于 EBIT；营业总成本不含减值损失。这两个因子在模型里的重要性约为 0.1%。
+
+## 每日模拟盘（`generated/jq240_paper.py`，只打印，不下单）
+
+每天收盘后运行一次。脚本会计算从 `PAPER_START` 到最新交易日的每天打分，再用 `PAPER_CAPITAL` 现金从头重放模拟盘：
+top `PAPER_TOPK`、每天最多换 `PAPER_N_DROP` 只、次日开盘价成交、A 股佣金（最低 5 元）和印花税、100 股取整、
+停牌和开盘涨跌停不能成交。规则和 RQuant 回测里的 Qlib TopkDropoutStrategy 一致。
+持仓不需要存文件，每次运行时重新推算出来。
+
+日志里会打印：
+
+- `paper.fill.<日期>`：每天的模拟成交；
+- `paper.nav.<日期>`：每天的模拟盘净值；
+- `paper.hold`：当前持仓；
+- `paper.next.sell`、`paper.next.buy`：下一个开盘要卖和要买的股票（按今天收盘价估算股数）；
+- `paper.next.backups`：备选股票，用于计划买入的股票开盘涨停时替补。
+
+模拟盘逻辑和回测对比过：以 2026 年 189 个交易日为例，每天都从回测当天的真实持仓出发，用模拟盘逻辑计算成交和净值。
+所有不一致都出在同分股票先选哪一只上。Qlib 用不稳定排序，同分股票谁在前取决于 numpy 的版本；模拟盘改成同分时按股票代码排序。
+
 ## 后续步骤
 
 1. 根据探测结果，列出 jq240 中能用 QMT 数据算出来的因子，并离线回测“只用这些因子”的模型，量化损失多少。

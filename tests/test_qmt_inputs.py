@@ -264,3 +264,33 @@ def test_parity_strategy_scores_with_an_exported_model(capsys) -> None:
     top = next(line for line in lines if line.startswith("[RQ] score.top30=")).split("=", 1)[1].split(",")
     assert sorted(top) == ["600001.SH", "600003.SH", "600004.SH"]
     assert any(line.startswith("[RQ] score.model=fake year=2010") for line in lines)
+
+
+def test_paper_strategy_replays_the_book_and_plans_the_next_open(capsys) -> None:
+    context, _ = built()
+    names: dict = {}
+    source = build_jq240.build_strategy(build_jq240.PAPER_PARTS)
+    exec(compile(source, str(build_jq240.PAPER_OUTPUT), "exec"), names)  # noqa: S102 - our own generated file
+    features = [f"jq_{ordinal:03d}" for ordinal in range(1, 234)]
+    names.update(
+        MARKET_MIN_STOCKS=1, PAPER_DAYS=DAYS, PAPER_START="20110601", PAPER_CAPITAL=100_000.0, PAPER_TOPK=2,
+        PAPER_N_DROP=1,
+        beijing_today=lambda: END,
+        MODEL={"run": "fake", "prediction_year": 2011, "fit_period": ["2010-01-01", "2010-12-31"],
+               "features": features, "mean": [0.0] * 233, "std": [1.0] * 233,
+               "trees": [{"feature": [0], "threshold": [0.0], "left": [~0], "right": [~1], "leaf": [-1.0, 1.0]}]},
+    )
+    names["init"](context)
+    names["handlebar"](context)
+    lines = capsys.readouterr().out.splitlines()
+    assert "[RQ] paper=end" in lines and not any("error" in line.lower() for line in lines), lines[-5:]
+    assert "[RQ] paper.data_through=20110630" in lines
+    trading_days = CALENDAR[(CALENDAR > "2011-06-01") & (CALENDAR <= "2011-06-30")]
+    navs = [line for line in lines if line.startswith("[RQ] paper.nav.")]
+    assert len(navs) == len(trading_days)
+    assert any(line.startswith("[RQ] paper.fill.20110602=buy ") for line in lines)
+    holdings = [line for line in lines if line.startswith("[RQ] paper.hold=")]
+    assert 1 <= len(holdings) <= 2
+    value = float(next(line for line in lines if line.startswith("[RQ] paper.value=")).split("=")[1].split()[0])
+    assert 50_000 < value < 200_000
+    assert any(line.startswith("[RQ] paper.top2=") for line in lines)
