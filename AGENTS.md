@@ -2,6 +2,8 @@
 
 Codex 等 coding agent 会自动读取本文件。本仓库的完整 agent 规则在 `agent.md`，开始任何任务前先读它。
 
+- 项目当前进度（默认设置、回测结论、实盘状态、打开的 PR）在 `docs/PROJECT_STATUS.md`，开始任务前先读；
+  任务改变了其中任何一项时，在同一个 PR 里更新它。
 - 新增因子集（把论文或网上公开的因子库实现进来）：按 `docs/adding-factor-sets.md` 做。
 - 只在新分支上改，开 draft PR 交给用户审阅；不得推送 `main`，不得合并 PR，不得改写已有分支历史。
 - 所有因子库都用 KunQuant 实现，并通过 `src/rquant/factors/libraries/registry.py` 注册。
