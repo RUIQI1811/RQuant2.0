@@ -12,7 +12,8 @@ PAPER_N_DROP = 3
 PAPER_BACKUPS = 5
 PAPER_DAYS = 1100
 DOWNLOAD_DAYS = 10  # calendar days of daily bars to refresh through QMT's own data service on start; 0 = off
-DOWNLOAD_SECONDS = 600
+DOWNLOAD_SECONDS = 900  # cap for the codes the model scores (the calendar index and sh_main)
+DOWNLOAD_OTHERS_SECONDS = 120  # the other A shares feed only the market return: just this long, after the rest
 TAG = "[RQ]"
 _state = {"done": False}
 
@@ -26,40 +27,45 @@ def beijing_now():
     return time.strftime("%Y%m%d%H%M", time.gmtime(time.time() + 8 * 3600))
 
 
+def _download(one, codes, start, seconds, label):
+    began, failed = time.time(), 0
+    for position, code in enumerate(codes):
+        if time.time() - began > seconds:
+            log("download.stopped", "%s after %d of %d codes" % (label, position, len(codes)))
+            break
+        try:
+            one(code, "1d", start, "")
+        except Exception:
+            failed += 1
+    log("download.%s" % label, "%d codes, %d failed, %.1f s" % (len(codes), failed, time.time() - began))
+
+
 def download_recent_bars(C):
-    """Ask QMT to fetch the last DOWNLOAD_DAYS of daily bars (the same as its data manager's download) for every
-    A share and the calendar index, so that the last session's bars are in before scoring."""
+    """Ask QMT to fetch the last DOWNLOAD_DAYS of daily bars (the same as its data manager's download): all of the
+    calendar index and the sh_main stocks the model scores, then the other A shares (they only enter the market
+    return) for DOWNLOAD_OTHERS_SECONDS."""
     if DOWNLOAD_DAYS <= 0:
         return
     many, one = globals().get("download_history_data2"), globals().get("download_history_data")
     if many is None and one is None:
         log("download.skip", "this QMT has no download_history_data")
         return
-    began = time.time()
     start = time.strftime("%Y%m%d", time.gmtime(time.time() + 8 * 3600 - DOWNLOAD_DAYS * 86400))
-    # The calendar index and the sh_main stocks the model scores first; the other A shares (for the market return)
-    # only if time allows.
-    everything = set(C.get_stock_list_in_sector(SECTOR_ALL_A))
-    first = [CALENDAR_CODE] + sh_main_codes(C)
-    codes = first + sorted(everything - set(first))
-    failed = 0
+    needed = [CALENDAR_CODE] + sh_main_codes(C)
+    others = sorted(set(C.get_stock_list_in_sector(SECTOR_ALL_A)) - set(needed))
     if many is not None:
         try:
-            many(codes, "1d", start, "")
-            codes = []
+            many(needed + others, "1d", start, "")
+            log("download.batch", "%d codes from %s" % (len(needed) + len(others), start))
+            return
         except Exception:
             log("download.batch_error", traceback.format_exc().splitlines()[-1])
             if one is None:
                 return
-    for position, code in enumerate(codes):
-        if time.time() - began > DOWNLOAD_SECONDS:
-            log("download.stopped", "after %d of %d codes" % (position, len(codes)))
-            break
-        try:
-            one(code, "1d", start, "")
-        except Exception:
-            failed += 1
-    log("download.bars", "from %s, %d failed, %.1f s" % (start, failed, time.time() - began))
+    log("download.from", start)
+    _download(one, needed, start, DOWNLOAD_SECONDS, "needed")
+    if DOWNLOAD_OTHERS_SECONDS > 0:
+        _download(one, others, start, DOWNLOAD_OTHERS_SECONDS, "others")
 
 
 COMPLETE_SHARE = 0.9  # a latest day counts only when this share of the stocks of recent days have its bar

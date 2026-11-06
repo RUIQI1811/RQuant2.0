@@ -449,7 +449,18 @@ def test_start_refreshes_recent_daily_bars(capsys) -> None:
     assert len(fetched) == len(set(context.get_stock_list_in_sector("")) | {"000300.SH"})
     assert all(len(start) == 8 and end == "" for _, _, start, end in fetched)
     out = capsys.readouterr().out
-    assert "[RQ] download.batch_error=RuntimeError: not supported" in out and "[RQ] download.bars=from " in out
+    assert "[RQ] download.batch_error=RuntimeError: not supported" in out and "[RQ] download.needed=" in out
+    assert "[RQ] download.others=" in out
+
+
+def test_download_others_only_with_their_own_time(capsys) -> None:
+    context, names, _ = live_strategy(["20110701200000"], {}, dry_run=True)
+    fetched: list[str] = []
+    names.update(download_history_data=lambda code, *args: fetched.append(code), DOWNLOAD_OTHERS_SECONDS=0)
+    names["download_recent_bars"](context)
+    needed = ["000300.SH"] + names["sh_main_codes"](context)
+    assert fetched == needed
+    assert "download.others" not in capsys.readouterr().out
 
 
 def test_live_strategy_left_running_plans_again_each_day(capsys) -> None:
