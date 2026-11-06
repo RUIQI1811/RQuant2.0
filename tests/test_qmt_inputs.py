@@ -438,7 +438,8 @@ def test_start_refreshes_recent_daily_bars(capsys) -> None:
 
     names.update(download_history_data2=batch, download_history_data=lambda *args: fetched.append(args))
     names["download_recent_bars"](context)
-    assert ("000300.SH", "1d") in {(code, period) for code, period, _, _ in fetched}
+    order = [code for code, _, _, _ in fetched]
+    assert order[0] == "000300.SH" and order[1:4] == ["600001.SH", "600002.SH", "600003.SH"]
     assert len(fetched) == len(set(context.get_stock_list_in_sector("")) | {"000300.SH"})
     assert all(len(start) == 8 and end == "" for _, _, start, end in fetched)
     out = capsys.readouterr().out

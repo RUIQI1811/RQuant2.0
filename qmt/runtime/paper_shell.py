@@ -11,7 +11,7 @@ PAPER_TOPK = 30
 PAPER_N_DROP = 3
 PAPER_BACKUPS = 5
 PAPER_DAYS = 1100
-DOWNLOAD_DAYS = 15  # calendar days of daily bars to refresh through QMT's own data service on start; 0 = off
+DOWNLOAD_DAYS = 10  # calendar days of daily bars to refresh through QMT's own data service on start; 0 = off
 DOWNLOAD_SECONDS = 600
 TAG = "[RQ]"
 _state = {"done": False}
@@ -37,7 +37,11 @@ def download_recent_bars(C):
         return
     began = time.time()
     start = time.strftime("%Y%m%d", time.gmtime(time.time() + 8 * 3600 - DOWNLOAD_DAYS * 86400))
-    codes = sorted(set(C.get_stock_list_in_sector(SECTOR_ALL_A)) | set([CALENDAR_CODE]))
+    # The calendar index and the sh_main stocks the model scores first; the other A shares (for the market return)
+    # only if time allows.
+    everything = set(C.get_stock_list_in_sector(SECTOR_ALL_A))
+    first = [CALENDAR_CODE] + sh_main_codes(C)
+    codes = first + sorted(everything - set(first))
     failed = 0
     if many is not None:
         try:
