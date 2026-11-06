@@ -70,6 +70,8 @@ def live_plan(C):
     clock = beijing_clock()
     inputs = build_inputs(C, clock[:8], PAPER_DAYS, log)
     listed = inputs["close"].index
+    counts = inputs["close"].notna().sum(axis=1)
+    log("live.bars", ",".join("%s:%d" % (day.strftime("%Y%m%d"), counts[day]) for day in listed[-3:]))
     dates = complete_days(inputs, clock[:12])
     today = pd.Timestamp(clock[:8])
     if not len(dates):

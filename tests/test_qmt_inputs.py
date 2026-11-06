@@ -326,6 +326,12 @@ def test_complete_days_drops_days_without_daily_bars() -> None:
     full = close.fillna(9.0)
     assert list(complete({"close": full}, "202611051459")) == list(dates[:2])
     assert list(complete({"close": full}, "202611051500")) == list(dates)
+    # A download cut short: only some stocks have the latest bar, so that day is not complete yet.
+    partial = pd.DataFrame(9.0, index=dates, columns=[f"6000{n:02d}.SH" for n in range(20)])
+    partial.iloc[-1, 3:] = np.nan
+    assert list(complete({"close": partial}, "202611060900")) == list(dates[:2])
+    partial.iloc[-1, 3:-1] = 9.0
+    assert list(complete({"close": partial}, "202611060900")) == list(dates)
 
 
 class Row:

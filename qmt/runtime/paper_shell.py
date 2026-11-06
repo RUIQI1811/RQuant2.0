@@ -62,12 +62,19 @@ def download_recent_bars(C):
     log("download.bars", "from %s, %d failed, %.1f s" % (start, failed, time.time() - began))
 
 
+COMPLETE_SHARE = 0.9  # a latest day counts only when this share of the stocks of recent days have its bar
+
+
 def complete_days(inputs, now):
-    """Trading days with finished daily bars: a day with no close for any stock (QMT lists today in the calendar
-    before its daily bars arrive) is dropped, and so is today while its session is still open (before 15:00)."""
+    """Trading days with finished daily bars: today is dropped while its session is still open (before 15:00), and
+    so are latest days whose bars only some stocks have (QMT lists today in the calendar before its daily bars
+    arrive, and a download cut short leaves the rest of the stocks a day behind)."""
     close = inputs["close"]
-    dates = close.index[close.notna().any(axis=1).values]
+    counts = close.notna().sum(axis=1)
+    dates = close.index[(counts > 0).values]
     if len(dates) and dates[-1] == pd.Timestamp(now[:8]) and now[8:] < "1500":
+        dates = dates[:-1]
+    while len(dates) > 1 and counts[dates[-1]] < COMPLETE_SHARE * counts[dates[-11:-1]].max():
         dates = dates[:-1]
     return dates
 
