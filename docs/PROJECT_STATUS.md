@@ -1,6 +1,6 @@
 # RQuant2.0 项目进度（共享记忆）
 
-最后更新：2026-11-06（美西时间）。
+最后更新：2026-11-08（美西时间）。
 
 这份文件是 Claude 和 GPT/Codex 等 agent 共同读取的项目进度。规则见文末「怎么维护」。
 研究口径、目录职责和安全边界以 `agent.md` 为准；本文件只记录「现在做到哪了」。
@@ -12,8 +12,9 @@
 - Windows 笔记本（`D:\自己瞎搞\RQuant2.0`）常开在家，是唯一的计算机器：ROG Zephyrus G16，24 线程，16 GB 内存（焊死，不能加）。
   内存是瓶颈，用户开游戏或桌面应用时空闲常不足 1 GB。**任何运行前先看空闲内存**；神经网络、walk-forward、
   甚至 NN 的 pytest 都要至少 6 GB 空闲，否则会卡死。
-- Windows 主 checkout 停在分支 `codex/rquant-subagent-rules`，有大量未提交改动：**不要在那里切分支**。
-  跑某个 PR 的代码用 worktree + `PYTHONPATH=<worktree>\src` + `--root D:\自己瞎搞\RQuant2.0`。
+- Windows 主 checkout（`D:\自己瞎搞\RQuant2.0`）从 2026-11-08 起在 `main` 上。原来 `codex/rquant-subagent-rules` 上的未提交改动
+  已存成那个分支上的本地提交 `f0891dd`（没有推送）。其他旧 worktree（`.claude\worktrees`、`RQuant2.0-oap` 等）可能还有未提交改动，不要删。
+  跑某个未合并 PR 的代码用 worktree + `PYTHONPATH=<worktree>\src` + `--root D:\自己瞎搞\RQuant2.0`。
 - Mac 用来讨论和审阅，不跑重任务。
 - 用户在美西时间（UTC-8）。A 股时间是北京时间，两者相差 16 小时；给用户写时间时注明时区。
 - 用户用中文交流。
@@ -74,13 +75,14 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 
 | PR | 内容 | 状态 |
 | --- | --- | --- |
-| #29 | qlib 原生化：RollingGen + TrainerR + RollingEnsemble、qrun YAML、PortAnaRecord（年化按 252 天）、DoubleEnsemble、PyTorch 模型、`report --signal-only`、结构化风险模型 | 可以合并，等用户 |
 | #28 | QMT 实盘（探测、一致性核对、模拟盘、实盘策略） | 草稿，实盘在用 |
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |
 
-已合并的重要 PR：#22（oap_jq_cnc、默认因子集 jq240）、#23（`scripts/analysis/window_metrics.py`，从已保存的 run 算任意时间段指标）、
+已合并的重要 PR：#29（2026-11-08，qlib 原生化：walk-forward 用 RollingGen + TrainerR + RollingEnsemble，模型写成
+`src/rquant/workflow/workflows/` 下的 qrun YAML，报告用 PortAnaRecord、年化按 252 天；另有 DoubleEnsemble、qlib PyTorch 模型、
+`report --signal-only`、`report --strategy enhanced-indexing` 和结构化风险模型）、#30（本文件）、#22（oap_jq_cnc、默认因子集 jq240）、#23（`scripts/analysis/window_metrics.py`，从已保存的 run 算任意时间段指标）、
 #24（`AGENTS.md` 和 `docs/adding-factor-sets.md`）。
 
 ## 7. 其他结论
