@@ -74,6 +74,26 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
             "definitions": YEARLY_PERFORMANCE_DEFINITIONS,
             "years": _yearly_performance(pd, portfolio),
         }
+    signal_path = run_dir / "signal_analysis.json"
+    if signal_path.exists():
+        with signal_path.open("r", encoding="utf-8") as handle:
+            summary["signal_analysis"] = json.load(handle)
+    importance_path = run_dir / "feature_importance.parquet"
+    if importance_path.exists():
+        summary["feature_importance"] = _feature_importance_summary(pd, pd.read_parquet(importance_path))
+    optimizations_path = run_dir / "optimizations.parquet"
+    if optimizations_path.exists():
+        optimizations = pd.read_parquet(optimizations_path)
+        if not optimizations.empty:
+            summary["optimizations"] = {
+                column: float(optimizations[column].mean())
+                for column in ("universe", "holdings", "turnover", "active_share", "tracking_error")
+            } | {"rebalances": len(optimizations)}
+            if "solved" in optimizations:
+                summary["optimizations"]["unsolved"] = int((~optimizations["solved"].astype(bool)).sum())
+            if "max_industry_active" in optimizations:
+                summary["optimizations"]["max_industry_active"] = float(optimizations["max_industry_active"].max())
+                summary["optimizations"]["max_abs_size_active"] = float(optimizations["size_active"].abs().max())
     atomic_write_json(run_dir / "report.json", summary)
     markdown = [
         "# RQuant Research Report",
@@ -85,10 +105,35 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
         "",
     ]
     if "backtest" in summary:
-        markdown.extend(["## Portfolio backtest", ""])
-        for key, value in summary["backtest"].get("metrics", {}).items():
-            markdown.append(f"- {key}: {value}")
+        markdown.extend(_backtest_markdown(summary["backtest"]))
+    if "optimizations" in summary:
+        optimized = summary["optimizations"]
+        markdown.extend(
+            [
+                "## Portfolio optimisation",
+                "",
+                f"- Rebalances: {optimized['rebalances']}",
+                f"- Average universe: {optimized['universe']:.0f} stocks, holdings: {optimized['holdings']:.0f}",
+                f"- Average one-way turnover per rebalance: {optimized['turnover'] / 2:.2%}",
+                f"- Average active share: {optimized['active_share']:.2%}",
+                f"- Average ex-ante tracking error (annualised): {optimized['tracking_error']:.2%}",
+            ]
+        )
+        if "unsolved" in optimized:
+            markdown.append(
+                f"- Rebalances where the optimiser failed (held the current book, or the benchmark if empty): "
+                f"{optimized['unsolved']}"
+            )
+        if "max_industry_active" in optimized:
+            markdown.append(
+                f"- Largest active industry weight: {optimized['max_industry_active']:.2%}; largest active size "
+                f"exposure: {optimized['max_abs_size_active']:.3f} std"
+            )
         markdown.append("")
+    if "signal_analysis" in summary:
+        markdown.extend(_signal_markdown(summary["signal_analysis"]))
+    if "feature_importance" in summary:
+        markdown.extend(_importance_markdown(summary["feature_importance"]))
     if "yearly_performance" in summary:
         markdown.extend(
             [
@@ -126,6 +171,52 @@ def build_report(run_directory: str | Path) -> dict[str, Any]:
     markdown.extend(["## Limitations", "", *(f"- {item}" for item in summary["limitations"]), ""])
     (run_dir / "report.md").write_text("\n".join(markdown), encoding="utf-8")
     return summary
+
+
+METRIC_ROWS = (
+    ("Net return (return - cost)", "net_return", "net_return_compounded"),
+    ("Benchmark", "benchmark_return", "benchmark_return_compounded"),
+    ("Excess return with cost", "excess_return_with_cost", None),
+    ("Excess return without cost", "excess_return_without_cost", None),
+)
+
+
+def _backtest_markdown(backtest: dict[str, Any]) -> list[str]:
+    """The headline table of Qlib's risk_analysis: compounded annual return and NAV drawdown, the Sharpe (information)
+    ratio, and Qlib's default additive annual return and drawdown for comparison with Qlib's benchmarks."""
+    metrics = backtest.get("metrics", {})
+    lines = ["## Portfolio backtest", ""]
+    if not all(isinstance(value, dict) for value in metrics.values()):
+        lines.extend([*(f"- {key}: {value}" for key, value in metrics.items()), ""])
+        return lines
+
+    def cell(series: str | None, field: str, kind: str = "percent") -> str:
+        value = (metrics.get(series) or {}).get(field) if series else None
+        if value is None:
+            return "n/a"
+        return f"{value * 100:+.2f}%" if kind == "percent" else f"{value:.3f}"
+
+    lines.extend(
+        [
+            "qlib.contrib.evaluate.risk_analysis on daily returns, 252 trading days a year. Compounded columns use "
+            "mode `product` (NAV growth and NAV drawdown); the Sharpe ratio is the mean over the standard deviation of "
+            "daily returns times sqrt(252) (information ratio for excess returns); the Qlib-sum columns are Qlib's "
+            "default mode (mean daily return times 252, drawdown of the summed returns).",
+            "",
+            "| Series | Annual return | Max drawdown | Sharpe | Annual return (Qlib sum) | Max drawdown (Qlib sum) |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for label, additive, compounded in METRIC_ROWS:
+        if additive not in metrics:
+            continue
+        lines.append(
+            f"| {label} | {cell(compounded, 'annualized_return')} | {cell(compounded, 'max_drawdown')} | "
+            f"{cell(additive, 'information_ratio', 'ratio')} | {cell(additive, 'annualized_return')} | "
+            f"{cell(additive, 'max_drawdown')} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _yearly_performance(pd: Any, portfolio: Any) -> list[dict[str, Any]]:
@@ -182,6 +273,89 @@ def _yearly_performance(pd: Any, portfolio: Any) -> list[dict[str, Any]]:
         )
         previous_total_cost = total_cost
     return yearly
+
+
+IMPORTANCE_TOP = 30
+
+
+def _feature_importance_summary(pd: Any, frame: Any) -> dict[str, Any]:
+    """Average each factor's share of the total gain over the walk-forward years, highest first."""
+    required = {"prediction_year", "factor", "gain", "split", "gain_share"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise DataContractError(f"Feature importance columns are missing: {missing}")
+    years = int(frame["prediction_year"].nunique())
+    grouped = frame.groupby("factor", sort=False)
+    table = pd.DataFrame(
+        {
+            "mean_gain_share": grouped["gain_share"].sum() / years,
+            "years_used": grouped["split"].apply(lambda values: int((values > 0).sum())),
+        }
+    ).sort_values("mean_gain_share", ascending=False, kind="mergesort")
+    source_names = _source_names()
+    return {
+        "years": years,
+        "factors": int(len(table)),
+        "unused_factors": int((table["years_used"] == 0).sum()),
+        "top": [
+            {
+                "factor": str(name),
+                "source_name": source_names.get(str(name), str(name)),
+                "mean_gain_share": float(row.mean_gain_share),
+                "years_used": int(row.years_used),
+            }
+            for name, row in table.head(IMPORTANCE_TOP).iterrows()
+        ],
+    }
+
+
+def _source_names() -> dict[str, str]:
+    """Catalog column name (``jq_218``) to the factor's name in its source library (``single_day_VPT``)."""
+    from rquant.factors.catalog import get_catalog
+
+    return {spec.canonical_name: spec.source_name for spec in get_catalog().specs}
+
+
+def _signal_markdown(signal: dict[str, Any]) -> list[str]:
+    def value(number: Any, digits: int = 4) -> str:
+        return "n/a" if number is None else f"{number:.{digits}f}"
+
+    overall = signal["overall"]
+    lines = [
+        "## Prediction IC",
+        "",
+        f"Daily cross-sectional correlation between the score and the label `{signal['label']}`; ICIR is the mean "
+        "over the standard deviation of the daily values, not annualised.",
+        "",
+        "| Period | Days | IC | ICIR | Rank IC | Rank ICIR | Rank IC > 0 |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for label, row in (("All", overall), *((str(item["year"]), item) for item in signal["years"])):
+        lines.append(
+            f"| {label} | {row['days']} | {value(row['ic'])} | {value(row['ic_ir'], 3)} | {value(row['rank_ic'])} | "
+            f"{value(row['rank_ic_ir'], 3)} | {value(row['rank_ic_positive_ratio'], 2)} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _importance_markdown(importance: dict[str, Any]) -> list[str]:
+    lines = [
+        "## Feature importance",
+        "",
+        f"Share of the model's total split gain, averaged over {importance['years']} walk-forward years. "
+        f"{importance['unused_factors']} of {importance['factors']} factors were never split on.",
+        "",
+        "| Rank | Factor | Source name | Mean gain share | Years used |",
+        "| ---: | :--- | :--- | ---: | ---: |",
+    ]
+    for rank, row in enumerate(importance["top"], start=1):
+        source = row.get("source_name", row["factor"])
+        lines.append(
+            f"| {rank} | {row['factor']} | {source} | {row['mean_gain_share']:.2%} | {row['years_used']} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _format_percent(value: float) -> str:

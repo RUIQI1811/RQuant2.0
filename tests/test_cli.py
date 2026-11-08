@@ -5,7 +5,7 @@ import io
 import json
 import subprocess
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -28,12 +28,23 @@ class CliTests(unittest.TestCase):
             ["factors", "validate", "--factor-set", "wq_alpha101"],
             ["factors", "evaluate", "--factor-set", "oap_jq_cnc", "--horizon", "20d"],
             ["walk-forward", "--model", "lgb", "--horizon", "1d", "--factor-set", "oap_jq_cnc"],
+            ["walk-forward", "--model", "double-ensemble"],
+            ["walk-forward", "--workflow", "my_lgb.yaml", "--through", "2025-01-01"],
             ["report", "run-id"],
             ["rdagent", "export", "--mining-end", "2021-12-31"],
         ]
         for argv in cases:
             with self.subTest(argv=argv):
                 self.assertTrue(callable(parser.parse_args(argv).handler))
+
+    def test_walk_forward_takes_exactly_one_workflow(self) -> None:
+        parser = build_parser()
+        for argv in (
+            ["walk-forward", "--horizon", "1d"],
+            ["walk-forward", "--model", "lgb", "--workflow", "my_lgb.yaml"],
+        ):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                parser.parse_args(argv)
 
     def test_research_commands_have_run_categories(self) -> None:
         parser = build_parser()
@@ -84,6 +95,31 @@ class CliTests(unittest.TestCase):
             run_directory = Path(payload["run_directory"])
             self.assertEqual(0, code)
             self.assertEqual(paths.runs, run_directory.parent)
+
+    def test_report_strategy_flag_and_enhanced_indexing_options(self) -> None:
+        import yaml
+
+        from rquant.cli import _enhanced_indexing_options
+        from rquant.workflow.backtest import PortfolioConfig
+
+        args = build_parser().parse_args(["report", "run-id", "--strategy", "enhanced-indexing"])
+        self.assertEqual("enhanced-indexing", args.strategy)
+        self.assertIsNone(build_parser().parse_args(["report", "run-id"]).strategy)
+        self.assertTrue(build_parser().parse_args(["report", "run-id", "--signal-only"]).signal_only)
+        self.assertFalse(build_parser().parse_args(["report", "run-id"]).signal_only)
+        with (Path(__file__).resolve().parents[1] / "config" / "default.yaml").open("r", encoding="utf-8") as handle:
+            backtest = yaml.safe_load(handle)["backtest"]
+        self.assertEqual("topk-dropout", backtest["strategy"])
+        options = _enhanced_indexing_options(backtest["enhanced_indexing"])
+        config = PortfolioConfig(strategy="enhanced-indexing", **options)
+        self.assertEqual((240, 10, 0.2, 0.01), (
+            config.risk_lookback_days, config.risk_factors, config.turnover_limit, config.benchmark_deviation
+        ))
+        self.assertIsNone(_enhanced_indexing_options({"benchmark_deviation": None})["benchmark_deviation"])
+        with self.assertRaises(DataContractError):
+            _enhanced_indexing_options({"lambda": 1})
+        with self.assertRaises(ValueError):
+            PortfolioConfig(strategy="risk-parity")
 
     def test_report_run_resolution_prefers_categorized_directory(self) -> None:
         with TemporaryDirectory() as temporary:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,10 @@ from typing import Any
 from rquant.errors import DataContractError, DependencyError
 from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.exchange import AshareCostModel, AshareExchange
-from rquant.qlib_ext.runtime import qlib_init_kwargs
+from rquant.qlib_ext.loader import LABEL_EXPRESSIONS
+
+STRATEGIES = ("topk-dropout", "enhanced-indexing")
+RISK_MODELS = ("statistical", "structured")
 
 
 @dataclass(frozen=True)
@@ -27,6 +31,27 @@ class PortfolioConfig:
     # Trade only every `rebalance_days` trading days, counted from the first prediction date. With n_drop == topk each
     # rebalance replaces every holding that fell out of the latest top-K, so the book becomes that top-K.
     rebalance_days: int = 1
+    # "topk-dropout" holds the equal-weighted top K. "enhanced-indexing" weights the whole universe with Qlib's
+    # EnhancedIndexingOptimizer against the universe's float-cap index (rquant.qlib_ext.strategy); topk and n_drop are
+    # then unused.
+    strategy: str = "topk-dropout"
+    # "statistical": Qlib's StructuredCovEstimator (risk_factors PCA factors of past returns). "structured": Shenwan
+    # industries + CNE6 styles from the barra_cne6 factor store (rquant.qlib_ext.riskmodel), which the industry,
+    # size and style deviation limits apply to.
+    risk_model: str = "statistical"
+    risk_lookback_days: int = 240
+    risk_factors: int = 10
+    risk_half_life: float = 90.0
+    # Largest active weight per Shenwan level-1 industry, active size exposure (standard deviations) and active
+    # exposure to every other style; null removes a limit. Used by the structured risk model only.
+    industry_deviation: float | None = 0.03
+    size_deviation: float | None = 0.2
+    style_deviation: float | None = None
+    risk_aversion: float = 1.0
+    # Qlib's optimiser needs a number here; 2.0 (sell the whole book and buy a new one) leaves turnover unlimited.
+    turnover_limit: float = 0.2
+    benchmark_deviation: float | None = 0.01
+    risk_degree: float = 0.95
 
     def __post_init__(self) -> None:
         if self.topk < 1:
@@ -35,10 +60,35 @@ class PortfolioConfig:
             raise ValueError(f"n_drop must be between 1 and topk={self.topk}, got {self.n_drop}")
         if self.rebalance_days < 1:
             raise ValueError(f"rebalance_days must be at least 1, got {self.rebalance_days}")
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"strategy must be one of {STRATEGIES}, got {self.strategy}")
+        if self.risk_lookback_days < 2 or self.risk_factors < 1:
+            raise ValueError("risk_lookback_days must be at least 2 and risk_factors at least 1")
+        if self.risk_model not in RISK_MODELS:
+            raise ValueError(f"risk_model must be one of {RISK_MODELS}, got {self.risk_model}")
+        if self.risk_half_life <= 0:
+            raise ValueError(f"risk_half_life must be positive, got {self.risk_half_life}")
+        for name in ("industry_deviation", "size_deviation", "style_deviation"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must not be negative, got {value}")
+        if self.risk_aversion < 0:
+            raise ValueError(f"risk_aversion must not be negative, got {self.risk_aversion}")
+        if self.turnover_limit < 0:
+            raise ValueError(f"turnover_limit must not be negative, got {self.turnover_limit}")
+        if self.benchmark_deviation is not None and self.benchmark_deviation < 0:
+            raise ValueError(f"benchmark_deviation must not be negative, got {self.benchmark_deviation}")
+        if not 0 < self.risk_degree <= 1:
+            raise ValueError(f"risk_degree must be in (0, 1], got {self.risk_degree}")
 
 
 class PortfolioBacktestRunner:
-    """Run Qlib TopkDropoutStrategy on the saved out-of-sample predictions."""
+    """Backtest the saved out-of-sample predictions through Qlib's record templates.
+
+    The predictions (and, given the run's horizon, their labels) are saved as ``SignalRecord`` saves them, in a fresh
+    recorder under ``<run>/backtest_mlflow``; ``SigAnaRecord`` scores the signal, and ``PortAnaRecord`` runs the
+    backtest (TopkDropoutStrategy or EnhancedIndexingStrategy on the A-share exchange) and its ``risk_analysis``.
+    """
 
     def __init__(
         self,
@@ -46,49 +96,57 @@ class PortfolioBacktestRunner:
         qlib_root: str | Path,
         run_directory: str | Path,
         config: PortfolioConfig | None = None,
+        reference_root: str | Path | None = None,
+        horizon: str | None = None,
+        factor_root: str | Path | None = None,
     ) -> None:
+        """``horizon`` names the label the predictions were trained on; without it the signal is not scored.
+        ``reference_root`` is ``<canonical>/reference``; the structured risk model also reads the canonical bars next
+        to it and the barra_cne6 store under ``factor_root`` (the run universe's factor root)."""
         self.qlib_root = Path(qlib_root)
         self.run_directory = Path(run_directory)
         self.config = config or PortfolioConfig()
+        self.reference_root = Path(reference_root) if reference_root is not None else None
+        self.factor_root = Path(factor_root) if factor_root is not None else None
+        self.horizon = horizon
+        if self.config.strategy == "enhanced-indexing" and self.reference_root is None:
+            raise DataContractError("enhanced-indexing needs the reference data root for float market caps")
+        if self.config.strategy == "enhanced-indexing" and self.config.risk_model == "structured":
+            if self.factor_root is None:
+                raise DataContractError("The structured risk model needs the factor root holding barra_cne6")
+        if horizon is not None and horizon not in LABEL_EXPRESSIONS:
+            raise DataContractError(f"Unsupported horizon: {horizon}")
 
     def run(self) -> dict[str, Any]:
         qlib, pd, np = _dependencies()
-        predictions_path = self.run_directory / "predictions.parquet"
-        if not predictions_path.exists():
-            raise DataContractError(f"Predictions do not exist: {predictions_path}")
-        predictions = pd.read_parquet(predictions_path)
-        required = {"datetime", "instrument", "score"}
-        if not required.issubset(predictions.columns):
-            raise DataContractError(f"Prediction columns must include {sorted(required)}")
-        predictions = predictions.dropna(subset=["score"]).copy()
-        predictions["datetime"] = pd.to_datetime(predictions["datetime"])
-        if predictions.empty:
-            raise DataContractError("No finite predictions are available for backtesting")
-        if predictions.duplicated(["datetime", "instrument"]).any():
-            raise DataContractError("Predictions contain duplicate datetime/instrument rows")
+        predictions = load_predictions(pd, self.run_directory)
 
-        from qlib.backtest import backtest
-        from qlib.backtest.executor import SimulatorExecutor
         from qlib.constant import REG_CN
-        from qlib.contrib.strategy import TopkDropoutStrategy
+        from qlib.contrib.evaluate import risk_analysis
+        from qlib.workflow import R
+        from qlib.workflow.record_temp import PortAnaRecord
+
+        from rquant.qlib_ext.strategy import OptimizationLog, keep_rebalance_dates
+        from rquant.workflow.runner import init_run_tracking, release_run_tracking
+
+        store = self.run_directory / "backtest_mlflow"
+        # A fresh store on every report: a copied run directory would otherwise write into the original's artifacts.
+        if store.exists():
+            shutil.rmtree(store)
+        store.mkdir()
+        tracking_uri = init_run_tracking(
+            store, BACKTEST_EXPERIMENT, provider_uri=self.qlib_root, region=REG_CN, qlib_module=qlib
+        )
         from qlib.data import D
 
-        qlib.init(provider_uri=str(self.qlib_root), region=REG_CN, **qlib_init_kwargs())
         start_time = predictions["datetime"].min()
         signal_end = predictions["datetime"].max()
         later = D.calendar(start_time=signal_end, freq="day")
         end_time = next((value for value in later if pd.Timestamp(value) > signal_end), signal_end)
         signal = predictions.set_index(["datetime", "instrument"])["score"].sort_index()
-        rebalance_dates = _rebalance_dates(
-            pd,
-            D.calendar(start_time=start_time, end_time=signal_end, freq="day"),
-            self.config.rebalance_days,
+        signal_days = int(
+            keep_rebalance_dates(signal, self.config.rebalance_days).index.get_level_values("datetime").nunique()
         )
-        # Qlib strategies place no orders on a step whose previous day has no signal, so dropping the signal on
-        # non-rebalance days leaves the book untouched until the next rebalance.
-        signal = signal[signal.index.get_level_values("datetime").isin(rebalance_dates)]
-        if signal.empty:
-            raise DataContractError("No predictions fall on a rebalance date")
         cost_model = AshareCostModel(
             commission_rate=self.config.commission_rate,
             minimum_commission=self.config.minimum_commission,
@@ -107,31 +165,79 @@ class PortfolioBacktestRunner:
             trade_unit=self.config.trade_unit,
             impact_cost=self.config.impact_cost,
         )
-        strategy_class = _liquidating_strategy_class(TopkDropoutStrategy)
-        strategy = strategy_class(
-            signal=signal,
-            topk=self.config.topk,
-            n_drop=self.config.n_drop,
-            risk_degree=1.0,
-            hold_thresh=1,
-            only_tradable=True,
-            forbid_all_trade_at_limit=False,
-        )
-        executor_class = _zero_order_safe_executor_class(SimulatorExecutor)
-        executor = executor_class(time_per_step="day", generate_portfolio_metrics=True, verbose=False)
-        portfolio, indicators = backtest(
-            start_time=start_time,
-            end_time=end_time,
-            strategy=strategy,
-            executor=executor,
-            benchmark=self.config.benchmark,
-            account=self.config.initial_capital,
-            exchange_kwargs={"exchange": exchange},
-        )
-        if "1day" not in portfolio:
-            raise DataContractError(f"Qlib did not return daily portfolio metrics: {sorted(portfolio)}")
-        report, positions = portfolio["1day"]
-        indicator_frame, indicator_object = indicators["1day"]
+        optimization_log = OptimizationLog()
+        if self.config.strategy == "enhanced-indexing":
+            strategy_class = "LiquidatingEnhancedIndexingStrategy"
+            rebalance_dates = keep_rebalance_dates(signal, self.config.rebalance_days).index.get_level_values(
+                "datetime"
+            )
+            risk_data = self._risk_data(D, pd, predictions, start_time, end_time, rebalance_dates.unique())
+            optimizer_kwargs: dict[str, Any] = {
+                "lamb": self.config.risk_aversion,
+                "delta": self.config.turnover_limit,
+                "b_dev": self.config.benchmark_deviation,
+            }
+            if self.config.risk_model == "structured":
+                optimizer_kwargs["f_dev"] = risk_data.factor_deviation()
+            strategy_kwargs: dict[str, Any] = {
+                "risk_data": risk_data,
+                "optimizer_kwargs": optimizer_kwargs,
+                "optimization_log": optimization_log,
+                "risk_degree": self.config.risk_degree,
+            }
+        else:
+            strategy_class = "LiquidatingTopkDropoutStrategy"
+            strategy_kwargs = {
+                "topk": self.config.topk,
+                "n_drop": self.config.n_drop,
+                "risk_degree": 1.0,
+                "hold_thresh": 1,
+                "only_tradable": True,
+                "forbid_all_trade_at_limit": False,
+            }
+        port_analysis_config = {
+            "strategy": {
+                "class": strategy_class,
+                "module_path": "rquant.qlib_ext.strategy",
+                "kwargs": {"signal": "<PRED>", "rebalance_days": self.config.rebalance_days, **strategy_kwargs},
+            },
+            "executor": {
+                "class": "ZeroOrderSafeSimulatorExecutor",
+                "module_path": "rquant.qlib_ext.executor",
+                "kwargs": {"time_per_step": "day", "generate_portfolio_metrics": True, "verbose": False},
+            },
+            "backtest": {
+                "start_time": None,
+                "end_time": None,
+                "account": self.config.initial_capital,
+                "benchmark": self.config.benchmark,
+                "exchange_kwargs": {"exchange": exchange},
+            },
+        }
+        with R.start(experiment_name=BACKTEST_EXPERIMENT, recorder_name=self.config.strategy):
+            recorder = R.get_recorder()
+            # The artifacts SignalRecord saves; SigAnaRecord and PortAnaRecord read them back.
+            recorder.save_objects(**{"pred.pkl": signal.to_frame("score")})
+            signal_summary = None
+            if self.horizon is not None:
+                signal_summary = analyse_signal(recorder, signal, self.horizon, self.run_directory)
+            else:
+                # As in SignalRecord, a label that cannot be built (no horizon) is saved as None; nothing is scored.
+                recorder.save_objects(**{"label.pkl": None})
+            artifacts = PortAnaRecord(
+                recorder,
+                config=port_analysis_config,
+                risk_analysis_freq="day",
+                indicator_analysis_freq="day",
+            ).generate()
+            recorder_id = recorder.id
+        release_run_tracking(store)
+        if not artifacts or "report_normal_1day.pkl" not in artifacts:
+            raise DataContractError("Qlib's PortAnaRecord did not return daily portfolio metrics")
+        report = artifacts["report_normal_1day.pkl"]
+        positions = artifacts["positions_normal_1day.pkl"]
+        indicator_frame = artifacts["indicators_normal_1day.pkl"]
+        indicator_object = artifacts["indicators_normal_1day_obj.pkl"]
 
         portfolio_path = self.run_directory / "portfolio.parquet"
         report.reset_index().to_parquet(portfolio_path, index=False)
@@ -151,23 +257,33 @@ class PortfolioBacktestRunner:
             if abs(float(terminal_position.get_stock_amount(stock))) > 1e-12
         )
 
-        net_returns = report["return"].astype(float) - report["cost"].astype(float)
-        benchmark_returns = report["bench"].astype(float)
-        metrics = _metrics(np, net_returns, benchmark_returns)
+        optimizations_path = None
+        if self.config.strategy == "enhanced-indexing":
+            optimizations_path = self.run_directory / "optimizations.parquet"
+            columns = ["datetime", "universe", "solved", "holdings", "turnover", "active_share", "tracking_error"]
+            if self.config.risk_model == "structured":
+                columns += ["max_industry_active", "size_active"]
+            pd.DataFrame(optimization_log.rows, columns=columns).to_parquet(optimizations_path, index=False)
+
         manifest = {
             "status": "complete",
-            "engine": "qlib.backtest",
-            "strategy": "LiquidatingTopkDropoutStrategy",
+            "engine": "qlib.workflow.record_temp.PortAnaRecord",
+            "strategy": strategy_class,
             "start": str(pd.Timestamp(start_time).date()),
             "end": str(pd.Timestamp(end_time).date()),
             "config": asdict(self.config),
-            "signal_days": int(signal.index.get_level_values("datetime").nunique()),
+            "signal_days": signal_days,
             "constraints": {
                 "rebalance": _rebalance_description(self.config),
                 "deal_price": "next trading day open",
                 "long_only": True,
-                "equal_weight": True,
-                "t_plus_one": "TopkDropoutStrategy hold_thresh=1",
+                "equal_weight": self.config.strategy == "topk-dropout",
+                "weights": _weighting_description(self.config),
+                "t_plus_one": (
+                    "TopkDropoutStrategy hold_thresh=1"
+                    if self.config.strategy == "topk-dropout"
+                    else "daily steps: a stock bought at one open is sold at the earliest on the next"
+                ),
                 "suspension": "Qlib $close NaN",
                 "open_limit": "direction-aware $limit_buy/$limit_sell",
                 "market_impact": (
@@ -185,98 +301,239 @@ class PortfolioBacktestRunner:
             },
             "rows": len(report),
             "trade_rows": len(trades),
-            "metrics": metrics,
+            "metrics_definition": METRICS_DEFINITION,
+            "metrics": risk_metrics(risk_analysis, report),
+            "indicator_analysis": _indicator_analysis(artifacts.get("indicator_analysis_1day.pkl")),
+            "mlflow": {"tracking_uri": tracking_uri, "experiment": BACKTEST_EXPERIMENT, "recorder_id": recorder_id},
             "artifacts": {
                 "portfolio": sha256_file(portfolio_path),
                 "positions": sha256_file(holdings_path),
                 "trades": sha256_file(trades_path),
                 "trade_indicators": sha256_file(indicators_path),
+                **({"optimizations": sha256_file(optimizations_path)} if optimizations_path is not None else {}),
             },
         }
+        if signal_summary is not None:
+            manifest["signal"] = {key: signal_summary[key] for key in ("label", "overall")}
         atomic_write_json(self.run_directory / "backtest.json", manifest)
         return manifest
 
+    def _risk_data(
+        self, D: Any, pd: Any, predictions: Any, start_time: Any, end_time: Any, signal_dates: Any
+    ) -> Any:
+        """The risk model over every predicted instrument, from ``risk_lookback_days`` rows before the first signal
+        through the last trading day."""
+        from rquant.qlib_ext.strategy import RiskModelData, load_float_cap
 
-def _rebalance_dates(pd: Any, calendar: Any, every: int) -> Any:
-    """Return every `every`-th trading day of `calendar`, starting with its first day."""
-    return pd.DatetimeIndex(pd.to_datetime(list(calendar))[::every])
+        assert self.reference_root is not None
+        # The structured model needs `lookback` daily factor returns, so one more day of prices and exposures.
+        rows = self.config.risk_lookback_days + (1 if self.config.risk_model == "structured" else 0)
+        calendar = D.calendar(end_time=start_time, freq="day")
+        if len(calendar) < rows:
+            raise DataContractError(f"The provider calendar holds fewer than {rows} days before {start_time}")
+        history_start = calendar[-rows]
+        instruments = sorted(predictions["instrument"].unique())
+        quotes = D.features(instruments, ["$close", "$volume"], start_time=history_start, end_time=end_time, freq="day")
+        quotes.columns = ["close", "volume"]
+        close = quotes["close"].unstack(level="instrument").sort_index()
+        volume = quotes["volume"].unstack(level="instrument").sort_index()
+        float_cap = load_float_cap(self.reference_root, history_start, end_time, instruments)
+        if self.config.risk_model == "structured":
+            from rquant.qlib_ext.riskmodel import StructuredRiskModelData, load_barra_descriptors, load_sector
+
+            assert self.factor_root is not None
+            return StructuredRiskModelData(
+                close=close,
+                volume=volume,
+                float_cap=float_cap,
+                sector=load_sector(self.reference_root.parent / "bars", history_start, end_time, instruments),
+                descriptors=load_barra_descriptors(self.factor_root, history_start, end_time),
+                signal_dates=signal_dates,
+                lookback=self.config.risk_lookback_days,
+                half_life=self.config.risk_half_life,
+                industry_deviation=self.config.industry_deviation,
+                size_deviation=self.config.size_deviation,
+                style_deviation=self.config.style_deviation,
+            )
+        return RiskModelData(
+            close=close,
+            volume=volume,
+            float_cap=float_cap,
+            lookback=self.config.risk_lookback_days,
+            num_factors=self.config.risk_factors,
+        )
+
+
+class SignalAnalysisRunner:
+    """Score a run's saved predictions with Qlib's ``SigAnaRecord`` alone, without a portfolio backtest.
+
+    The predictions and labels are saved as ``SignalRecord`` saves them, in a fresh recorder under
+    ``<run>/signal_mlflow``; ``signal_ic.parquet`` and ``signal_analysis.json`` are written as ``rquant report``
+    writes them.
+    """
+
+    def __init__(self, *, qlib_root: str | Path, run_directory: str | Path, horizon: str) -> None:
+        if horizon not in LABEL_EXPRESSIONS:
+            raise DataContractError(f"Unsupported horizon: {horizon}")
+        self.qlib_root = Path(qlib_root)
+        self.run_directory = Path(run_directory)
+        self.horizon = horizon
+
+    def run(self) -> dict[str, Any]:
+        qlib, pd, _ = _dependencies()
+        predictions = load_predictions(pd, self.run_directory)
+
+        from qlib.constant import REG_CN
+        from qlib.workflow import R
+
+        from rquant.workflow.runner import init_run_tracking, release_run_tracking
+
+        store = self.run_directory / "signal_mlflow"
+        if store.exists():
+            shutil.rmtree(store)
+        store.mkdir()
+        init_run_tracking(store, SIGNAL_EXPERIMENT, provider_uri=self.qlib_root, region=REG_CN, qlib_module=qlib)
+        signal = predictions.set_index(["datetime", "instrument"])["score"].sort_index()
+        with R.start(experiment_name=SIGNAL_EXPERIMENT, recorder_name="signal"):
+            recorder = R.get_recorder()
+            recorder.save_objects(**{"pred.pkl": signal.to_frame("score")})
+            summary = analyse_signal(recorder, signal, self.horizon, self.run_directory)
+        release_run_tracking(store)
+        if summary is None:
+            raise DataContractError("Qlib's SigAnaRecord returned no IC")
+        return summary
+
+
+def load_predictions(pd: Any, run_directory: Path) -> Any:
+    """The run's finite out-of-sample predictions (``datetime``, ``instrument``, ``score``)."""
+    predictions_path = run_directory / "predictions.parquet"
+    if not predictions_path.exists():
+        raise DataContractError(f"Predictions do not exist: {predictions_path}")
+    predictions = pd.read_parquet(predictions_path)
+    required = {"datetime", "instrument", "score"}
+    if not required.issubset(predictions.columns):
+        raise DataContractError(f"Prediction columns must include {sorted(required)}")
+    predictions = predictions.dropna(subset=["score"]).copy()
+    predictions["datetime"] = pd.to_datetime(predictions["datetime"])
+    if predictions.empty:
+        raise DataContractError("No finite predictions are available")
+    if predictions.duplicated(["datetime", "instrument"]).any():
+        raise DataContractError("Predictions contain duplicate datetime/instrument rows")
+    return predictions
+
+
+def analyse_signal(recorder: Any, signal: Any, horizon: str, run_directory: Path) -> dict[str, Any] | None:
+    """Save the ``horizon`` labels of ``signal`` to ``recorder`` (whose ``pred.pkl`` is ``signal``), run Qlib's
+    ``SigAnaRecord``, and write its daily IC and Rank IC with their overall and calendar-year summary."""
+    import pandas as pd
+    from qlib.data import D
+    from qlib.workflow.record_temp import SigAnaRecord
+
+    from rquant.workflow.signal_analysis import summarize_ic
+
+    recorder.save_objects(**{"label.pkl": _labels(D, pd, signal, horizon)})
+    artifacts = SigAnaRecord(recorder).generate()
+    if not artifacts:
+        return None
+    daily = pd.DataFrame({"ic": artifacts["ic.pkl"], "rank_ic": artifacts["ric.pkl"]})
+    daily = daily.rename_axis("datetime").reset_index()
+    daily.to_parquet(run_directory / "signal_ic.parquet", index=False)
+    summary = {
+        "status": "complete",
+        "engine": "qlib.workflow.record_temp.SigAnaRecord",
+        "horizon": horizon,
+        "label": LABEL_EXPRESSIONS[horizon],
+        **summarize_ic(daily),
+    }
+    atomic_write_json(run_directory / "signal_analysis.json", summary)
+    return summary
+
+
+BACKTEST_EXPERIMENT = "rquant-backtest"
+SIGNAL_EXPERIMENT = "rquant-signal"
+
+# Annualization: 252 trading days a year, as every earlier RQuant report and scripts/analysis/window_metrics.py use
+# (Qlib's own default for freq "day" is 238; the A-share calendar has about 242).
+TRADING_DAYS_PER_YEAR = 252
+
+METRICS_DEFINITION = (
+    "qlib.contrib.evaluate.risk_analysis of daily returns with N = 252 trading days a year. "
+    "Default mode 'sum', Qlib's convention: annualized_return = mean daily return * 252, max_drawdown on the "
+    "cumulative sum of daily returns, information_ratio = mean / std * sqrt(252) (the Sharpe ratio at zero risk-free "
+    "rate for net_return). Mode 'product' compounds: annualized_return = final NAV ^ (252 / days) - 1, max_drawdown "
+    "on the NAV. net_return is return - cost; excess returns subtract the benchmark, as PortAnaRecord computes them."
+)
+
+
+def risk_metrics(risk_analysis: Any, report: Any) -> dict[str, dict[str, float | None]]:
+    """``risk_analysis`` (N = 252) of the net and benchmark returns in both modes, and of the excess returns with and
+    without cost as PortAnaRecord defines them (PortAnaRecord's own analysis, logged to MLflow, uses Qlib's 238)."""
+    returns = report["return"].astype(float)
+    cost = report["cost"].astype(float)
+    bench = report["bench"].astype(float)
+    net = returns - cost
+
+    def analysed(series: Any, mode: str = "sum") -> dict[str, float | None]:
+        frame = risk_analysis(series, N=TRADING_DAYS_PER_YEAR, freq=None, mode=mode)
+        return {name: _finite(float(value)) for name, value in frame["risk"].items()}
+
+    return {
+        "net_return": analysed(net),
+        "net_return_compounded": analysed(net, "product"),
+        "benchmark_return": analysed(bench),
+        "benchmark_return_compounded": analysed(bench, "product"),
+        "excess_return_with_cost": analysed(net - bench),
+        "excess_return_without_cost": analysed(returns - bench),
+    }
+
+
+def _indicator_analysis(frame: Any) -> dict[str, float | None] | None:
+    if frame is None:
+        return None
+    return {str(name): _finite(float(value)) for name, value in frame["value"].items()}
+
+
+def _labels(D: Any, pd: Any, signal: Any, horizon: str) -> Any:
+    """The raw label of ``horizon`` on the signal's rows, as SignalRecord saves it (a <datetime, instrument> frame)."""
+    days = signal.index.get_level_values("datetime")
+    labels = D.features(
+        sorted(signal.index.get_level_values("instrument").unique()),
+        [LABEL_EXPRESSIONS[horizon]],
+        start_time=days.min(),
+        end_time=days.max(),
+        freq="day",
+    )
+    labels.columns = ["LABEL0"]
+    labels = labels.swaplevel().sort_index()
+    labels.index = labels.index.set_names(["datetime", "instrument"])
+    return labels.reindex(signal.index)
+
+
+def _weighting_description(config: PortfolioConfig) -> str:
+    if config.strategy == "topk-dropout":
+        return f"equal weight across the top {config.topk}"
+    if config.risk_model == "structured":
+        risk = (
+            f"Shenwan L1 industry + CNE6 style risk model over {config.risk_lookback_days} days (half-life "
+            f"{config.risk_half_life}), active industry weight within {config.industry_deviation}, active size "
+            f"within {config.size_deviation} std, other styles within {config.style_deviation}"
+        )
+    else:
+        risk = f"{config.risk_factors} PCA risk factors over {config.risk_lookback_days} days"
+    return (
+        "Qlib EnhancedIndexingOptimizer against the universe float-cap index: "
+        f"risk aversion {config.risk_aversion}, turnover limit {config.turnover_limit}, "
+        f"per-stock deviation {config.benchmark_deviation}, {risk}, risk degree {config.risk_degree}"
+    )
 
 
 def _rebalance_description(config: PortfolioConfig) -> str:
     cadence = "daily" if config.rebalance_days == 1 else f"every {config.rebalance_days} trading days"
+    if config.strategy == "enhanced-indexing":
+        return f"{cadence}, re-optimised weights"
     if config.n_drop == config.topk:
         return f"{cadence}, full rebalance into the latest top {config.topk}"
     return f"{cadence}, drop at most {config.n_drop} of the top {config.topk}"
-
-
-def _liquidating_strategy_class(base_class: Any) -> type[Any]:
-    """Add a constrained final-step liquidation to Qlib's TopkDropoutStrategy."""
-    from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
-
-    class LiquidatingTopkDropoutStrategy(base_class):  # type: ignore[misc,valid-type]
-        def generate_trade_decision(self, execute_result: Any = None) -> Any:
-            trade_step = self.trade_calendar.get_trade_step()
-            if trade_step + 1 < self.trade_calendar.get_trade_len():
-                return super().generate_trade_decision(execute_result)
-
-            trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
-            orders = []
-            for stock in sorted(self.trade_position.get_stock_list()):
-                if self.trade_position.get_stock_count(stock, bar=self.trade_calendar.get_freq()) < self.hold_thresh:
-                    continue
-                if not self.trade_exchange.is_stock_tradable(
-                    stock_id=stock,
-                    start_time=trade_start,
-                    end_time=trade_end,
-                    direction=OrderDir.SELL,
-                ):
-                    continue
-                amount = self.trade_position.get_stock_amount(stock)
-                order = Order(
-                    stock_id=stock,
-                    amount=amount,
-                    start_time=trade_start,
-                    end_time=trade_end,
-                    direction=Order.SELL,
-                )
-                if self.trade_exchange.check_order(order):
-                    orders.append(order)
-            return TradeDecisionWO(orders, self)
-
-    return LiquidatingTopkDropoutStrategy
-
-
-def _zero_order_safe_executor_class(base_class: Any) -> type[Any]:
-    """Keep Qlib trade indicators defined when a daily decision contains no orders."""
-    from qlib.backtest.report import Indicator
-
-    class ZeroOrderSafeIndicator(Indicator):
-        def cal_trade_indicators(
-            self,
-            trade_start_time: Any,
-            freq: str,
-            indicator_config: dict[str, Any] | None = None,
-        ) -> None:
-            if self.order_indicator.get_index_data("amount").empty:
-                self.trade_indicator.update(
-                    {
-                        "ffr": None,
-                        "pa": None,
-                        "pos": None,
-                        "deal_amount": 0.0,
-                        "value": 0.0,
-                        "count": 0,
-                    }
-                )
-                return
-            super().cal_trade_indicators(trade_start_time, freq, indicator_config or {})
-
-    class ZeroOrderSafeSimulatorExecutor(base_class):  # type: ignore[misc,valid-type]
-        def reset_common_infra(self, common_infra: Any, copy_trade_account: bool = False) -> None:
-            super().reset_common_infra(common_infra, copy_trade_account)
-            self.trade_account.indicator = ZeroOrderSafeIndicator()
-
-    return ZeroOrderSafeSimulatorExecutor
 
 
 def _position_artifact(pd: Any, positions: dict[Any, Any], exchange: Any) -> Any:
@@ -330,28 +587,6 @@ def _trade_artifact(pd: Any, indicator: Any, exchange: Any) -> Any:
             )
     trade_columns = ["datetime", "instrument", "direction", "adjusted_amount", "shares", "price", "value", "cost"]
     return pd.DataFrame(trade_rows, columns=trade_columns)
-
-
-def _metrics(np: Any, returns: Any, benchmark: Any) -> dict[str, float | None]:
-    values = returns.fillna(0.0).to_numpy(dtype=float)
-    benchmark_values = benchmark.fillna(0.0).to_numpy(dtype=float)
-    nav = np.cumprod(1.0 + values)
-    excess = values - benchmark_values
-    annual_return = float(nav[-1] ** (252.0 / len(values)) - 1.0) if len(values) else float("nan")
-    volatility = float(np.std(values, ddof=1) * math.sqrt(252)) if len(values) > 1 else float("nan")
-    # Conventional annualized Sharpe: arithmetic mean daily return scaled by 252 over annualized volatility.
-    sharpe = float(np.mean(values) * 252.0) / volatility if volatility > 0 else float("nan")
-    running_max = np.maximum.accumulate(nav) if len(nav) else np.asarray([])
-    max_drawdown = float(np.min(nav / running_max - 1.0)) if len(nav) else float("nan")
-    return {
-        "total_return": _finite(float(nav[-1] - 1.0)) if len(nav) else None,
-        "annual_return": _finite(annual_return),
-        "annual_volatility": _finite(volatility),
-        "sharpe_zero_rf": _finite(sharpe),
-        "max_drawdown": _finite(max_drawdown),
-        "benchmark_total_return": _finite(float(np.prod(1.0 + benchmark_values) - 1.0)),
-        "excess_total_return_additive": _finite(float(np.sum(excess))),
-    }
 
 
 def _finite(value: float) -> float | None:

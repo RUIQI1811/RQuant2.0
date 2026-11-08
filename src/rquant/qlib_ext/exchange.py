@@ -40,7 +40,12 @@ except ImportError:
 class AshareExchange(Exchange):  # type: ignore[misc,valid-type]
     """Qlib Exchange with commission minimum and date-aware sell stamp tax."""
 
-    def __init__(self, *args: Any, cost_model: AshareCostModel | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, cost_model: AshareCostModel | dict[str, float] | None = None, **kwargs: Any
+    ) -> None:
+        """``cost_model`` may be the fields of an ``AshareCostModel``, as a workflow file gives them."""
+        if isinstance(cost_model, dict):
+            cost_model = AshareCostModel(**cost_model)
         self.cost_model = cost_model or AshareCostModel()
         kwargs.setdefault("open_cost", self.cost_model.commission_rate)
         kwargs.setdefault("close_cost", self.cost_model.commission_rate + self.cost_model.stamp_tax_before)
