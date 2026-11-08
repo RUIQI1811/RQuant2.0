@@ -142,6 +142,7 @@ class RollingWorkflowRunner:
             anchor_positions=anchor_positions,
             run_directory=self.run_directory,
             factor_names=list(get_catalog().canonical_names(self.factor_set)),
+            early_stopping_metric=str(self.workflow["rolling"]["early_stopping_metric"]),
         )
         trainer.end_train(recorders)
         trained = {recorder.id for recorder in recorders}

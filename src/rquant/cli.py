@@ -137,6 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--first-year", type=int)
     walk.add_argument("--last-year", type=int)
     walk.add_argument("--through", type=_date, help="Inclusive date, YYYY-MM-DD (default: data.through)")
+    walk.add_argument(
+        "--seed",
+        type=int,
+        help="Override workflow.seed (the model's random seed); runs that differ only in seed can be averaged with "
+        "scripts/analysis/blend_runs.py",
+    )
     walk.set_defaults(handler=_walk_forward, run_category="walk-forward")
 
     report = commands.add_parser("report", help="Run portfolio backtest and build the report for a walk-forward run")
@@ -615,7 +621,11 @@ def _walk_forward(args: argparse.Namespace) -> int:
             workflow=args.model or Path(args.workflow).expanduser(),
             horizon=args.horizon,
             factor_set=args.factor_set,
-            seed=int(workflow.get("seed", config.get("project", {}).get("seed", 42))),
+            seed=(
+                args.seed
+                if args.seed is not None
+                else int(workflow.get("seed", config.get("project", {}).get("seed", 42)))
+            ),
             train_years=int(workflow.get("train_years", 3)),
             validation_months=int(workflow.get("validation_months", 6)),
             formal_start_year=_date_value(config.get("data", {}).get("formal_start", "2010-01-01")).year,

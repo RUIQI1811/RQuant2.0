@@ -882,6 +882,11 @@ walk-forward 把文件里的 `task` 当作 Qlib `RollingGen` 的模板：股票�
 Qlib `TrainerR` 逐年训练，每年一个 MLflow recorder（`params.pkl` 和 `SignalRecord` 格式的 `pred.pkl`）；最后用
 `RecorderCollector` + `RollingEnsemble` 合并成 `predictions.parquet`，合并结果另存为 recorder `rolling-ensemble`。
 文件里的 `rolling.refit: true`（lgb 默认开启）表示先在内部切分上早停选轮数，再在整个训练窗口上按该轮数重训。
+`rolling.early_stopping_metric` 决定早停看什么：`loss`（默认，模型自己的目标函数，mse 即 l2）或 `ic`（验证段每天预测分数和
+处理后标签的 Pearson 相关的均值，越大越好），`ic` 只支持省内存路径上的 `LGBModel`。标签的截面标准化可以是
+`CSZScoreNorm`（默认）或 `CSRankNorm`（每天的百分位排名），两者都走省内存路径。`--seed` 覆盖 `workflow.seed`；
+只差种子的几个 run 可以用 `scripts/analysis/blend_runs.py` 平均成一个新 run 再 `report`。jq240 的 LightGBM 调参配置和
+步骤见 `docs/lgb-tuning.md`。
 
 训练路径：数据集是 RQuant 的 handler（`KunQuantDataLoader` + RQuant 的处理器）且模型是 `LGBModel` 或
 `DEnsembleModel` 时，`TrainerR` 的训练函数走省内存路径（见上文，与 `DatasetH` 逐位相同）；其他模型或处理器走

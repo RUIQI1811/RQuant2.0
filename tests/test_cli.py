@@ -37,6 +37,11 @@ class CliTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertTrue(callable(parser.parse_args(argv).handler))
 
+    def test_walk_forward_seed_overrides_the_configured_seed(self) -> None:
+        parser = build_parser()
+        self.assertEqual(43, parser.parse_args(["walk-forward", "--model", "lgb", "--seed", "43"]).seed)
+        self.assertIsNone(parser.parse_args(["walk-forward", "--model", "lgb"]).seed)
+
     def test_walk_forward_takes_exactly_one_workflow(self) -> None:
         parser = build_parser()
         for argv in (

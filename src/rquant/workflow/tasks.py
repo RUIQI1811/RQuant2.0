@@ -57,7 +57,14 @@ ROLLING_DEFAULTS = {
     # Train only up to `trunc_days` trading days before the validation months instead of through them, so a model
     # that early-stops on the validation set (the neural networks) never trains on it.
     "holdout_valid": False,
+    # What an LGBModel's early stopping watches on the validation months: `loss` (the model's own objective, l2 for
+    # mse) or `ic` (the mean daily Pearson correlation of the score with the processed label, higher is better).
+    # `ic` stops where the cross-sectional ranking is best rather than where the squared error is; it needs the lean
+    # LightGBM path (rquant.workflow.lgb_window).
+    "early_stopping_metric": "loss",
 }
+
+EARLY_STOPPING_METRICS = ("loss", "ic")
 
 
 def infer_processors(fit_start: Any, fit_end: Any) -> list[dict[str, Any]]:
@@ -73,10 +80,20 @@ def infer_processors(fit_start: Any, fit_end: Any) -> list[dict[str, Any]]:
     ]
 
 
-LEARN_PROCESSORS = [
-    {"class": "DropnaLabel", "module_path": "rquant.qlib_ext.processors"},
-    {"class": "CSZScoreNorm", "module_path": "qlib.data.dataset.processor", "kwargs": {"fields_group": "label"}},
-]
+# How the label is normalised across each day's stocks before training: Qlib's CSZScoreNorm (the default) or
+# CSRankNorm (the daily percentile rank, centred and scaled to unit variance), which a few limit-up or limit-down
+# moves cannot dominate.
+LABEL_NORMS = ("CSZScoreNorm", "CSRankNorm")
+
+
+def learn_processors(label_norm: str = "CSZScoreNorm") -> list[dict[str, Any]]:
+    """The learn processors of an RQuant handler: drop rows without a label, then normalise it per day."""
+    if label_norm not in LABEL_NORMS:
+        raise DataContractError(f"Unsupported label normalisation {label_norm!r}; use one of {LABEL_NORMS}")
+    return [
+        {"class": "DropnaLabel", "module_path": "rquant.qlib_ext.processors"},
+        {"class": label_norm, "module_path": "qlib.data.dataset.processor", "kwargs": {"fields_group": "label"}},
+    ]
 
 
 def handler_config(
@@ -89,6 +106,7 @@ def handler_config(
     end_time: Any,
     fit_start_time: Any,
     fit_end_time: Any,
+    label_norm: str = "CSZScoreNorm",
 ) -> dict[str, Any]:
     """A ``DataHandlerLP`` over a KunQuant factor store with RQuant's processors."""
     return {
@@ -104,7 +122,7 @@ def handler_config(
                 "kwargs": {"factor_root": str(factor_root), "factor_set": factor_set, "horizon": horizon},
             },
             "infer_processors": infer_processors(fit_start_time, fit_end_time),
-            "learn_processors": copy.deepcopy(LEARN_PROCESSORS),
+            "learn_processors": learn_processors(label_norm),
             "process_type": "append",
             # Training reads the learn and infer views only; keeping the raw panel too would hold a third copy.
             "drop_raw": True,
@@ -131,6 +149,11 @@ def load_workflow(path: str | Path) -> dict[str, Any]:
     unknown = sorted(set(rolling).difference(ROLLING_DEFAULTS))
     if unknown:
         raise DataContractError(f"{path}: unknown rolling keys {unknown}")
+    if rolling["early_stopping_metric"] not in EARLY_STOPPING_METRICS:
+        raise DataContractError(
+            f"{path}: rolling.early_stopping_metric must be one of {EARLY_STOPPING_METRICS}, "
+            f"got {rolling['early_stopping_metric']!r}"
+        )
     workflow["rolling"] = rolling
     return workflow
 

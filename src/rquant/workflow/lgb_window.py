@@ -25,6 +25,7 @@ from typing import Any
 
 from rquant.errors import DataContractError
 from rquant.qlib_ext.processors import DropnaLabel, Fillna, ProcessInf, ZScoreNorm
+from rquant.workflow.tasks import EARLY_STOPPING_METRICS, LABEL_NORMS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,23 +62,28 @@ def segment_rows(dates: Any, segment: Segment) -> slice:
     return slice(first, last)
 
 
-def process_panel(panel: Any, *, fit_start: str, fit_end: str) -> tuple[Any, Any]:
+def process_panel(
+    panel: Any, *, fit_start: str, fit_end: str, label_norm: str = "CSZScoreNorm"
+) -> tuple[Any, Any]:
     """Run the infer processors on ``panel`` in place, then return the learn labels and the rows that keep one.
 
     ``panel`` is the single-block frame KunQuantDataLoader returns (features, then the label). The returned label is
-    the label after the infer and learn processors; the keep mask is None when DropnaLabel keeps every row.
+    the label after the infer and learn processors (DropnaLabel, then ``label_norm``: Qlib's CSZScoreNorm or
+    CSRankNorm); the keep mask is None when DropnaLabel keeps every row.
     """
     import numpy as np
     import pandas as pd
-    from qlib.data.dataset.processor import CSZScoreNorm
+    from qlib.data.dataset import processor as qlib_processors
 
+    if label_norm not in LABEL_NORMS:
+        raise DataContractError(f"Unsupported label normalisation {label_norm!r}; use one of {LABEL_NORMS}")
     for processor in (ProcessInf(), ZScoreNorm(fit_start_time=fit_start, fit_end_time=fit_end), Fillna()):
         processor.fit(panel)
         processor(panel)
     label = panel.iloc[:, [-1]].copy()
     learn = DropnaLabel()(label)
     keep = None if learn is label else label.iloc[:, 0].notna().to_numpy()
-    learn = CSZScoreNorm(fields_group="label")(learn)
+    learn = getattr(qlib_processors, label_norm)(fields_group="label")(learn)
     values = learn.iloc[:, 0].to_numpy(dtype=np.float32)
     if keep is not None:
         full = np.full(len(panel), np.nan, dtype=np.float32)
@@ -123,20 +129,28 @@ def fit_lgb_window(
     valid: Segment,
     test: Segment | None,
     log_metrics: Any,
+    label_norm: str = "CSZScoreNorm",
+    early_stopping_metric: str = "loss",
 ) -> Any:
     """Fit ``model`` (a Qlib ``LGBModel``) on the panel ``load_panel`` returns and return the test predictions (None
     without a test segment).
 
     The panel is loaded here so that no caller keeps a reference to it: its buffer is reused for the training rows and
-    released before boosting starts.
+    released before boosting starts. ``label_norm`` names the label's daily normalisation (``process_panel``).
+    With ``early_stopping_metric`` ``ic`` the validation rows are scored by ``daily_ic`` instead of the objective, and
+    early stopping keeps the round with the best mean daily IC.
     """
+    if early_stopping_metric not in EARLY_STOPPING_METRICS:
+        raise DataContractError(
+            f"Unsupported early stopping metric {early_stopping_metric!r}; use one of {EARLY_STOPPING_METRICS}"
+        )
     import lightgbm as lgb
     import numpy as np
     import pandas as pd
 
     panel = load_panel()
     _log_memory("loaded")
-    label, keep = process_panel(panel, fit_start=fit_start, fit_end=fit_end)
+    label, keep = process_panel(panel, fit_start=fit_start, fit_end=fit_end, label_norm=label_norm)
     index = panel.index
     dates = index.get_level_values("datetime").to_numpy()
     width = panel.shape[1] - 1
@@ -171,13 +185,24 @@ def fit_lgb_window(
     valid_set = lgb.Dataset(x_valid, label=y_valid)
 
     evals_result: dict[str, Any] = {}
-    names = ("train", "valid")
+    params = model.params
+    valid_sets = [train_set, valid_set]
+    names: tuple[str, ...] = ("train", "valid")
+    feval = None
+    if early_stopping_metric == "ic":
+        # Only the validation rows are scored, by IC alone: LightGBM's early stopping would otherwise also stop on
+        # the objective's own metric.
+        valid_dates = _learn_dates(dates, valid_rows, keep)
+        feval = daily_ic(valid_dates, y_valid)
+        params = {**model.params, "metric": "None"}
+        valid_sets, names = [valid_set], ("valid",)
     model.model = lgb.train(
-        model.params,
+        params,
         train_set,
         num_boost_round=model.num_boost_round,
-        valid_sets=[train_set, valid_set],
+        valid_sets=valid_sets,
         valid_names=list(names),
+        feval=feval,
         callbacks=[
             lgb.early_stopping(model.early_stopping_rounds),
             lgb.log_evaluation(period=20),
@@ -195,6 +220,51 @@ def fit_lgb_window(
     if x_test is None:
         return None
     return pd.Series(model.model.predict(x_test), index=index[test_rows])
+
+
+def daily_ic(dates: Any, label: Any) -> Callable[[Any, Any], tuple[str, float, bool]]:
+    """A LightGBM ``feval`` scoring predictions by their mean daily Pearson correlation with ``label``.
+
+    ``dates`` and ``label`` are the validation rows' trading days (sorted, as the panel is) and processed labels, in
+    the order LightGBM predicts them. Days with fewer than two stocks or a constant score or label count as zero, so
+    a first tree that scores every stock alike cannot look good.
+    """
+    import numpy as np
+
+    dates = np.asarray(dates)
+    label = np.asarray(label, dtype=np.float64)
+    if len(dates) != len(label):
+        raise DataContractError("daily_ic needs one date per label")
+    if len(dates) == 0:
+        raise DataContractError("daily_ic needs validation rows")
+    if (dates[1:] < dates[:-1]).any():
+        raise DataContractError("daily_ic needs date-sorted rows")
+    starts = np.flatnonzero(np.r_[True, dates[1:] != dates[:-1]])
+    counts = np.diff(np.r_[starts, len(dates)])
+    label_dev = label - np.repeat(np.add.reduceat(label, starts) / counts, counts)
+    label_var = np.add.reduceat(label_dev * label_dev, starts)
+
+    def evaluate(predictions: Any, _data: Any) -> tuple[str, float, bool]:
+        scores = np.asarray(predictions, dtype=np.float64)
+        dev = scores - np.repeat(np.add.reduceat(scores, starts) / counts, counts)
+        covariance = np.add.reduceat(dev * label_dev, starts)
+        variance = np.add.reduceat(dev * dev, starts)
+        denominator = np.sqrt(variance * label_var)
+        usable = (counts > 1) & (denominator > 1e-12)
+        ic = np.zeros(len(starts))
+        ic[usable] = covariance[usable] / denominator[usable]
+        return "ic", float(ic.mean()), True
+
+    return evaluate
+
+
+def _learn_dates(dates: Any, rows: slice, keep: Any) -> Any:
+    """The trading days of the learn rows ``_learn_rows`` takes from ``rows``."""
+    import numpy as np
+
+    if keep is None or keep[rows].all():
+        return dates[rows]
+    return dates[np.arange(rows.start, rows.stop)[keep[rows]]]
 
 
 def _learn_rows(block: Any, rows: slice, width: int, label: Any, keep: Any) -> tuple[Any, Any]:
@@ -252,6 +322,7 @@ def fit_double_ensemble_window(
     train: Segment,
     valid: Segment,
     test: Segment | None,
+    label_norm: str = "CSZScoreNorm",
 ) -> Any:
     """Fit ``model`` (a Qlib ``DEnsembleModel``) on the panel ``load_panel`` returns and return the test predictions
     (None without a test segment).
@@ -265,7 +336,7 @@ def fit_double_ensemble_window(
 
     panel = load_panel()
     _log_memory("loaded")
-    label, keep = process_panel(panel, fit_start=fit_start, fit_end=fit_end)
+    label, keep = process_panel(panel, fit_start=fit_start, fit_end=fit_end, label_norm=label_norm)
     index = panel.index
     dates = index.get_level_values("datetime").to_numpy()
     width = panel.shape[1] - 1
