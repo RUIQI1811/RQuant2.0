@@ -1,11 +1,15 @@
 # jq240 + LightGBM live trading inside QMT (run in QMT's live-trading mode with the account selected).
 #
-# Start it before 09:15 Beijing time and leave it running; each Beijing day it plans afresh. On the day's first bar
-# it refreshes recent daily bars and scores sh_main with the last finished session's data (several minutes, so start
-# by 09:00). At 09:30:05 it reads the account, decides like the backtest's TopkDropoutStrategy
-# (top LIVE_TOPK, drop at most LIVE_N_DROP a day) against the real holdings and the real open, and sends the sells; at
-# 09:30:25 it sends the buys with the cash then available. Orders are marketable limit orders. It trades at most once
-# a day and never after LIVE_STOP_AT.
+# Start it by 08:45 Beijing time and leave it running; each Beijing day it plans afresh. On the day's first bar (or
+# its timer) it refreshes recent daily bars and scores sh_main with the last finished session's data (about 15
+# minutes). With LIVE_AUCTION (the default) it trades in the opening call auction, so it deals at the open as the
+# backtest does: between LIVE_AUCTION_AT and LIVE_AUCTION_END it reads the account, decides like the backtest's
+# TopkDropoutStrategy (top LIVE_TOPK, drop at most LIVE_N_DROP a day) against the real holdings and the previous
+# close, and sends the sells at the limit-down price and the buys at most LIVE_AUCTION_BUY above the previous close;
+# the auction fills both at the open. The buys can only use the cash on hand before the auction (the sales pay out at
+# 09:25), so the account keeps about one day's sales in cash. If the plan is not ready by LIVE_AUCTION_END it trades
+# after the open instead: sells at LIVE_SELL_AT, buys at LIVE_BUY_AT and LIVE_BUY_GAP seconds after the sells, as
+# marketable limit orders. It trades at most once a day and never after LIVE_STOP_AT.
 #
 # LIVE_DRY_RUN = True (the default) sends nothing: it prints the orders it would send, at once if the market is shut.
 # Set it to False in the QMT editor only after a dry run looks right. The account number stays in the QMT editor.
@@ -15,15 +19,21 @@ LIVE_CAPITAL = 0  # the most the strategy may hold (holdings at market plus cash
 LIVE_TOPK = 30
 LIVE_N_DROP = 3
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SH"])
+LIVE_AUCTION = True  # trade in the opening call auction (at the open); False: after the open, as below
+LIVE_AUCTION_AT = "092100"  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
+LIVE_AUCTION_END = "092450"
+LIVE_AUCTION_BUY = 0.03  # auction buy limit above the previous close (the cash it ties up); above it, no fill at the open
+LIVE_TIMER = True  # also wake every 30 s on a QMT timer, so the plan is ready before the auction without ticks
 LIVE_SELL_AT = "093005"
 LIVE_BUY_AT = "093025"
 LIVE_BUY_GAP = 20  # seconds between sending the sells and the buys, whatever the clock says, so the sales can fill
 LIVE_STOP_AT = "100000"
 LIVE_SLIP = 0.01  # limit price offset from the last price; capped at the daily limit
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
+LIVE_RETRY = 600  # seconds before planning again after the data was not ready
 LIVE_TAG = "RQ"
 BUY_OP, SELL_OP, BY_SHARES, LIMIT_PRICE, RIGHT_AWAY = 23, 24, 1101, 11, 2
-_live = {"day": None, "planned": False, "plan": None, "sold": None, "sold_at": None, "done": False}
+_live = {"day": None, "planned": False, "plan": None, "sold": None, "sold_at": None, "retry_at": 0, "done": False}
 
 
 def beijing_clock():
@@ -96,13 +106,16 @@ def live_plan(C):
     return {"date": last, "scores": scores, "st": inputs["quotes"]["st"]}
 
 
-def tick_day(C, codes, st):
-    """paper.Day from QMT's live ticks: open and last price in real yuan, factor 1, open-limit flags."""
+def tick_day(C, codes, st, auction=False):
+    """paper.Day from QMT's live ticks: open and last price in real yuan, factor 1, open-limit flags. In the auction
+    there is no open yet: the previous close stands for both, and no code counts as opening at a limit."""
     ticks = C.get_full_tick(list(codes)) or {}
     open_, last, factor, limit_buy, limit_sell, limits = {}, {}, {}, {}, {}, {}
     for code in codes:
         tick = ticks.get(code) or {}
         price, opened, pre = (float(tick.get(key) or 0.0) for key in ("lastPrice", "open", "lastClose"))
+        if auction and pre > 0:
+            price = opened = pre
         factor[code] = 1.0
         if price <= 0 or opened <= 0 or pre <= 0:
             last[code] = np.nan
@@ -123,11 +136,11 @@ def send(C, account, side, code, shares, price, tag):
                   int(shares), "RQuant", RIGHT_AWAY, tag, C)
 
 
-def live_sell(C, plan, account, tag):
+def live_sell(C, plan, account, tag, auction=False):
     cash, positions = read_account(account)
     held = sorted(positions)
     codes = sorted(set(plan["scores"].index) | set(held))
-    day, limits = tick_day(C, codes, plan["st"])
+    day, limits = tick_day(C, codes, plan["st"], auction)
     if sum(1 for code in plan["scores"].index if code in day.open) < 0.5 * len(plan["scores"]):
         return None  # the market has not opened
     value = sum(positions[code][0] * day.close[code] for code in held if day.close[code] == day.close[code])
@@ -143,7 +156,8 @@ def live_sell(C, plan, account, tag):
     kept = dict((code, positions[code][0]) for code in held)
     for code, shares in sells:
         sellable = positions[code][1]
-        price = max(limits[code][1], round(day.close[code] * (1 - LIVE_SLIP), 2))
+        # In the auction a sell at the limit-down price fills at the open, whatever the open is.
+        price = limits[code][1] if auction else max(limits[code][1], round(day.close[code] * (1 - LIVE_SLIP), 2))
         if sellable > 0:
             send(C, account, "sell", code, sellable, price, tag)
             sent += 1
@@ -153,7 +167,7 @@ def live_sell(C, plan, account, tag):
                 kept.pop(code)
     value_after = sum(kept[code] * day.close[code] for code in kept if day.close[code] == day.close[code])
     return {"day": day, "limits": limits, "buys": buys, "sold": sold, "kept": kept, "value_after": value_after,
-            "capital": capital, "sells": sent}
+            "capital": capital, "sells": sent, "auction": auction}
 
 
 def _lots(shares):
@@ -172,8 +186,11 @@ def live_buy(C, sold, account, tag):
     slot = (sold["value_after"] + budget) / LIVE_TOPK
     ceiling = LIVE_MAX_ORDER * sold["capital"] / LIVE_TOPK
 
+    slip = LIVE_AUCTION_BUY if sold.get("auction") else LIVE_SLIP
+
     def price_of(code):
-        return min(limits[code][0], round(day.close[code] * (1 + LIVE_SLIP), 2))
+        # Sized at the limit price: the broker holds back limit x shares of cash until the order fills.
+        return min(limits[code][0], round(day.close[code] * (1 + slip), 2))
 
     orders = [(code, min(amount, slot / price_of(code)), price_of(code)) for code, amount in sold["buys"]]
     planned = sum(amount * price for _, amount, price in orders) * (1 + OPEN_COST)
@@ -206,7 +223,8 @@ def live_buy(C, sold, account, tag):
 def live_step(C, plan):
     clock = beijing_clock()
     moment = clock[8:]
-    in_session = LIVE_SELL_AT <= moment < LIVE_STOP_AT
+    auction = LIVE_AUCTION and _live["sold"] is None and LIVE_AUCTION_AT <= moment < LIVE_AUCTION_END
+    in_session = auction or LIVE_SELL_AT <= moment < LIVE_STOP_AT
     if not LIVE_DRY_RUN and not in_session:
         if moment >= LIVE_STOP_AT:
             log("live.skip", "past %s Beijing time: no orders today" % LIVE_STOP_AT)
@@ -221,7 +239,7 @@ def live_step(C, plan):
             log("live.skip", "orders tagged %s already sent today" % tag)
             _live["done"] = True
             return
-        _live["sold"] = live_sell(C, plan, account, tag)
+        _live["sold"] = live_sell(C, plan, account, tag, auction and not LIVE_DRY_RUN)
         _live["sold_at"] = seconds()
         if _live["sold"] is None:
             if LIVE_DRY_RUN and not in_session:
@@ -230,34 +248,57 @@ def live_step(C, plan):
             return
     # Buy at LIVE_BUY_AT, and never sooner than LIVE_BUY_GAP seconds after sells were sent: a start after the open (or a
     # machine clock ahead of the exchange) must not send the buys with the sells, before the sales add to the cash.
+    # In the auction the buys go with the sells: they spend only the cash on hand before it.
     waited = seconds() - _live["sold_at"] >= (LIVE_BUY_GAP if _live["sold"]["sells"] else 0)
-    if LIVE_DRY_RUN or (moment >= LIVE_BUY_AT and waited):
+    if LIVE_DRY_RUN or _live["sold"]["auction"] or (moment >= LIVE_BUY_AT and waited):
         live_buy(C, _live["sold"], account, tag)
         log("live.done", "dry run, nothing sent" if LIVE_DRY_RUN else "orders sent")
         _live["done"] = True
 
 
 def init(C):
-    log("live", "start dry_run=%s" % LIVE_DRY_RUN)
+    log("live", "start dry_run=%s auction=%s" % (LIVE_DRY_RUN, LIVE_AUCTION))
+    if LIVE_TIMER:
+        try:
+            C.run_time("live_timer", "30nSecond", "2020-01-01 00:00:00", "SH")
+            log("live.timer", "every 30 s")
+        except Exception:
+            log("live.timer_error", traceback.format_exc().splitlines()[-1])
+
+
+def live_timer(C):
+    live_tick(C)
 
 
 def handlebar(C):
     if not C.is_last_bar():
         return
+    live_tick(C)
+
+
+def live_tick(C):
     day = beijing_clock()[:8]
     if _live["day"] != day:
         # A new Beijing day: plan afresh, so a strategy left running trades each day on that day's plan.
-        _live.update(day=day, planned=False, plan=None, sold=None, sold_at=None, done=False)
+        _live.update(day=day, planned=False, plan=None, sold=None, sold_at=None, retry_at=0, done=False)
     if _live["done"]:
         return
     if not _live["planned"]:
+        if seconds() < _live["retry_at"]:
+            return
         _live["planned"] = True
         try:
             _live["plan"] = live_plan(C)
         except Exception:
             log("live.error", traceback.format_exc())
         if _live["plan"] is None:
-            _live["done"] = True
+            # Data not ready (say the timer planned before the last session's bars were in): try again later today,
+            # until the trading window has passed.
+            if LIVE_DRY_RUN or beijing_clock()[8:] >= LIVE_STOP_AT:
+                _live["done"] = True
+            else:
+                _live.update(planned=False, retry_at=seconds() + LIVE_RETRY)
+                log("live.retry", "planning again in %d s" % LIVE_RETRY)
             return
     try:
         live_step(C, _live["plan"])

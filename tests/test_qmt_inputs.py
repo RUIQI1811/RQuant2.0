@@ -342,6 +342,9 @@ class Row:
 class LiveQMT(FakeQMT):
     """FakeQMT plus live ticks: the next session opens 1% above the last close and trades 0.5% above it."""
 
+    def run_time(self, name, period, start, market):
+        self.__dict__.setdefault("timers", []).append((name, period, start, market))
+
     def get_full_tick(self, codes):
         ticks = {}
         for code in codes:
@@ -425,6 +428,47 @@ def test_live_buys_wait_after_the_sells_even_when_started_late(capsys) -> None:
     names["handlebar"](context)
     assert any(op == 23 for op, _, _, _ in sent[1:])
     assert "[RQ] live.done=orders sent" in capsys.readouterr().out
+
+
+def test_live_strategy_trades_in_the_opening_auction(capsys) -> None:
+    clock = ["20110701084500"]
+    context, names, sent = live_strategy(clock, {"600002.SH": (300, 300)})
+    names["init"](context)
+    assert context.timers == [("live_timer", "30nSecond", "2020-01-01 00:00:00", "SH")]
+    names["handlebar"](context)  # plans, then waits for the auction
+    assert sent == []
+    clock[0] = "20110701092130"
+    names["handlebar"](context)
+    sells = [order for order in sent if order[0] == 24]
+    buys = [order for order in sent if order[0] == 23]
+    close = {code: float(context.bars[code]["close"].iloc[-1]) for code in context.bars}
+    # The sell goes at the limit-down price, the buys with it at most 3% above the previous close.
+    assert [(code, volume) for _, code, volume, _ in sells] == [("600002.SH", 300)]
+    assert abs(sells[0][3] - names["limit_price"](close["600002.SH"], 0.95)) < 1e-9  # an ST name: 5%
+    assert buys and all(price <= round(close[code] * 1.03, 2) + 1e-9 for _, code, _, price in buys)
+    assert sum(volume * price for _, _, volume, price in buys) <= 50_000.0  # the cash before the auction
+    count = len(sent)
+    clock[0] = "20110701093010"
+    names["handlebar"](context)
+    assert len(sent) == count
+    out = capsys.readouterr().out
+    assert "[RQ] live.timer=every 30 s" in out and "[RQ] live.done=orders sent" in out
+
+
+def test_live_plan_is_retried_when_the_data_is_not_ready(capsys) -> None:
+    clock, now = ["20110701003000"], [0.0]
+    context, names, sent = live_strategy(clock, {}, now=now)
+    real = names["complete_days"]
+    names["complete_days"] = lambda inputs, at: inputs["close"].index[:-1]
+    names["handlebar"](context)
+    assert "daily bars of 20110630 are missing" in capsys.readouterr().out
+    names["complete_days"] = real
+    now[0] += 599
+    names["handlebar"](context)
+    assert "live.plan_seconds" not in capsys.readouterr().out
+    now[0] += 1
+    names["handlebar"](context)
+    assert "live.plan_seconds" in capsys.readouterr().out and sent == []
 
 
 def test_live_dry_run_prints_orders_and_sends_nothing(capsys) -> None:
