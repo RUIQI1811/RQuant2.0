@@ -351,7 +351,8 @@ class LiveQMT(FakeQMT):
         return ticks
 
 
-def live_strategy(clock: list[str], positions: dict, cash: float = 50_000.0, dry_run: bool = False):
+def live_strategy(clock: list[str], positions: dict, cash: float = 50_000.0, dry_run: bool = False,
+                  now: list[float] | None = None):
     context = LiveQMT()
     names: dict = {}
     source = build_jq240.build_strategy(build_jq240.LIVE_PARTS)
@@ -376,6 +377,8 @@ def live_strategy(clock: list[str], positions: dict, cash: float = 50_000.0, dry
     names.update(
         MARKET_MIN_STOCKS=1, PAPER_DAYS=DAYS, LIVE_TOPK=2, LIVE_N_DROP=1, LIVE_CAPITAL=100_000.0,
         LIVE_DRY_RUN=dry_run, account="1234567890", beijing_clock=lambda: clock[0],
+        seconds=(lambda: now[0]) if now is not None else (lambda: 1e9 + int(clock[0][8:10]) * 3600
+                                                          + int(clock[0][10:12]) * 60 + int(clock[0][12:14])),
         get_trade_detail_data=get_trade_detail_data, passorder=passorder,
         MODEL={"run": "fake", "prediction_year": 2011, "fit_period": ["2010-01-01", "2010-12-31"],
                "features": features, "mean": [0.0] * 233, "std": [1.0] * 233,
@@ -407,6 +410,21 @@ def test_live_strategy_sells_at_the_open_then_buys(capsys) -> None:
     lines = capsys.readouterr().out.splitlines()
     assert "[RQ] live.data_through=20110630" in lines and not any("error" in line for line in lines), lines[-8:]
     assert not any("1234567890" in line for line in lines)
+
+
+def test_live_buys_wait_after_the_sells_even_when_started_late(capsys) -> None:
+    # Started after 09:30:25 (or a clock running ahead): the sells go at once, the buys only LIVE_BUY_GAP seconds later.
+    clock, now = ["20110701093100"], [500.0]
+    context, names, sent = live_strategy(clock, {"600002.SH": (300, 300)}, now=now)
+    names["handlebar"](context)
+    assert [(op, code) for op, code, _, _ in sent] == [(24, "600002.SH")]
+    now[0] += 19
+    names["handlebar"](context)
+    assert len(sent) == 1
+    now[0] += 1
+    names["handlebar"](context)
+    assert any(op == 23 for op, _, _, _ in sent[1:])
+    assert "[RQ] live.done=orders sent" in capsys.readouterr().out
 
 
 def test_live_dry_run_prints_orders_and_sends_nothing(capsys) -> None:
@@ -496,4 +514,4 @@ def test_live_capital_zero_uses_the_whole_account(capsys) -> None:
     names["handlebar"](context)
     out = capsys.readouterr().out
     account = next(line for line in out.splitlines() if line.startswith("[RQ] live.account="))
-    assert account.endswith("budget 230000.00"), account
+    assert "budget 230000.00 at 200000" in account, account

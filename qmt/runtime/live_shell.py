@@ -17,17 +17,22 @@ LIVE_N_DROP = 3
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SH"])
 LIVE_SELL_AT = "093005"
 LIVE_BUY_AT = "093025"
+LIVE_BUY_GAP = 20  # seconds between sending the sells and the buys, whatever the clock says, so the sales can fill
 LIVE_STOP_AT = "100000"
 LIVE_SLIP = 0.01  # limit price offset from the last price; capped at the daily limit
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
 LIVE_TAG = "RQ"
 BUY_OP, SELL_OP, BY_SHARES, LIMIT_PRICE, RIGHT_AWAY = 23, 24, 1101, 11, 2
-_live = {"day": None, "planned": False, "plan": None, "sold": None, "done": False}
+_live = {"day": None, "planned": False, "plan": None, "sold": None, "sold_at": None, "done": False}
 
 
 def beijing_clock():
     """Beijing wall-clock time as YYYYMMDDHHMMSS, whatever the machine's time zone."""
     return time.strftime("%Y%m%d%H%M%S", time.gmtime(time.time() + 8 * 3600))
+
+
+def seconds():
+    return time.time()
 
 
 def account_id():
@@ -128,26 +133,27 @@ def live_sell(C, plan, account, tag):
     value = sum(positions[code][0] * day.close[code] for code in held if day.close[code] == day.close[code])
     capital = LIVE_CAPITAL if LIVE_CAPITAL > 0 else cash + value
     budget = max(0.0, min(cash, capital - value))
-    log("live.account", "%s cash %.2f holdings %d value %.2f budget %.2f" % (
-        masked(account), cash, len(held), value, budget))
+    log("live.account", "%s cash %.2f holdings %d value %.2f budget %.2f at %s" % (
+        masked(account), cash, len(held), value, budget, beijing_clock()[8:]))
     book = Book(budget, dict((code, float(positions[code][0])) for code in held),
                 dict((code, day.close[code]) for code in held),
                 dict((code, 1 if positions[code][1] > 0 else 0) for code in held))
     sells, buys = decide(plan["scores"], book, day, LIVE_TOPK, LIVE_N_DROP)
-    sold = 0.0
+    sold, sent = 0.0, 0
     kept = dict((code, positions[code][0]) for code in held)
     for code, shares in sells:
         sellable = positions[code][1]
         price = max(limits[code][1], round(day.close[code] * (1 - LIVE_SLIP), 2))
         if sellable > 0:
             send(C, account, "sell", code, sellable, price, tag)
+            sent += 1
             sold += sellable * price * (1 - CLOSE_COST)
             kept[code] -= sellable
             if kept[code] <= 0:
                 kept.pop(code)
     value_after = sum(kept[code] * day.close[code] for code in kept if day.close[code] == day.close[code])
     return {"day": day, "limits": limits, "buys": buys, "sold": sold, "kept": kept, "value_after": value_after,
-            "capital": capital}
+            "capital": capital, "sells": sent}
 
 
 def _lots(shares):
@@ -216,12 +222,16 @@ def live_step(C, plan):
             _live["done"] = True
             return
         _live["sold"] = live_sell(C, plan, account, tag)
+        _live["sold_at"] = seconds()
         if _live["sold"] is None:
             if LIVE_DRY_RUN and not in_session:
                 log("live.error", "no live quotes: the dry run needs today's ticks")
                 _live["done"] = True
             return
-    if LIVE_DRY_RUN or moment >= LIVE_BUY_AT:
+    # Buy at LIVE_BUY_AT, and never sooner than LIVE_BUY_GAP seconds after sells were sent: a start after the open (or a
+    # machine clock ahead of the exchange) must not send the buys with the sells, before the sales add to the cash.
+    waited = seconds() - _live["sold_at"] >= (LIVE_BUY_GAP if _live["sold"]["sells"] else 0)
+    if LIVE_DRY_RUN or (moment >= LIVE_BUY_AT and waited):
         live_buy(C, _live["sold"], account, tag)
         log("live.done", "dry run, nothing sent" if LIVE_DRY_RUN else "orders sent")
         _live["done"] = True
@@ -237,7 +247,7 @@ def handlebar(C):
     day = beijing_clock()[:8]
     if _live["day"] != day:
         # A new Beijing day: plan afresh, so a strategy left running trades each day on that day's plan.
-        _live.update(day=day, planned=False, plan=None, sold=None, done=False)
+        _live.update(day=day, planned=False, plan=None, sold=None, sold_at=None, done=False)
     if _live["done"]:
         return
     if not _live["planned"]:
