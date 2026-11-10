@@ -31,6 +31,7 @@ LIVE_STOP_AT = "100000"
 LIVE_SLIP = 0.01  # limit price offset from the last price; capped at the daily limit
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
 LIVE_FILL_MAX = 1.3  # idle cash tops names up lot by lot, to at most this many slots each
+LIVE_TOPUP = False  # False: only today's new buys get the idle cash; True: held names are topped up too
 LIVE_FIRST_LOT_MAX = 1.5  # a new name whose one lot is above a slot is still bought if the lot is under this
 LIVE_TOPUP_MIN = 0.2  # top-ups of a held name under this many slots are not sent (5 yuan minimum commission)
 LIVE_RETRY = 600  # seconds before planning again after the data was not ready
@@ -219,9 +220,9 @@ def live_buy(C, sold, account, tag):
     coming = sold.get("proceeds", 0.0) if sold.get("auction") else 0.0
     reserve = max(0.0, LIVE_N_DROP * slot - coming) if LIVE_AUCTION else 0.0
     log("live.reserve", "%.0f kept for tomorrow's auction buys" % reserve)
-    # The rest of the cash, lot by lot, to whichever name holds least, held names and today's buys alike.
+    # The rest of the cash, lot by lot, to whichever of today's buys (and held names, with LIVE_TOPUP) holds least.
     held = dict((code, kept[code] * day.close[code]) for code in kept
-                if day.close[code] == day.close[code] and day.tradable(code, BUY))
+                if LIVE_TOPUP and day.close[code] == day.close[code] and day.tradable(code, BUY))
     names = set(held) | set(shares)
     added = dict((code, 0) for code in names)
 

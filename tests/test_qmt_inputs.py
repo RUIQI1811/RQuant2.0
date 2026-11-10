@@ -537,7 +537,7 @@ def test_live_strategy_left_running_plans_again_each_day(capsys) -> None:
     assert len([line for line in lines if line.startswith("[RQ] live.plan_seconds=")]) == 2
 
 
-def test_live_buys_are_capped_at_a_slot_and_idle_money_tops_up_small_holdings(capsys) -> None:
+def test_live_buys_are_capped_and_idle_money_goes_to_todays_buys(capsys) -> None:
     _, names, sent = live_strategy(["20110701093030"], {}, cash=99_000.0)
     names.update(LIVE_TOPK=4)
     day = names["Day"](None, {"A.SH": 10.0, "B.SH": 10.0, "C.SH": 10.0}, {"A.SH": 10.0, "B.SH": 10.0, "C.SH": 10.0},
@@ -547,8 +547,13 @@ def test_live_buys_are_capped_at_a_slot_and_idle_money_tops_up_small_holdings(ca
             "value_after": 2_000.0, "capital": 100_000.0}
     names["live_buy"](None, sold, "1234567890", "RQ20110701")
     # Slot = (2,000 held + 98,000 budget) / 4 = 25,000: B gets about one slot, not the 100,000 the backtest would give
-    # it. The idle money then goes lot by lot to the smaller of A and B, both up to 1.3 slots (32,500 yuan at 10.10);
-    # C opened limit-up and is left alone.
+    # it. By default the idle money only lifts today's buy B, up to 1.3 slots (32,500 yuan at 10.10).
+    assert [(op, code, volume) for op, code, volume, _ in sent] == [(23, "B.SH", 3200)]
+    assert "live.topup" not in capsys.readouterr().out
+    # With LIVE_TOPUP it goes lot by lot to the smaller of A and B; C opened limit-up and is left alone.
+    sent.clear()
+    names.update(LIVE_TOPUP=True)
+    names["live_buy"](None, sold, "1234567890", "RQ20110701")
     assert [(op, code, volume) for op, code, volume, _ in sent] == [(23, "B.SH", 3200), (23, "A.SH", 3100)]
     assert "[RQ] live.topup=A.SH 3100 shares" in capsys.readouterr().out
 
