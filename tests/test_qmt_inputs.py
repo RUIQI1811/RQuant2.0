@@ -565,11 +565,18 @@ def test_live_lot_by_lot_filling_spends_most_of_the_cash(capsys) -> None:
     buys = [(code, 200_000.0 / 30 / price) for code, price in zip(codes, prices, strict=True)]
     sold = {"day": day, "limits": limits, "buys": buys, "sold": 0.0, "kept": {}, "value_after": 0.0,
             "capital": 200_000.0, "auction": True}
+    names.update(LIVE_N_DROP=3, LIVE_TOPK=30)
     names["live_buy"](None, sold, "1234567890", "RQ20110701")
     spent = sum(volume * price for _, _, volume, price in sent)
-    assert len(sent) == 30 and 0.95 * 200_000 < spent <= 200_000 / (1 + names["OPEN_COST"])
+    # Nothing was sold today, so 3 slots (20,000 yuan) stay in cash for tomorrow's auction buys; the rest goes out.
+    assert len(sent) == 30 and 0.85 * 200_000 < spent <= 0.9 * 200_000 / (1 + names["OPEN_COST"])
     # The 80-yuan name (one lot 8,240 yuan at the 3% auction limit) is bought: under 1.5 slots.
     assert any(code == codes[-1] and volume == 100 for _, code, volume, _ in sent)
+    assert "[RQ] live.reserve=20000 kept for tomorrow's auction buys" in capsys.readouterr().out
+    # When today's sales bring in the 3 slots, nothing more is kept back.
+    sent.clear()
+    names["live_buy"](None, dict(sold, proceeds=20_000.0), "1234567890", "RQ20110701")
+    assert sum(volume * price for _, _, volume, price in sent) > 0.95 * 200_000
 
 
 def test_live_capital_zero_uses_the_whole_account(capsys) -> None:

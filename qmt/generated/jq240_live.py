@@ -1801,7 +1801,7 @@ def live_sell(C, plan, account, tag, auction=False):
                 dict((code, day.close[code]) for code in held),
                 dict((code, 1 if positions[code][1] > 0 else 0) for code in held))
     sells, buys = decide(plan["scores"], book, day, LIVE_TOPK, LIVE_N_DROP)
-    sold, sent = 0.0, 0
+    sold, sent, proceeds = 0.0, 0, 0.0
     kept = dict((code, positions[code][0]) for code in held)
     for code, shares in sells:
         sellable = positions[code][1]
@@ -1810,13 +1810,15 @@ def live_sell(C, plan, account, tag, auction=False):
         if sellable > 0:
             send(C, account, "sell", code, sellable, price, tag)
             sent += 1
+            if day.close[code] == day.close[code]:
+                proceeds += sellable * day.close[code] * (1 - CLOSE_COST)
             sold += sellable * price * (1 - CLOSE_COST)
             kept[code] -= sellable
             if kept[code] <= 0:
                 kept.pop(code)
     value_after = sum(kept[code] * day.close[code] for code in kept if day.close[code] == day.close[code])
     return {"day": day, "limits": limits, "buys": buys, "sold": sold, "kept": kept, "value_after": value_after,
-            "capital": capital, "sells": sent, "auction": auction}
+            "capital": capital, "sells": sent, "auction": auction, "proceeds": proceeds}
 
 
 def _lots(shares):
@@ -1858,6 +1860,11 @@ def live_buy(C, sold, account, tag):
             continue
         shares[code] = count
         left -= count * price * (1 + OPEN_COST)
+    # Auction buys can only use the cash on hand before 09:25, so keep enough back that tomorrow starts with
+    # LIVE_N_DROP slots of cash. Sales in today's auction pay out after it and count towards that.
+    coming = sold.get("proceeds", 0.0) if sold.get("auction") else 0.0
+    reserve = max(0.0, LIVE_N_DROP * slot - coming) if LIVE_AUCTION else 0.0
+    log("live.reserve", "%.0f kept for tomorrow's auction buys" % reserve)
     # The rest of the cash, lot by lot, to whichever name holds least, held names and today's buys alike.
     held = dict((code, kept[code] * day.close[code]) for code in kept
                 if day.close[code] == day.close[code] and day.tradable(code, BUY))
@@ -1871,7 +1878,8 @@ def live_buy(C, sold, account, tag):
         best = None
         for code in names:
             price = price_of(code)
-            if TRADE_UNIT * price * (1 + OPEN_COST) > left or value(code) + TRADE_UNIT * price > LIVE_FILL_MAX * slot:
+            lot = TRADE_UNIT * price * (1 + OPEN_COST)
+            if lot > left - reserve or value(code) + TRADE_UNIT * price > LIVE_FILL_MAX * slot:
                 continue
             if best is None or (value(code), code) < (value(best), best):
                 best = code
