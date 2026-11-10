@@ -34,6 +34,7 @@ from rquant.reporting import build_report
 from rquant.runs import RunContext
 from rquant.universe import SUPPORTED_UNIVERSES
 from rquant.workflow.backtest import (
+    ENTRIES,
     RISK_MODELS,
     STRATEGIES,
     PortfolioBacktestRunner,
@@ -160,6 +161,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=RISK_MODELS,
         help="Override backtest.enhanced_indexing.risk_model: PCA factors of past returns, or Shenwan industries + "
         "CNE6 styles from the barra_cne6 store (industry and size limits)",
+    )
+    report.add_argument(
+        "--entry",
+        choices=ENTRIES,
+        help="Override backtest.entry: trade each signal at the next open (default) or at the signal day's own close "
+        "(an upper bound for scoring near the close and buying in the closing auction)",
+    )
+    report.add_argument(
+        "--max-open-gap",
+        type=float,
+        help="Override backtest.max_open_gap: with --entry open, skip buying stocks that open more than this fraction "
+        "above their previous close (e.g. 0.03); the next-ranked tradable stock is bought instead",
     )
     report.add_argument(
         "--signal-only",
@@ -676,7 +689,10 @@ def _report(args: argparse.Namespace) -> int:
         if not predictions_path.exists():
             raise DataContractError(f"Predictions do not exist: {predictions_path}")
         if args.signal_only:
-            portfolio_options = (args.topk, args.n_drop, args.rebalance_days, args.strategy, args.risk_model)
+            portfolio_options = (
+                args.topk, args.n_drop, args.rebalance_days, args.strategy, args.risk_model, args.entry,
+                args.max_open_gap,
+            )
             if any(value is not None for value in portfolio_options):
                 raise DataContractError("--signal-only runs no backtest; drop the portfolio options")
             return _signal_report(run, paths, args.run_id, run_directory, predictions_path)
@@ -695,6 +711,8 @@ def _report(args: argparse.Namespace) -> int:
             universe=_walk_forward_universe(run_directory, config),
             rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
             strategy=args.strategy or str(backtest.get("strategy", "topk-dropout")),
+            entry=args.entry or str(backtest.get("entry", "open")),
+            max_open_gap=args.max_open_gap if args.max_open_gap is not None else backtest.get("max_open_gap"),
             **{
                 **_enhanced_indexing_options(backtest.get("enhanced_indexing") or {}),
                 **({"risk_model": args.risk_model} if args.risk_model else {}),

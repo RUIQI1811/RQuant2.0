@@ -367,6 +367,94 @@ class DataPipelineTests(unittest.TestCase):
         trades = self.pd.read_parquet(run_directory / "trades.parquet")
         self.assertEqual({"SZ000002"}, set(trades["instrument"]))
 
+    def _add_trading_day_2020_01_07(self) -> None:
+        """Bars for both stocks on 2020-01-07 (and a calendar day after it), so a buy on 2020-01-06 is not the
+        backtest's final (liquidation) step."""
+        pd = self.pd
+        new_rows = {
+            "daily": [
+                ["000001.SZ", "20200107", 12.1, 12.5, 11.9, 12.2, 12.0, 3.0, 6.0],
+                ["000002.SZ", "20200107", 20.6, 21.0, 20.4, 20.8, 20.5, 2.0, 4.2],
+            ],
+            "adj_factor": [["000001.SZ", "20200107", 2.4], ["000002.SZ", "20200107", 1.0]],
+            "daily_basic": [["000001.SZ", "20200107", 12.2], ["000002.SZ", "20200107", 20.8]],
+            "stk_limit": [["000001.SZ", "20200107", 13.2, 10.8], ["000002.SZ", "20200107", 22.55, 18.45]],
+            "index_weight": [["399300.SZ", "000001.SZ", "20200107", 1.0], ["399300.SZ", "000002.SZ", "20200107", 1.0]],
+            "index_daily": [["399300.SZ", "20200107", 4020.0, 4040.0, 4010.0, 4030.0, 1.0, 1.0, 0.25]],
+            # Qlib reads the calendar day after a backtest's last step.
+            "trade_cal": [["20200108", 1]],
+        }
+        for endpoint, rows in new_rows.items():
+            path = self.raw / endpoint / "fixture" / "data.parquet"
+            frame = pd.read_parquet(path)
+            pd.concat([frame, pd.DataFrame(rows, columns=frame.columns)], ignore_index=True).to_parquet(
+                path, index=False
+            )
+
+    def _backtest_trades(self, rows: list[tuple[str, str, float]], **options: object) -> object:
+        run_directory = self.root / f"run-{len(list(self.root.glob('run-*')))}"
+        run_directory.mkdir()
+        self.pd.DataFrame(
+            [[self.pd.Timestamp(day), code, score] for day, code, score in rows],
+            columns=["datetime", "instrument", "score"],
+        ).to_parquet(run_directory / "predictions.parquet", index=False)
+        result = PortfolioBacktestRunner(
+            qlib_root=self.qlib,
+            run_directory=run_directory,
+            config=PortfolioConfig(initial_capital=100_000, topk=1, n_drop=1, **options),
+        ).run()
+        return result, self.pd.read_parquet(run_directory / "trades.parquet")
+
+    # Break caught: an open-gap rule Qlib cannot evaluate (its And/Or fail on float series), or one that blocks the
+    # wrong stock instead of letting TopkDropout take the next-ranked one.
+    def test_max_open_gap_skips_a_stock_that_opens_too_far_above_its_previous_close(self) -> None:
+        self._add_trading_day_2020_01_07()
+        CanonicalBuilder(self.raw, self.canonical).build()
+        QlibProviderBuilder(self.canonical, self.qlib).build()
+        # Traded at the 2020-01-06 open: SZ000002 opens 20.5 after a 20.0 close (+2.5%); SZ000001 has no previous
+        # close (suspended on 2020-01-03), so no gap.
+        rows = [("2020-01-03", "SZ000002", 2.0), ("2020-01-03", "SZ000001", 1.0), ("2020-01-06", "SZ000002", 1.0)]
+        _, plain = self._backtest_trades(rows)
+        result, gapped = self._backtest_trades(rows, max_open_gap=0.02)
+        _, loose = self._backtest_trades(rows, max_open_gap=0.03)
+
+        def bought(trades: object) -> set[str]:
+            return set(trades.loc[trades["direction"] == "buy", "instrument"])
+
+        self.assertEqual({"SZ000002"}, bought(plain))
+        self.assertEqual({"SZ000001"}, bought(gapped))
+        self.assertEqual({"SZ000002"}, bought(loose))
+        self.assertIn("2.0% above the previous close", result["constraints"]["price_limit"])
+
+    # Break caught: an option silently ignored where it cannot apply.
+    def test_entry_options_reject_combinations_they_do_not_support(self) -> None:
+        for options in (
+            {"entry": "auction"},
+            {"entry": "close", "max_open_gap": 0.03},
+            {"max_open_gap": 0.0},
+            {"strategy": "enhanced-indexing", "entry": "close"},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                PortfolioConfig(**options)
+
+    # Break caught: a close entry that still trades at the next open (signal not re-dated), or a close-limit rule
+    # Qlib cannot evaluate.
+    def test_close_entry_trades_the_signal_at_its_own_close(self) -> None:
+        self._add_trading_day_2020_01_07()
+        CanonicalBuilder(self.raw, self.canonical).build()
+        QlibProviderBuilder(self.canonical, self.qlib).build()
+        rows = [("2020-01-03", "SZ000002", 1.0), ("2020-01-06", "SZ000002", 1.0)]
+        _, at_open = self._backtest_trades(rows)
+        result, at_close = self._backtest_trades(rows, entry="close")
+
+        def first_buy(trades: object) -> object:
+            return trades.loc[trades["direction"] == "buy", "datetime"].min()
+
+        self.assertEqual(self.pd.Timestamp("2020-01-06"), first_buy(at_open))
+        self.assertEqual(self.pd.Timestamp("2020-01-03"), first_buy(at_close))
+        self.assertTrue(result["constraints"]["deal_price"].startswith("signal day close"))
+        self.assertEqual("2020-01-02", result["start"])
+
 
 @unittest.skipUnless(HAS_PARQUET, "pandas and pyarrow are required")
 class CollectorResumeTests(unittest.TestCase):

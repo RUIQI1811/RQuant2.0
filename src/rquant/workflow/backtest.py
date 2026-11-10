@@ -13,6 +13,10 @@ from rquant.qlib_ext.loader import LABEL_EXPRESSIONS
 
 STRATEGIES = ("topk-dropout", "enhanced-indexing")
 RISK_MODELS = ("statistical", "structured")
+ENTRIES = ("open", "close")
+# A Shanghai main-board stock (not ST) closes at its +/-10% limit when its close is the day's high (low) and the raw
+# change is at least 9.5%: the limits round to the cent, so a limit day's change is 9.5%-10.5%, never below.
+CLOSE_LIMIT_CHANGE = 0.095
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,13 @@ class PortfolioConfig:
     turnover_limit: float = 0.2
     benchmark_deviation: float | None = 0.01
     risk_degree: float = 0.95
+    # "open": trade the signal of day t at the open of t+1 (the default). "close": trade it at the close of t itself,
+    # as a strategy that scores near the close (e.g. 14:50 Beijing) and buys in the closing auction would; the signal
+    # still uses t's full-day bar, so this is an upper bound on what such a strategy gets.
+    entry: str = "open"
+    # With entry "open": do not buy a stock whose open is more than this fraction above its previous close (TopkDropout
+    # takes the next-ranked tradable stock instead), as a buy order capped at previous close * (1 + max_open_gap) would.
+    max_open_gap: float | None = None
 
     def __post_init__(self) -> None:
         if self.topk < 1:
@@ -80,6 +91,12 @@ class PortfolioConfig:
             raise ValueError(f"benchmark_deviation must not be negative, got {self.benchmark_deviation}")
         if not 0 < self.risk_degree <= 1:
             raise ValueError(f"risk_degree must be in (0, 1], got {self.risk_degree}")
+        if self.entry not in ENTRIES:
+            raise ValueError(f"entry must be one of {ENTRIES}, got {self.entry}")
+        if self.strategy != "topk-dropout" and (self.entry != "open" or self.max_open_gap is not None):
+            raise ValueError("entry 'close' and max_open_gap are only supported with the topk-dropout strategy")
+        if self.max_open_gap is not None and (self.entry != "open" or self.max_open_gap <= 0):
+            raise ValueError(f"max_open_gap needs entry 'open' and must be positive, got {self.max_open_gap}")
 
 
 class PortfolioBacktestRunner:
@@ -139,11 +156,17 @@ class PortfolioBacktestRunner:
         )
         from qlib.data import D
 
-        start_time = predictions["datetime"].min()
         signal_end = predictions["datetime"].max()
         later = D.calendar(start_time=signal_end, freq="day")
         end_time = next((value for value in later if pd.Timestamp(value) > signal_end), signal_end)
         signal = predictions.set_index(["datetime", "instrument"])["score"].sort_index()
+        # Qlib trades step d on the signal of the step before d; to trade at t's close, the signal of t is dated t-1.
+        trade_signal = (
+            shift_to_previous_trading_day(signal, D.calendar(end_time=signal_end, freq="day"))
+            if self.config.entry == "close"
+            else signal
+        )
+        start_time = trade_signal.index.get_level_values("datetime").min()
         signal_days = int(
             keep_rebalance_dates(signal, self.config.rebalance_days).index.get_level_values("datetime").nunique()
         )
@@ -164,6 +187,7 @@ class PortfolioBacktestRunner:
             cost_model=cost_model,
             trade_unit=self.config.trade_unit,
             impact_cost=self.config.impact_cost,
+            **exchange_trading_rules(self.config),
         )
         optimization_log = OptimizationLog()
         if self.config.strategy == "enhanced-indexing":
@@ -224,6 +248,9 @@ class PortfolioBacktestRunner:
             else:
                 # As in SignalRecord, a label that cannot be built (no horizon) is saved as None; nothing is scored.
                 recorder.save_objects(**{"label.pkl": None})
+            if trade_signal is not signal:
+                # Scored above on its own dates; PortAnaRecord trades (and dates the backtest by) the re-dated copy.
+                recorder.save_objects(**{"pred.pkl": trade_signal.to_frame("score")})
             artifacts = PortAnaRecord(
                 recorder,
                 config=port_analysis_config,
@@ -275,7 +302,11 @@ class PortfolioBacktestRunner:
             "signal_days": signal_days,
             "constraints": {
                 "rebalance": _rebalance_description(self.config),
-                "deal_price": "next trading day open",
+                "deal_price": (
+                    "signal day close (signal re-dated to the previous trading day)"
+                    if self.config.entry == "close"
+                    else "next trading day open"
+                ),
                 "long_only": True,
                 "equal_weight": self.config.strategy == "topk-dropout",
                 "weights": _weighting_description(self.config),
@@ -285,7 +316,7 @@ class PortfolioBacktestRunner:
                     else "daily steps: a stock bought at one open is sold at the earliest on the next"
                 ),
                 "suspension": "Qlib $close NaN",
-                "open_limit": "direction-aware $limit_buy/$limit_sell",
+                "price_limit": _limit_description(self.config),
                 "market_impact": (
                     f"impact_cost * (trade_value / daily_value)^2, impact_cost={self.config.impact_cost}"
                     if self.config.impact_cost
@@ -525,6 +556,54 @@ def _weighting_description(config: PortfolioConfig) -> str:
         f"risk aversion {config.risk_aversion}, turnover limit {config.turnover_limit}, "
         f"per-stock deviation {config.benchmark_deviation}, {risk}, risk degree {config.risk_degree}"
     )
+
+
+def exchange_trading_rules(config: PortfolioConfig) -> dict[str, Any]:
+    """The Qlib ``Exchange`` deal price and (buy, sell) limit expressions for ``config``'s entry.
+
+    A limit expression is true where that side cannot trade. Qlib's And/Or are bitwise and fail on its float series,
+    so a conjunction is a product and a disjunction a ``Greater`` (maximum) of 0/1 series.
+    """
+    if config.entry == "close":
+        return {
+            "deal_price": "$close",
+            "limit_threshold": (
+                f"Ge($change, {CLOSE_LIMIT_CHANGE}) * Ge($close, $high)",
+                f"Le($change, -{CLOSE_LIMIT_CHANGE}) * Le($close, $low)",
+            ),
+        }
+    buy_limit = "$limit_buy"
+    if config.max_open_gap is not None:
+        buy_limit = f"Greater($limit_buy, Gt($open / Ref($close, 1), {1.0 + config.max_open_gap}))"
+    return {"deal_price": "$open", "limit_threshold": (buy_limit, "$limit_sell")}
+
+
+def shift_to_previous_trading_day(signal: Any, calendar: Any) -> Any:
+    """``signal`` (on a <datetime, instrument> index) with every date replaced by the trading day before it."""
+    import pandas as pd
+
+    days = pd.DatetimeIndex(pd.to_datetime(list(calendar))).normalize()
+    dates = pd.DatetimeIndex(signal.index.get_level_values("datetime")).normalize()
+    positions = days.get_indexer(dates)
+    if (positions < 1).any():
+        missing = dates[positions < 1][0]
+        raise DataContractError(f"No trading day before signal date {missing.date()} in the provider calendar")
+    index = pd.MultiIndex.from_arrays(
+        [days[positions - 1], signal.index.get_level_values("instrument")], names=signal.index.names
+    )
+    return pd.Series(signal.to_numpy(), index=index, name=signal.name).sort_index()
+
+
+def _limit_description(config: PortfolioConfig) -> str:
+    if config.entry == "close":
+        return (
+            f"no buy (sell) when the close is the day's high (low) with a raw change of at least "
+            f"+{CLOSE_LIMIT_CHANGE:.1%} (-{CLOSE_LIMIT_CHANGE:.1%})"
+        )
+    rule = "direction-aware $limit_buy/$limit_sell (open at the limit)"
+    if config.max_open_gap is not None:
+        rule += f"; no buy when the open is more than {config.max_open_gap:.1%} above the previous close"
+    return rule
 
 
 def _rebalance_description(config: PortfolioConfig) -> str:

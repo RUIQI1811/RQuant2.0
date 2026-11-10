@@ -1033,6 +1033,14 @@ long-only 回测并做 `risk_analysis`。策略（`rquant.qlib_ext.strategy.Liqu
 rquant report RUN_ID --n-drop 5 --rebalance-days 1
 ```
 
+成交时点的两个实验选项（只用于 `topk-dropout`）：
+
+- `--max-open-gap 0.03`（`backtest.max_open_gap`）：开盘价高于前收盘 3% 以上的股票不买，TopkDropout 改买排名下一只能买的；
+  相当于买单限价前收盘 +3%、开盘后再决定买哪些。
+- `--entry close`（`backtest.entry`）：信号日 t 的信号在 t 日收盘价成交（信号日期提前一个交易日交给 Qlib），
+  收盘涨停不可买、收盘跌停不可卖（收盘价等于最高价或最低价且涨跌幅至少 9.5%，沪市主板）。信号仍用 t 日全天的日线，
+  所以是「14:50 左右打分、尾盘集合竞价买入」的上限。
+
 ### 组合优化（增强指数）
 
 `--strategy enhanced-indexing`（或配置 `backtest.strategy`）改用 Qlib 的增强指数组合优化代替等权 top50：
