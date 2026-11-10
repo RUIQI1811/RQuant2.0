@@ -1676,6 +1676,9 @@ LIVE_BUY_GAP = 20  # seconds between sending the sells and the buys, whatever th
 LIVE_STOP_AT = "100000"
 LIVE_SLIP = 0.01  # limit price offset from the last price; capped at the daily limit
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
+LIVE_FILL_MAX = 1.3  # idle cash tops names up lot by lot, to at most this many slots each
+LIVE_FIRST_LOT_MAX = 1.5  # a new name whose one lot is above a slot is still bought if the lot is under this
+LIVE_TOPUP_MIN = 0.2  # top-ups of a held name under this many slots are not sent (5 yuan minimum commission)
 LIVE_RETRY = 600  # seconds before planning again after the data was not ready
 LIVE_TAG = "RQ"
 BUY_OP, SELL_OP, BY_SHARES, LIMIT_PRICE, RIGHT_AWAY = 23, 24, 1101, 11, 2
@@ -1821,9 +1824,10 @@ def _lots(shares):
 
 
 def live_buy(C, sold, account, tag):
-    """New names as the backtest sizes them, at most one slot (the strategy's money / LIVE_TOPK) each; then, when a
-    slot or more of the budget is still idle (money added, or the first days), top up holdings under a slot,
-    smallest first."""
+    """New names as the backtest sizes them, at most one slot (the strategy's money / LIVE_TOPK) each; then the idle
+    cash goes out one lot at a time, always to the name furthest below its share, up to LIVE_FILL_MAX slots a name.
+    With ~6,000 yuan slots and 100-share lots of up to 5,000 yuan, flooring each name to a slot left a quarter of the
+    money idle."""
     cash, _ = read_account(account)
     if LIVE_DRY_RUN:
         cash += sold["sold"]  # nothing was really sold
@@ -1831,7 +1835,6 @@ def live_buy(C, sold, account, tag):
     budget = max(0.0, min(cash, sold["capital"] - sold["value_after"]))
     slot = (sold["value_after"] + budget) / LIVE_TOPK
     ceiling = LIVE_MAX_ORDER * sold["capital"] / LIVE_TOPK
-
     slip = LIVE_AUCTION_BUY if sold.get("auction") else LIVE_SLIP
 
     def price_of(code):
@@ -1843,27 +1846,51 @@ def live_buy(C, sold, account, tag):
     scale = min(1.0, budget / planned) if planned > 0 else 0.0
     log("live.buy_budget", "%.2f planned %.2f scale %.3f slot %.0f" % (budget, planned, scale, slot))
     left = budget
+    shares = {}  # code -> shares to buy today
     for code, amount, price in orders:
-        shares = _lots(amount * scale)
-        if shares <= 0:
-            log("live.skip_buy", "%s too dear for its share of the cash" % code)
-        elif shares * price > ceiling:
-            log("live.skip_buy", "%s order %.0f yuan above the %.0f ceiling" % (code, shares * price, ceiling))
-        else:
-            send(C, account, "buy", code, shares, price, tag)
-            left -= shares * price * (1 + OPEN_COST)
-    if left < slot:
-        return
-    for code in sorted(kept, key=lambda name: (kept[name] * day.close[name], name)):
-        if not day.tradable(code, BUY):
+        lot = TRADE_UNIT * price * (1 + OPEN_COST)
+        count = _lots(amount * scale)
+        if count <= 0 and TRADE_UNIT * price <= LIVE_FIRST_LOT_MAX * slot and lot <= left:
+            count = TRADE_UNIT  # one lot is a little above a slot: still worth holding
+        if count <= 0:
+            log("live.skip_buy", "%s one lot (%.0f yuan) is too dear for its share of the cash" % (
+                code, TRADE_UNIT * price))
             continue
-        price = price_of(code)
-        gap = slot - kept[code] * day.close[code]
-        shares = _lots(min(gap, left / (1 + OPEN_COST)) / price)
-        if shares * price < 0.2 * slot:  # not worth a 5 yuan commission
+        shares[code] = count
+        left -= count * price * (1 + OPEN_COST)
+    # The rest of the cash, lot by lot, to whichever name holds least, held names and today's buys alike.
+    held = dict((code, kept[code] * day.close[code]) for code in kept
+                if day.close[code] == day.close[code] and day.tradable(code, BUY))
+    names = set(held) | set(shares)
+    added = dict((code, 0) for code in names)
+
+    def value(code):
+        return held.get(code, 0.0) + (shares.get(code, 0) + added[code]) * price_of(code)
+
+    while True:
+        best = None
+        for code in names:
+            price = price_of(code)
+            if TRADE_UNIT * price * (1 + OPEN_COST) > left or value(code) + TRADE_UNIT * price > LIVE_FILL_MAX * slot:
+                continue
+            if best is None or (value(code), code) < (value(best), best):
+                best = code
+        if best is None:
+            break
+        added[best] += TRADE_UNIT
+        left -= TRADE_UNIT * price_of(best) * (1 + OPEN_COST)
+    for code, amount, price in orders:
+        count = shares.get(code, 0) + added.get(code, 0)
+        if count <= 0:
             continue
-        send(C, account, "topup", code, shares, price, tag)
-        left -= shares * price * (1 + OPEN_COST)
+        if count * price > ceiling:
+            log("live.skip_buy", "%s order %.0f yuan above the %.0f ceiling" % (code, count * price, ceiling))
+            continue
+        send(C, account, "buy", code, count, price, tag)
+    for code in sorted(held, key=lambda name: (held[name], name)):
+        count = added.get(code, 0)
+        if count and count * price_of(code) >= LIVE_TOPUP_MIN * slot:  # not worth a 5 yuan commission below
+            send(C, account, "topup", code, count, price_of(code), tag)
 
 
 def live_step(C, plan):

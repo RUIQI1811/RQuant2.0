@@ -546,10 +546,30 @@ def test_live_buys_are_capped_at_a_slot_and_idle_money_tops_up_small_holdings(ca
     sold = {"day": day, "limits": limits, "buys": [("B.SH", 10_000.0)], "sold": 0.0, "kept": {"A.SH": 100, "C.SH": 100},
             "value_after": 2_000.0, "capital": 100_000.0}
     names["live_buy"](None, sold, "1234567890", "RQ20110701")
-    # Slot = (2,000 held + 98,000 budget) / 4 = 25,000: B gets one slot, not the 100,000 the backtest would give it.
-    # The idle money then tops A up to a slot; C opened limit-up and is left alone.
-    assert [(op, code, volume) for op, code, volume, _ in sent] == [(23, "B.SH", 2400), (23, "A.SH", 2300)]
-    assert "[RQ] live.topup=A.SH 2300 shares" in capsys.readouterr().out
+    # Slot = (2,000 held + 98,000 budget) / 4 = 25,000: B gets about one slot, not the 100,000 the backtest would give
+    # it. The idle money then goes lot by lot to the smaller of A and B, both up to 1.3 slots (32,500 yuan at 10.10);
+    # C opened limit-up and is left alone.
+    assert [(op, code, volume) for op, code, volume, _ in sent] == [(23, "B.SH", 3200), (23, "A.SH", 3100)]
+    assert "[RQ] live.topup=A.SH 3100 shares" in capsys.readouterr().out
+
+
+def test_live_lot_by_lot_filling_spends_most_of_the_cash(capsys) -> None:
+    # 200,000 yuan in 30 names of 3 to 80 yuan: 100-share lots of 300 to 8,000 yuan against ~6,700 yuan slots.
+    _, names, sent = live_strategy(["20110701092130"], {}, cash=200_000.0)
+    prices = [3.0 + 77.0 * n / 29 for n in range(30)]
+    codes = [f"60{n:04d}.SH" for n in range(30)]
+    flags = {code: False for code in codes}
+    price = dict(zip(codes, prices, strict=True))
+    day = names["Day"](None, price, price, {code: 1.0 for code in codes}, flags, flags)
+    limits = {code: (price * 1.1, price * 0.9) for code, price in zip(codes, prices, strict=True)}
+    buys = [(code, 200_000.0 / 30 / price) for code, price in zip(codes, prices, strict=True)]
+    sold = {"day": day, "limits": limits, "buys": buys, "sold": 0.0, "kept": {}, "value_after": 0.0,
+            "capital": 200_000.0, "auction": True}
+    names["live_buy"](None, sold, "1234567890", "RQ20110701")
+    spent = sum(volume * price for _, _, volume, price in sent)
+    assert len(sent) == 30 and 0.95 * 200_000 < spent <= 200_000 / (1 + names["OPEN_COST"])
+    # The 80-yuan name (one lot 8,240 yuan at the 3% auction limit) is bought: under 1.5 slots.
+    assert any(code == codes[-1] and volume == 100 for _, code, volume, _ in sent)
 
 
 def test_live_capital_zero_uses_the_whole_account(capsys) -> None:
