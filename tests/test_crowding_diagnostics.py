@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -96,6 +97,29 @@ class CrowdingDiagnosticsTests(unittest.TestCase):
         self.assertEqual(3, summary.loc["ALL", "factors"])
         self.assertAlmostEqual(0.035, by_year.loc["momentum", 2020])
         self.assertEqual(233, len(module.jq240_categories()))
+
+    # Break caught: factor IC read from the wrong rows or year, or a factor column paired with another's values.
+    def test_factor_years_reads_columns_in_chunks_per_year(self) -> None:
+        module = _load_script()
+        panel = _panel(pd.bdate_range("2021-12-27", "2022-01-07"), 30)
+        factors = panel[["datetime", "instrument"]].copy()
+        factors["jq_001"] = panel["label"]
+        factors["jq_002"] = -panel["pre"]
+        factors["jq_003"] = panel["next"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for year, part in factors.groupby(factors["datetime"].dt.year):
+                (root / f"year={year}").mkdir()
+                part.to_parquet(root / f"year={year}" / "factors.parquet", index=False)
+            table = module.factor_years(panel, root, ["jq_001", "jq_002", "jq_003"], chunk=2)
+
+        table = table.set_index(["factor", "year"])
+        self.assertEqual(6, len(table))
+        self.assertAlmostEqual(1.0, table.loc[("jq_001", 2022), "rank_ic_mean"])
+        self.assertEqual(5, table.loc[("jq_001", 2022), "days"])
+        # Small caps follow the score and the rest are flat, so -pre ranks against the label negatively.
+        self.assertLess(table.loc[("jq_002", 2021), "rank_ic_mean"], -0.3)
+        self.assertLess(abs(table.loc[("jq_003", 2021), "rank_ic_mean"]), 0.5)
 
 
 if __name__ == "__main__":

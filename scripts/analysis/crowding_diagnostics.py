@@ -1,9 +1,9 @@
-"""Does the post-2022 decline look like crowding? Read-only diagnostics on a finished run and a factor evaluation.
+"""Does the post-2022 decline look like crowding? Read-only diagnostics on a finished run and its factors.
 
 Usage (from anywhere; nothing is trained and nothing under data/ is written):
 
     python scripts/analysis/crowding_diagnostics.py <project_root> <run> [--universe sh_main] [--topk 50]
-        [--factor-evaluation <factors-evaluate run dir>] [--out <dir>]
+        [--factors] [--out <dir>]
 
 ``<run>`` is a folder under ``<project_root>/runs/walk-forward`` with ``predictions.parquet``. Every signal date t is
 traded at the open of t+1 and held to the open of t+2 (the 1d label). Each (t, stock) row gets:
@@ -18,10 +18,11 @@ captured ``label`` excess falls), that IC decays fastest where crowded money tra
 and that the signal decays faster (``next`` IC shrinks). A regime change (a style crash, a bear market) instead shows up
 as a negative small-minus-large spread and a broad IC drop across categories and sizes.
 
-Outputs (CSV, printed too): ``yearly.csv`` (per signal year plus 2013-2021 and 2022+ rows) and, with
-``--factor-evaluation`` (a ``rquant factors evaluate --horizon 1d`` run dir), ``categories.csv`` and
-``category_years.csv``: the mean sign-aligned Rank IC of the jq240 factors per category, with each factor's sign fixed
-from its 2013-2021 Rank IC so a factor that flips counts as negative.
+Outputs (CSV, printed too): ``yearly.csv`` (per signal year plus 2013-2021 and 2022+ rows) and, with ``--factors``,
+``factor_years.csv`` (each jq240 factor's mean daily Rank IC against the same label on the same stocks, per year, read
+from ``data/factors-<universe>/jq240`` a few columns at a time so memory stays small), ``categories.csv`` and
+``category_years.csv``: the mean sign-aligned Rank IC per jq240 category, with each factor's sign fixed from its
+2013-2021 Rank IC so a factor that flips counts as negative.
 """
 
 from __future__ import annotations
@@ -140,6 +141,32 @@ def category_tables(annual: pd.DataFrame, categories: dict[str, str]) -> tuple[p
     return summary.sort_values("retained"), by_year
 
 
+def factor_years(panel: pd.DataFrame, factor_dir: Path, names: list[str], chunk: int = 16) -> pd.DataFrame:
+    """Mean daily Rank IC of each factor against ``panel``'s label on ``panel``'s rows, per partition year.
+
+    Reads ``chunk`` factor columns of one ``year=*/factors.parquet`` at a time (rows of ~1,700 stocks x ~243 days),
+    so the peak is a few hundred MB instead of the whole 233-column year.
+    """
+    labels = panel.loc[panel["label"].notna(), [*KEYS, "label"]]
+    rows = []
+    for path in sorted(factor_dir.glob("year=*/factors.parquet")):
+        year = int(path.parent.name.removeprefix("year="))
+        target = labels[labels["datetime"].dt.year == year]
+        if target.empty:
+            continue
+        for start in range(0, len(names), chunk):
+            columns = names[start : start + chunk]
+            factors = pd.read_parquet(path, columns=[*KEYS, *columns])
+            factors["datetime"] = pd.to_datetime(factors["datetime"]).dt.normalize()
+            factors["instrument"] = factors["instrument"].astype(str)
+            merged = target.merge(factors, on=KEYS, how="inner")
+            for name in columns:
+                ic = daily_rank_ic(merged, name, "label")
+                rows.append({"factor": name, "year": year, "rank_ic_mean": ic.mean(), "days": len(ic)})
+        print(f"factors {year}: {len(names)} factors on {len(target)} labelled rows", flush=True)
+    return pd.DataFrame(rows)
+
+
 def jq240_categories() -> dict[str, str]:
     from rquant.factors.libraries.jq240 import JQ240
 
@@ -155,7 +182,8 @@ def load_panel(root: Path, run: Path) -> pd.DataFrame:
     from rquant.qlib_ext.runtime import qlib_init_kwargs
 
     predictions = pd.read_parquet(run / "predictions.parquet", columns=[*KEYS, "score"])
-    predictions["datetime"] = pd.to_datetime(predictions["datetime"])
+    predictions["datetime"] = pd.to_datetime(predictions["datetime"]).dt.normalize()
+    predictions["instrument"] = predictions["instrument"].astype(str)
     qlib.init(provider_uri=str(root / "data" / "qlib"), region=REG_CN, **qlib_init_kwargs())
     parts = []
     for year, scores in predictions.groupby(predictions["datetime"].dt.year):
@@ -164,12 +192,14 @@ def load_panel(root: Path, run: Path) -> pd.DataFrame:
         features = D.features(instruments, list(FIELDS.values()), start_time=first, end_time=last, freq="day")
         features = features.rename(columns={expression: name for name, expression in FIELDS.items()})[RETURNS]
         features = features.reset_index()
-        features["datetime"] = pd.to_datetime(features["datetime"])
+        features["datetime"] = pd.to_datetime(features["datetime"]).dt.normalize()
+        features["instrument"] = features["instrument"].astype(str)
         caps = pd.read_parquet(
             root / "data" / "canonical" / "reference" / "daily_basic" / f"year={year}" / "data.parquet",
             columns=[*KEYS, "circ_mv"],
         )
-        caps["datetime"] = pd.to_datetime(caps["datetime"])
+        caps["datetime"] = pd.to_datetime(caps["datetime"]).dt.normalize()
+        caps["instrument"] = caps["instrument"].astype(str)
         caps = caps.drop_duplicates(KEYS, keep="last")
         part = scores.merge(features, on=KEYS, how="left").merge(caps, on=KEYS, how="left")
         parts.append(part)
@@ -187,7 +217,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("root", type=Path)
     parser.add_argument("run")
     parser.add_argument("--topk", type=int, default=50)
-    parser.add_argument("--factor-evaluation", type=Path)
+    parser.add_argument("--universe", default="sh_main")
+    parser.add_argument("--factors", action="store_true", help="also compute jq240 per-category Rank IC decay")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     out = args.out or args.root / "runs" / "crowding" / args.run
@@ -200,9 +231,12 @@ def main(argv: list[str] | None = None) -> None:
     yearly.to_csv(out / "yearly.csv")
     _print(f"Model signal per signal year (top{args.topk}; top_* and small_minus_large in bp/day)", yearly)
 
-    if args.factor_evaluation:
-        annual = pd.read_csv(args.factor_evaluation / "annual_effectiveness.csv")
-        summary, by_year = category_tables(annual, jq240_categories())
+    if args.factors:
+        categories = jq240_categories()
+        factor_dir = args.root / "data" / ("factors" if args.universe == "csi300" else f"factors-{args.universe}")
+        annual = factor_years(panel, factor_dir / "jq240", list(categories))
+        annual.to_csv(out / "factor_years.csv", index=False)
+        summary, by_year = category_tables(annual, categories)
         summary.to_csv(out / "categories.csv")
         by_year.to_csv(out / "category_years.csv")
         _print(f"jq240 sign-aligned Rank IC by category: before {SPLIT_YEAR} vs {SPLIT_YEAR}+", summary)
