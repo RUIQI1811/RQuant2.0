@@ -184,7 +184,8 @@ def load_panel(root: Path, run: Path) -> pd.DataFrame:
     predictions = pd.read_parquet(run / "predictions.parquet", columns=[*KEYS, "score"])
     predictions["datetime"] = pd.to_datetime(predictions["datetime"]).dt.normalize()
     predictions["instrument"] = predictions["instrument"].astype(str)
-    qlib.init(provider_uri=str(root / "data" / "qlib"), region=REG_CN, **qlib_init_kwargs())
+    # One expression worker: the run shares a 16 GB laptop with QMT, and the pool's workers cost ~1 GB more.
+    qlib.init(provider_uri=str(root / "data" / "qlib"), region=REG_CN, **{**qlib_init_kwargs(), "kernels": 1})
     parts = []
     for year, scores in predictions.groupby(predictions["datetime"].dt.year):
         first, last = scores["datetime"].min(), scores["datetime"].max()
