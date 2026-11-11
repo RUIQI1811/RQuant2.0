@@ -50,6 +50,73 @@ class ModelConstructionTests(unittest.TestCase):
         self.assertEqual([0.8, 0.7, 0.6, 0.5, 0.4], ensemble.sample_ratios)
         self.assertEqual(0.2, ensemble.params["learning_rate"])
 
+    # Break caught: a tuning workflow that silently leaves the lean path (and so trains through DatasetH, which IC
+    # early stopping refuses), loses its label normalisation, or names a parameter its model cannot take.
+    def test_tuning_workflows_take_the_lean_path_with_their_label_and_ic_early_stopping(self) -> None:
+        from qlib.utils import init_instance_by_config
+
+        from rquant.workflow.tasks import BUILT_IN_WORKFLOWS, load_workflow, rolling_template
+        from rquant.workflow.trainer import lean_window
+
+        paths = sorted((Path(__file__).resolve().parents[1] / "config" / "workflows").glob("jq240_lgb_*.yaml"))
+        self.assertEqual(9, len(paths))
+        half_lives = {"jq240_lgb_q": None, "jq240_lgb_q_hl1": 1, "jq240_lgb_q_hl2": 2}
+        for path in paths:
+            with self.subTest(workflow=path.name):
+                workflow = load_workflow(path)
+                rolling = workflow["rolling"]
+                if path.stem in half_lives:
+                    # The retraining variants change only the windows and weights of the built-in lgb workflow.
+                    self.assertEqual(("loss", 3), (rolling["early_stopping_metric"], rolling["retrain_months"]))
+                    self.assertEqual(half_lives[path.stem], rolling["sample_half_life_years"])
+                    built_in = load_workflow(BUILT_IN_WORKFLOWS["lgb"])["task"]["model"]
+                    self.assertEqual(built_in, workflow["task"]["model"])
+                else:
+                    self.assertEqual("ic", rolling["early_stopping_metric"])
+                    self.assertEqual((12, None), (rolling["retrain_months"], rolling["sample_half_life_years"]))
+                self.assertTrue(rolling["refit"])
+                task = rolling_template(
+                    workflow["task"], factor_root="data/factors-sh_main", factor_set=None, horizon=None,
+                    universe="sh_main",
+                )
+                lean = lean_window(task)
+                self.assertIsNotNone(lean)
+                expected = "CSRankNorm" if path.stem.endswith("_rank") else "CSZScoreNorm"
+                self.assertEqual(expected, lean["label_norm"])
+                model = init_instance_by_config(task["model"])
+                self.assertEqual("LGBModel", type(model).__name__)
+                self.assertEqual(42, model.params["seed"])
+
+    # Break caught: a workflow whose rolling keys take values the windows or the weighting cannot honour.
+    def test_load_workflow_rejects_bad_rolling_values(self) -> None:
+        import tempfile as _tempfile
+
+        import yaml
+
+        from rquant.errors import DataContractError
+        from rquant.workflow.tasks import BUILT_IN_WORKFLOWS, load_workflow
+
+        workflow = yaml.safe_load(BUILT_IN_WORKFLOWS["lgb"].read_text(encoding="utf-8"))
+        self.assertEqual("loss", load_workflow(BUILT_IN_WORKFLOWS["lgb"])["rolling"]["early_stopping_metric"])
+        defaults = load_workflow(BUILT_IN_WORKFLOWS["lgb"])["rolling"]
+        self.assertEqual((12, None), (defaults["retrain_months"], defaults["sample_half_life_years"]))
+        bad_values = {
+            "early_stopping_metric": ["sharpe"], "retrain_months": [5, 0, "3"], "sample_half_life_years": [0, -1, True],
+        }
+        with _tempfile.TemporaryDirectory() as directory:
+            for key, values in bad_values.items():
+                for value in values:
+                    with self.subTest(key=key, value=value):
+                        changed = dict(workflow, rolling=dict(workflow["rolling"], **{key: value}))
+                        path = Path(directory) / "bad.yaml"
+                        path.write_text(yaml.safe_dump(changed), encoding="utf-8")
+                        with self.assertRaises(DataContractError):
+                            load_workflow(path)
+            changed = dict(workflow, rolling=dict(workflow["rolling"], retrain_months=3, sample_half_life_years=1.5))
+            path.write_text(yaml.safe_dump(changed), encoding="utf-8")
+            self.assertEqual((3, 1.5), (load_workflow(path)["rolling"]["retrain_months"],
+                                        load_workflow(path)["rolling"]["sample_half_life_years"]))
+
     def test_fixed_panel_runs_two_models_two_horizons_three_factor_sets(self) -> None:
         import numpy as np
         import pandas as pd
@@ -166,7 +233,9 @@ class LeanLGBWindowTests(unittest.TestCase):
         columns = pd.MultiIndex.from_tuples([("feature", name) for name in names] + [("label", "LABEL0")])
         return pd.DataFrame(np.asfortranarray(values), index=index, columns=columns, copy=False), dates
 
-    def _task(self, panel, dates_kept, *, fit_end, data_end, segments, model_name):  # type: ignore[no-untyped-def]
+    def _task(  # type: ignore[no-untyped-def]
+        self, panel, dates_kept, *, fit_end, data_end, segments, model_name, label_norm="CSZScoreNorm"
+    ):
         """A rolling task over ``panel`` whose data loader is a KunQuantDataLoader serving it."""
         import numpy as np
         import pandas as pd
@@ -187,6 +256,7 @@ class LeanLGBWindowTests(unittest.TestCase):
         handler = handler_config(
             factor_root="unused", factor_set="wq_alpha101", horizon="1d", universe="all",
             start_time=dates_kept[0], end_time=data_end, fit_start_time=dates_kept[0], fit_end_time=fit_end,
+            label_norm=label_norm,
         )
         handler["kwargs"]["data_loader"] = {"class": FixedLoader, "kwargs": {}}
         return {
@@ -245,6 +315,126 @@ class LeanLGBWindowTests(unittest.TestCase):
                     self.assertIsNone(actual)
                 else:
                     pd.testing.assert_series_equal(expected, actual, check_exact=True)
+
+    # Break caught: a rank-normalised label that the lean path processes differently from Qlib's CSRankNorm.
+    def test_lean_window_with_a_rank_label_predicts_what_the_qlib_dataset_path_predicts(self) -> None:
+        import numpy as np
+        import pandas as pd
+        from qlib.utils import init_instance_by_config
+        from qlib.workflow import R
+
+        from rquant.workflow.trainer import fit_task, lean_window
+
+        panel, dates = self._panel(np.random.default_rng(6))
+        day = [value.date().isoformat() for value in dates]
+        segments = {"train": (day[1], day[75]), "valid": (day[62], day[75]), "test": (day[78], day[-1])}
+        task = self._task(
+            panel, day, fit_end=day[75], data_end=day[-1], segments=segments, model_name="lgb", label_norm="CSRankNorm"
+        )
+        self.assertEqual("CSRankNorm", lean_window(task)["label_norm"])
+        qlib_model = built_in_model("lgb", **refit_overrides("lgb", 7))
+        with R.start(experiment_name="RQuantLean", recorder_name="qlib-rank"):
+            dataset = init_instance_by_config(task["dataset"])
+            qlib_model.fit(dataset)
+            expected = qlib_model.predict(dataset, segment="test")
+        model = built_in_model("lgb", **refit_overrides("lgb", 7))
+        with R.start(experiment_name="RQuantLean", recorder_name="lean-rank"):
+            actual = fit_task(model, task, log_metrics=R.log_metrics)
+        self.assertEqual(
+            qlib_model.model.model_to_string(num_iteration=-1), model.model.model_to_string(num_iteration=-1)
+        )
+        pd.testing.assert_series_equal(expected, actual, check_exact=True)
+        zscore = self._task(panel, day, fit_end=day[75], data_end=day[-1], segments=segments, model_name="lgb")
+        other = built_in_model("lgb", **refit_overrides("lgb", 7))
+        with R.start(experiment_name="RQuantLean", recorder_name="lean-zscore"):
+            self.assertFalse(fit_task(other, zscore).equals(actual))
+
+    # Break caught: IC early stopping that keeps a round other than the best validation IC, scores the training rows,
+    # or silently runs on a path that cannot score IC.
+    def test_ic_early_stopping_keeps_the_round_with_the_best_validation_ic(self) -> None:
+        import numpy as np
+        from qlib.workflow import R
+
+        from rquant.errors import DataContractError
+        from rquant.workflow.trainer import fit_task
+
+        panel, dates = self._panel(np.random.default_rng(8))
+        day = [value.date().isoformat() for value in dates]
+        segments = {"train": (day[0], day[60]), "valid": (day[62], day[70])}
+        task = self._task(panel, day, fit_end=day[60], data_end=day[70], segments=segments, model_name="lgb")
+        model = built_in_model("lgb", early_stopping_rounds=5, num_boost_round=200, lambda_l1=0.0, lambda_l2=1.0)
+        metrics: dict[str, dict[int, float]] = {}
+
+        def log_metrics(step=None, **values):  # type: ignore[no-untyped-def]
+            for name, value in values.items():
+                metrics.setdefault(name, {})[step] = value
+
+        with R.start(experiment_name="RQuantLean", recorder_name="lean-ic"):
+            self.assertIsNone(fit_task(model, task, log_metrics=log_metrics, early_stopping_metric="ic"))
+        self.assertEqual({"ic.valid"}, set(metrics))
+        curve = [metrics["ic.valid"][step] for step in sorted(metrics["ic.valid"])]
+        self.assertEqual(int(np.argmax(curve)) + 1, model.model.best_iteration)
+        self.assertGreater(max(curve), 0.2)  # the label is built from two of the factors
+        self.assertNotIn("metric", built_in_model("lgb").params)  # the model's own params are left alone
+
+        changed = dict(task, dataset={"class": "DatasetH", "kwargs": {"handler": {}, "segments": segments}})
+        with self.assertRaises(DataContractError):
+            fit_task(built_in_model("lgb"), changed, early_stopping_metric="ic")
+
+    # Break caught: recency weights that favour old rows, ignore the half-life or drift from a mean of one, and a
+    # half-life that is silently dropped on a path that cannot weight rows.
+    def test_recency_weights_halve_every_half_life_and_reach_the_lean_lightgbm_fit(self) -> None:
+        import numpy as np
+        from qlib.workflow import R
+
+        from rquant.errors import DataContractError
+        from rquant.workflow.lgb_window import recency_weights
+        from rquant.workflow.trainer import fit_task
+
+        dates = np.array(["2020-01-01", "2021-01-01", "2021-01-01", "2022-01-01"], dtype="datetime64[D]")
+        weight = recency_weights(dates[::-1], 1.0)[::-1]
+        self.assertEqual(np.float32, weight.dtype)
+        self.assertAlmostEqual(1.0, float(weight.mean()), places=6)
+        self.assertEqual(weight[1], weight[2])
+        np.testing.assert_allclose(weight[3] / weight[1], 2 ** (365 / 365.25), rtol=1e-6)
+        np.testing.assert_allclose(weight[1] / weight[0], 2 ** (366 / 365.25), rtol=1e-6)
+        ratio = recency_weights(dates, 2.0) ** 2 / recency_weights(dates, 1.0)  # a 2-year half-life is the square root
+        np.testing.assert_allclose(ratio, ratio[0], rtol=1e-5)
+        with self.assertRaises(ValueError):
+            recency_weights(dates, 0.0)
+
+        panel, all_dates = self._panel(np.random.default_rng(9))
+        day = [value.date().isoformat() for value in all_dates]
+        segments = {"train": (day[1], day[75]), "valid": (day[62], day[75]), "test": (day[78], day[-1])}
+        task = self._task(panel, day, fit_end=day[75], data_end=day[-1], segments=segments, model_name="lgb")
+        with R.start(experiment_name="RQuantLean", recorder_name="lean-weights"):
+            plain = fit_task(built_in_model("lgb", **refit_overrides("lgb", 7)), task)
+            weighted = fit_task(built_in_model("lgb", **refit_overrides("lgb", 7)), task, sample_half_life_years=0.05)
+        self.assertEqual(plain.index.tolist(), weighted.index.tolist())
+        self.assertFalse(plain.equals(weighted))
+
+        changed = dict(task, dataset={"class": "DatasetH", "kwargs": {"handler": {}, "segments": segments}})
+        with self.assertRaises(DataContractError):
+            fit_task(built_in_model("lgb"), changed, sample_half_life_years=1.0)
+
+    def test_daily_ic_is_the_mean_of_each_days_pearson_correlation(self) -> None:
+        import numpy as np
+        import pandas as pd
+
+        from rquant.workflow.lgb_window import daily_ic
+
+        rng = np.random.default_rng(4)
+        dates = np.repeat(pd.bdate_range("2024-01-01", periods=6).to_numpy(), [5, 1, 7, 6, 4, 8])
+        label = rng.normal(size=len(dates))
+        scores = 0.5 * label + rng.normal(size=len(dates))
+        scores[dates == dates[-1]] = 1.0  # a day where every stock scores alike counts as zero
+        frame = pd.DataFrame({"date": dates, "label": label, "score": scores})
+        per_day = frame.groupby("date").apply(
+            lambda day: day["score"].corr(day["label"]) if day["score"].std() > 0 else 0.0, include_groups=False
+        )
+        name, value, higher_better = daily_ic(dates, label)(scores, None)
+        self.assertEqual(("ic", True), (name, higher_better))
+        self.assertAlmostEqual(float(per_day.fillna(0.0).mean()), value, places=12)
 
     # Break caught: a lean DoubleEnsemble window whose segments, labels or feature names drift from the Qlib dataset
     # path, which would change its sample re-weighting, feature selection or predictions.
@@ -313,6 +503,10 @@ class LeanLGBWindowTests(unittest.TestCase):
         self.assertIsNone(lean_window(changed))
         changed = copy.deepcopy(task)
         changed["dataset"]["kwargs"]["handler"]["kwargs"]["data_loader"] = {"class": "StaticDataLoader"}
+        self.assertIsNone(lean_window(changed))
+        self.assertEqual("CSZScoreNorm", lean_window(task)["label_norm"])
+        changed = copy.deepcopy(task)
+        changed["dataset"]["kwargs"]["handler"]["kwargs"]["learn_processors"][1]["class"] = "RobustZScoreNorm"
         self.assertIsNone(lean_window(changed))
 
     def test_lgb_feature_importance_names_every_factor_in_store_order(self) -> None:

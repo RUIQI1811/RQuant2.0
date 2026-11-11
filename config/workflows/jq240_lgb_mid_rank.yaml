@@ -1,0 +1,76 @@
+# jq240 LightGBM tuning variant `mid_rank`: moderate trees (63 leaves, depth 7, 500 rows per leaf), light L1/L2, row
+# bagging every round; label normalised by daily rank (CSRankNorm).
+#
+# One of six variants (base_ic, mid, small, each with a z-score or rank label) compared against the built-in lgb
+# workflow on 2013-2021 only; see docs/lgb-tuning.md for the protocol and commands. Run with
+#   rquant --universe sh_main walk-forward --workflow config/workflows/jq240_lgb_mid_rank.yaml --last-year 2021
+# The handler below is RQuant's own (rquant.workflow.tasks.handler_config), so the run takes the lean
+# LightGBM path; RollingGen replaces the dates, segments and universe for every year.
+
+rolling:
+  refit: true
+  early_stopping_metric: ic
+
+task:
+  model:
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      early_stopping_rounds: 100
+      num_boost_round: 2000
+      learning_rate: 0.02
+      colsample_bytree: 0.6
+      subsample: 0.8
+      bagging_freq: 1
+      lambda_l1: 1.0
+      lambda_l2: 50.0
+      max_depth: 7
+      num_leaves: 63
+      min_data_in_leaf: 500
+      num_threads: 8
+      seed: 42
+  dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: DataHandlerLP
+        module_path: qlib.data.dataset.handler
+        kwargs:
+          instruments: sh_main
+          start_time: "2010-01-01"
+          end_time: "2013-12-31"
+          data_loader:
+            class: KunQuantDataLoader
+            module_path: rquant.qlib_ext.loader
+            kwargs:
+              factor_root: data/factors-sh_main
+              factor_set: jq240
+              horizon: 1d
+          infer_processors:
+            - class: ProcessInf
+              module_path: rquant.qlib_ext.processors
+            - class: ZScoreNorm
+              module_path: rquant.qlib_ext.processors
+              kwargs:
+                fit_start_time: "2010-01-01"
+                fit_end_time: "2012-12-27"
+            - class: Fillna
+              module_path: rquant.qlib_ext.processors
+          learn_processors:
+            - class: DropnaLabel
+              module_path: rquant.qlib_ext.processors
+            - class: CSRankNorm
+              module_path: qlib.data.dataset.processor
+              kwargs:
+                fields_group: label
+          process_type: append
+          drop_raw: true
+      segments:
+        train: ["2010-01-01", "2012-12-27"]
+        valid: ["2012-07-01", "2012-12-27"]
+        test: ["2013-01-01", "2013-12-31"]
+  record:
+    - class: SignalRecord
+      module_path: qlib.workflow.record_temp

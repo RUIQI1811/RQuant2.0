@@ -882,6 +882,13 @@ walk-forward 把文件里的 `task` 当作 Qlib `RollingGen` 的模板：股票�
 Qlib `TrainerR` 逐年训练，每年一个 MLflow recorder（`params.pkl` 和 `SignalRecord` 格式的 `pred.pkl`）；最后用
 `RecorderCollector` + `RollingEnsemble` 合并成 `predictions.parquet`，合并结果另存为 recorder `rolling-ensemble`。
 文件里的 `rolling.refit: true`（lgb 默认开启）表示先在内部切分上早停选轮数，再在整个训练窗口上按该轮数重训。
+`rolling.early_stopping_metric` 决定早停看什么：`loss`（默认，模型自己的目标函数，mse 即 l2）或 `ic`（验证段每天预测分数和
+处理后标签的 Pearson 相关的均值，越大越好），`ic` 只支持省内存路径上的 `LGBModel`。标签的截面标准化可以是
+`CSZScoreNorm`（默认）或 `CSRankNorm`（每天的百分位排名），两者都走省内存路径。`--seed` 覆盖 `workflow.seed`；
+只差种子的几个 run 可以用 `scripts/analysis/blend_runs.py` 平均成一个新 run 再 `report`。
+`rolling.retrain_months`（默认 12）可以改成 1、2、3、4 或 6，每隔这么多个月重训一次，每个窗口用它第一天之前的
+`train_years` 年训练，run 目录里的子目录叫 `year=2013-04`；`rolling.sample_half_life_years` 让训练样本按
+`0.5 ** (年龄 / 半衰期)` 加权（只支持省内存路径上的 `LGBModel`）。jq240 的 LightGBM 调参配置和步骤见 `docs/lgb-tuning.md`。
 
 训练路径：数据集是 RQuant 的 handler（`KunQuantDataLoader` + RQuant 的处理器）且模型是 `LGBModel` 或
 `DEnsembleModel` 时，`TrainerR` 的训练函数走省内存路径（见上文，与 `DatasetH` 逐位相同）；其他模型或处理器走
@@ -1027,6 +1034,14 @@ long-only 回测并做 `risk_analysis`。策略（`rquant.qlib_ext.strategy.Liqu
 ```bash
 rquant report RUN_ID --n-drop 5 --rebalance-days 1
 ```
+
+成交时点的两个实验选项（只用于 `topk-dropout`）：
+
+- `--max-open-gap 0.03`（`backtest.max_open_gap`）：开盘价高于前收盘 3% 以上的股票不买，TopkDropout 改买排名下一只能买的；
+  相当于买单限价前收盘 +3%、开盘后再决定买哪些。
+- `--entry close`（`backtest.entry`）：信号日 t 的信号在 t 日收盘价成交（信号日期提前一个交易日交给 Qlib），
+  收盘涨停不可买、收盘跌停不可卖（收盘价等于最高价或最低价且涨跌幅至少 9.5%，沪市主板）。信号仍用 t 日全天的日线，
+  所以是「14:50 左右打分、尾盘集合竞价买入」的上限。
 
 ### 组合优化（增强指数）
 

@@ -10,7 +10,9 @@ It does what ``qlib.model.trainer.task_train`` does (start a recorder, log the t
   four, which a 16 GB machine needs for multi-year main-board windows. Any other task goes through ``DatasetH``.
 - With ``refit``, an ``LGBModel`` first picks its boosting rounds by early stopping on an inner split (train ends
   ``trunc_days`` before valid, valid ends the day before the test), then trains that many rounds on the task's own
-  train segment without early stopping.
+  train segment without early stopping. ``early_stopping_metric`` ``ic`` (the workflow's
+  ``rolling.early_stopping_metric``) makes that early stopping keep the round with the best mean daily IC on the
+  validation months instead of the lowest loss; it needs the lean path.
 """
 
 from __future__ import annotations
@@ -25,7 +27,15 @@ from typing import Any
 from rquant.errors import DataContractError
 from rquant.io import atomic_write_json, sha256_file
 from rquant.workflow.lgb_window import Segment, feature_importance, fit_double_ensemble_window, fit_lgb_window
-from rquant.workflow.tasks import LEARN_PROCESSORS, TRUNC_DAYS, infer_processors, task_horizon, window_handler_mod
+from rquant.workflow.tasks import (
+    LABEL_NORMS,
+    TRUNC_DAYS,
+    WINDOW_KEY,
+    infer_processors,
+    learn_processors,
+    task_horizon,
+    window_handler_mod,
+)
 
 QLIB_PROCESSOR_MODULE = "qlib.data.dataset.processor"
 FIT_PERIOD_KEYS = {"fit_start_time", "fit_end_time"}
@@ -41,13 +51,16 @@ def train_rolling_task(
     anchor_positions: dict[Any, int] | None = None,
     run_directory: str | Path | None = None,
     factor_names: list[str] | None = None,
+    early_stopping_metric: str = "loss",
+    sample_half_life_years: float | None = None,
 ) -> Any:
     """Train ``task_config`` in a new recorder of ``experiment_name`` and return the recorder.
 
     ``seed`` seeds NumPy with ``seed + prediction year`` before anything is fitted. ``anchor_positions`` (trading day
     to its position in the calendar) keeps only the predictions of every fifth trading day, the 5-day anchors.
     With ``run_directory``, the window's predictions, feature importance and segments are also written to
-    ``<run_directory>/year=<prediction year>/``.
+    ``<run_directory>/year=<window>/``, the window being the prediction year or, with sub-year retraining, the year
+    and first month (``2013-04``). ``sample_half_life_years`` weights the training rows by age (``fit_lgb_window``).
     """
     import numpy as np
     import pandas as pd
@@ -58,7 +71,8 @@ def train_rolling_task(
 
     segments = task_config["dataset"]["kwargs"]["segments"]
     year = pd.Timestamp(segments["test"][0]).year
-    with R.start(experiment_name=experiment_name, recorder_name=recorder_name or f"year={year}"):
+    window_label = str(task_config.get(WINDOW_KEY) or year)
+    with R.start(experiment_name=experiment_name, recorder_name=recorder_name or f"year={window_label}"):
         _log_task_info(task_config)
         if seed is not None:
             np.random.seed(seed + year)
@@ -70,7 +84,13 @@ def train_rolling_task(
             tuning = init_instance_by_config(model_config, accept_types=Model)
             if not _is_lgb(tuning):
                 raise DataContractError("rolling.refit picks boosting rounds by early stopping and needs an LGBModel")
-            fit_task(tuning, inner, log_metrics=_prefixed(R.log_metrics, "tune."))
+            fit_task(
+                tuning,
+                inner,
+                log_metrics=_prefixed(R.log_metrics, "tune."),
+                early_stopping_metric=early_stopping_metric,
+                sample_half_life_years=sample_half_life_years,
+            )
             chosen_iterations = best_iterations(tuning)
             # Release the tuning model before the refit panel is loaded.
             del tuning
@@ -79,7 +99,13 @@ def train_rolling_task(
             model_config.setdefault("kwargs", {}).update(num_boost_round=chosen_iterations, early_stopping_rounds=0)
             R.log_params(chosen_iterations=chosen_iterations)
         model = init_instance_by_config(model_config, accept_types=Model)
-        prediction = fit_task(model, task_config, log_metrics=R.log_metrics)
+        prediction = fit_task(
+            model,
+            task_config,
+            log_metrics=R.log_metrics,
+            early_stopping_metric=early_stopping_metric,
+            sample_half_life_years=sample_half_life_years,
+        )
         if prediction is None:
             raise DataContractError(f"The {year} task has no test segment to predict")
         if isinstance(prediction, pd.DataFrame):
@@ -94,7 +120,7 @@ def train_rolling_task(
         recorder = R.get_recorder()
         if run_directory is not None:
             _write_window(
-                Path(run_directory) / f"year={year}",
+                Path(run_directory) / f"year={window_label}",
                 task_config,
                 inner,
                 prediction,
@@ -106,13 +132,26 @@ def train_rolling_task(
         return recorder
 
 
-def fit_task(model: Any, task: dict[str, Any], *, log_metrics: Any = None) -> Any:
+def fit_task(
+    model: Any,
+    task: dict[str, Any],
+    *,
+    log_metrics: Any = None,
+    early_stopping_metric: str = "loss",
+    sample_half_life_years: float | None = None,
+) -> Any:
     """Fit ``model`` on ``task``'s dataset and return its test predictions (None without a test segment)."""
     from qlib.data.dataset import Dataset
     from qlib.utils import init_instance_by_config
 
     segments = task["dataset"]["kwargs"]["segments"]
     lean = lean_window(task)
+    if early_stopping_metric != "loss" and (lean is None or not _is_lgb(model)):
+        raise DataContractError(
+            f"early_stopping_metric {early_stopping_metric!r} needs an LGBModel on RQuant's lean handler"
+        )
+    if sample_half_life_years is not None and (lean is None or not _is_lgb(model)):
+        raise DataContractError("sample_half_life_years needs an LGBModel on RQuant's lean handler")
     if lean is not None and (_is_lgb(model) or _is_double_ensemble(model)):
         loader = init_instance_by_config(lean["data_loader"])
         instruments, start, end = lean["instruments"], _day(lean["start_time"]), _day(lean["end_time"])
@@ -126,9 +165,17 @@ def fit_task(model: Any, task: dict[str, Any], *, log_metrics: Any = None) -> An
             "train": _segment(segments["train"]),
             "valid": _segment(segments["valid"]),
             "test": _segment(segments["test"]) if "test" in segments else None,
+            "label_norm": lean["label_norm"],
         }
         if _is_lgb(model):
-            return fit_lgb_window(model, load_panel, log_metrics=log_metrics or _ignore, **window)
+            return fit_lgb_window(
+                model,
+                load_panel,
+                log_metrics=log_metrics or _ignore,
+                early_stopping_metric=early_stopping_metric,
+                sample_half_life_years=sample_half_life_years,
+                **window,
+            )
         return fit_double_ensemble_window(model, load_panel, **window)
     dataset = init_instance_by_config(task["dataset"], accept_types=Dataset)
     model.fit(dataset)
@@ -141,8 +188,9 @@ def fit_task(model: Any, task: dict[str, Any], *, log_metrics: Any = None) -> An
 
 
 def lean_window(task: dict[str, Any]) -> dict[str, Any] | None:
-    """The loader, instruments, data range and fit period of ``task`` when its dataset is a ``DatasetH`` over a
-    ``DataHandlerLP`` with a ``KunQuantDataLoader`` and exactly RQuant's processors; None otherwise."""
+    """The loader, instruments, data range, fit period and label normalisation of ``task`` when its dataset is a
+    ``DatasetH`` over a ``DataHandlerLP`` with a ``KunQuantDataLoader`` and exactly RQuant's processors (the label
+    normalised by one of ``LABEL_NORMS``); None otherwise."""
     from rquant.qlib_ext.loader import KunQuantDataLoader
 
     dataset = task.get("dataset", {})
@@ -170,9 +218,12 @@ def lean_window(task: dict[str, Any]) -> dict[str, Any] | None:
     fit_start, fit_end = fit[0]["fit_start_time"], fit[0]["fit_end_time"]
     if _normalised(infer) != _normalised(infer_processors(fit_start, fit_end)):
         return None
-    if _normalised(kwargs.get("learn_processors", [])) != _normalised(LEARN_PROCESSORS):
+    learn = _normalised(kwargs.get("learn_processors", []))
+    label_norm = next((name for name in LABEL_NORMS if learn == _normalised(learn_processors(name))), None)
+    if label_norm is None:
         return None
     return {
+        "label_norm": label_norm,
         "data_loader": loader,
         "instruments": kwargs.get("instruments"),
         "start_time": kwargs.get("start_time"),
@@ -226,6 +277,7 @@ def _write_window(
     segments = task["dataset"]["kwargs"]["segments"]
     manifest = {
         "prediction_year": int(_timestamp(segments["test"][0]).year),
+        "window": str(task.get(WINDOW_KEY) or _timestamp(segments["test"][0]).year),
         "segments": {name: [_day(start), _day(end)] for name, (start, end) in segments.items()},
         "trunc_days": TRUNC_DAYS[task_horizon(task)],
         "chosen_iterations": chosen_iterations,

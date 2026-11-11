@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from rquant.errors import DataContractError
-from rquant.workflow.rolling import generate_rolling_windows
+from rquant.workflow.rolling import RETRAIN_MONTHS, generate_rolling_windows
 
 try:
     from qlib.workflow.task.gen import RollingGen as _RollingGen
@@ -48,6 +48,9 @@ TIME_SERIES_DATASETS = {"TSDatasetH": "step_len", "MTSDatasetH": "seq_len"}
 # The label of each horizon is evaluated by KunQuantDataLoader; it needs this many trading days after the prediction
 # date, so a training segment must end this many days before the test segment starts (Qlib's ``trunc_days``).
 TRUNC_DAYS = {"1d": 2, "5d": 6}
+# The task key CalendarYearRollingGen stores each window's label under (``2013``, or ``2013-04`` with sub-year
+# retraining); the trainer names the window's recorder and run sub-directory after it.
+WINDOW_KEY = "rquant_window"
 
 ROLLING_DEFAULTS = {
     # Pick the boosting rounds by early stopping on an inner train/valid split, then train that many rounds on the
@@ -57,7 +60,20 @@ ROLLING_DEFAULTS = {
     # Train only up to `trunc_days` trading days before the validation months instead of through them, so a model
     # that early-stops on the validation set (the neural networks) never trains on it.
     "holdout_valid": False,
+    # What an LGBModel's early stopping watches on the validation months: `loss` (the model's own objective, l2 for
+    # mse) or `ic` (the mean daily Pearson correlation of the score with the processed label, higher is better).
+    # `ic` stops where the cross-sectional ranking is best rather than where the squared error is; it needs the lean
+    # LightGBM path (rquant.workflow.lgb_window).
+    "early_stopping_metric": "loss",
+    # Months each model predicts before the next one is trained: 12 trains once per calendar year, 3 every quarter.
+    # Each window trains on the `train_years` before its first day.
+    "retrain_months": 12,
+    # Weight each training row by 0.5 ** (its age / half-life), its age counted back from the window's last training
+    # day in years, so recent rows count more; null weighs every row alike. Needs the lean LightGBM path.
+    "sample_half_life_years": None,
 }
+
+EARLY_STOPPING_METRICS = ("loss", "ic")
 
 
 def infer_processors(fit_start: Any, fit_end: Any) -> list[dict[str, Any]]:
@@ -73,10 +89,20 @@ def infer_processors(fit_start: Any, fit_end: Any) -> list[dict[str, Any]]:
     ]
 
 
-LEARN_PROCESSORS = [
-    {"class": "DropnaLabel", "module_path": "rquant.qlib_ext.processors"},
-    {"class": "CSZScoreNorm", "module_path": "qlib.data.dataset.processor", "kwargs": {"fields_group": "label"}},
-]
+# How the label is normalised across each day's stocks before training: Qlib's CSZScoreNorm (the default) or
+# CSRankNorm (the daily percentile rank, centred and scaled to unit variance), which a few limit-up or limit-down
+# moves cannot dominate.
+LABEL_NORMS = ("CSZScoreNorm", "CSRankNorm")
+
+
+def learn_processors(label_norm: str = "CSZScoreNorm") -> list[dict[str, Any]]:
+    """The learn processors of an RQuant handler: drop rows without a label, then normalise it per day."""
+    if label_norm not in LABEL_NORMS:
+        raise DataContractError(f"Unsupported label normalisation {label_norm!r}; use one of {LABEL_NORMS}")
+    return [
+        {"class": "DropnaLabel", "module_path": "rquant.qlib_ext.processors"},
+        {"class": label_norm, "module_path": "qlib.data.dataset.processor", "kwargs": {"fields_group": "label"}},
+    ]
 
 
 def handler_config(
@@ -89,6 +115,7 @@ def handler_config(
     end_time: Any,
     fit_start_time: Any,
     fit_end_time: Any,
+    label_norm: str = "CSZScoreNorm",
 ) -> dict[str, Any]:
     """A ``DataHandlerLP`` over a KunQuant factor store with RQuant's processors."""
     return {
@@ -104,7 +131,7 @@ def handler_config(
                 "kwargs": {"factor_root": str(factor_root), "factor_set": factor_set, "horizon": horizon},
             },
             "infer_processors": infer_processors(fit_start_time, fit_end_time),
-            "learn_processors": copy.deepcopy(LEARN_PROCESSORS),
+            "learn_processors": learn_processors(label_norm),
             "process_type": "append",
             # Training reads the learn and infer views only; keeping the raw panel too would hold a third copy.
             "drop_raw": True,
@@ -131,6 +158,18 @@ def load_workflow(path: str | Path) -> dict[str, Any]:
     unknown = sorted(set(rolling).difference(ROLLING_DEFAULTS))
     if unknown:
         raise DataContractError(f"{path}: unknown rolling keys {unknown}")
+    if rolling["retrain_months"] not in RETRAIN_MONTHS:
+        raise DataContractError(f"{path}: rolling.retrain_months must be one of {RETRAIN_MONTHS}")
+    half_life = rolling["sample_half_life_years"]
+    if half_life is not None and (
+        isinstance(half_life, bool) or not isinstance(half_life, (int, float)) or half_life <= 0
+    ):
+        raise DataContractError(f"{path}: rolling.sample_half_life_years must be null or a positive number of years")
+    if rolling["early_stopping_metric"] not in EARLY_STOPPING_METRICS:
+        raise DataContractError(
+            f"{path}: rolling.early_stopping_metric must be one of {EARLY_STOPPING_METRICS}, "
+            f"got {rolling['early_stopping_metric']!r}"
+        )
     workflow["rolling"] = rolling
     return workflow
 
@@ -240,10 +279,13 @@ def window_handler_mod(task: dict[str, Any], rolling_gen: Any) -> None:
 
 
 class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
-    """Qlib's ``RollingGen`` with one test segment per calendar year instead of a fixed number of trading days.
+    """Qlib's ``RollingGen`` with one test segment per calendar year (or per ``retrain_months`` of it) instead of a
+    fixed number of trading days.
 
     For prediction year Y the segments are train = Jan 1 of Y - train_years through Dec 31 of Y - 1, valid = the last
     ``validation_months`` of it, and test = Y (clipped to ``through``), aligned to trading days. With
+    ``retrain_months`` 3 the same holds per quarter: the window starting April 1 of Y trains from April 1 of
+    Y - train_years through March 31 of Y. With
     ``holdout_valid`` train stops before the validation months instead. ``trunc_segments``
     then ends train and valid ``trunc_days`` trading days before the test starts, so no training label looks into the
     test year, and ``window_handler_mod`` moves the handler's data and fit period with them.
@@ -260,6 +302,7 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
         validation_months: int = 6,
         formal_start_year: int = 2010,
         holdout_valid: bool = False,
+        retrain_months: int = 12,
     ) -> None:
         self.holdout_valid = holdout_valid
         if horizon not in TRUNC_DAYS:
@@ -273,6 +316,7 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
             train_years=train_years,
             validation_months=validation_months,
             formal_start_year=formal_start_year,
+            retrain_months=retrain_months,
         )
 
     def generate(self, task: dict[str, Any]) -> list[dict[str, Any]]:
@@ -298,5 +342,6 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
                 )
             rolled = self.task_copy_func(task)
             self._update_task_segs(rolled, segments)
+            rolled[WINDOW_KEY] = window.label
             tasks.append(rolled)
         return tasks

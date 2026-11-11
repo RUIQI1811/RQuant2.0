@@ -1,0 +1,217 @@
+# jq240 LightGBM 调参（sh_main，1 日标签）
+
+目标是让样本外表现真的变好，而不是把历史曲线调漂亮。所以所有比较都只用 **2013 至 2021 年**，2022 年以后的数据在
+最后一步只看一次。2022 年以后的 Sharpe 标准误约 ±0.45，即使是 2013 至 2021 年，差距小于 0.1 左右也当作噪声。
+
+## 为什么要调
+
+内置 `lgb` 的参数是 Qlib 给 Alpha158 + 沪深 300 调的（L1 正则 206、L2 正则 581、210 个叶子、学习率 0.042），
+`rolling.refit` 用验证段的 MSE 早停选轮数。在 jq240 + sh_main 上（run `20261101T210410Z-aada1bdd`）每年选出的轮数很不稳定：
+
+| 预测年 | 2013 | 2014 | 2015 | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 | 2026 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 树数 | 441 | 415 | 229 | 292 | 741 | 617 | 201 | 260 | 144 | 22 | 150 | 95 | 26 | 8 |
+
+2026 年的模型只有 8 棵树，平均每天 31% 的股票和别的股票同分（其他年份几乎没有）；实盘用的正是这个模型。
+另外 `subsample: 0.8789` 没配 `bagging_freq`，LightGBM 实际上没有做行采样。
+
+## 改了什么（代码）
+
+- `rolling.early_stopping_metric: ic`：早停看验证段每天预测分数和标签的 Pearson 相关的均值，而不是 MSE。
+  只支持省内存路径上的 `LGBModel`。
+- 标签的截面标准化可以用 `CSRankNorm`（每天的百分位排名），涨跌停的极端收益不会主导训练。省内存路径和 Qlib
+  `DatasetH` 逐位相同（`tests/test_models.py`）。
+- `rquant walk-forward --seed N` 覆盖 `workflow.seed`。
+- `scripts/analysis/blend_runs.py`：把几个 run 的预测按天 z-score 后平均，写成一个新 run，可以直接 `report`。
+- `rolling.retrain_months`（1、2、3、4、6、12，默认 12）：每隔几个月重训一次。3 是每季度：4 月 1 日开始的窗口用前 3 年
+  （上一个 4 月 1 日起）训练、预测 4 至 6 月。run 目录里每个窗口是 `year=2013-04` 这样的子目录。
+- `rolling.sample_half_life_years`（默认不加权）：训练样本按 `0.5 ** (距训练段最后一天的年数 / 半衰期)` 加权，再缩放到平均 1；
+  验证段不加权。只支持省内存路径上的 `LGBModel`。
+
+## 6 个候选配置（`config/workflows/`）
+
+| 文件 | 树 | 正则 | 采样 | 学习率 / 最多轮数 / 早停 | 标签 |
+| --- | --- | --- | --- | --- | --- |
+| `jq240_lgb_base_ic.yaml` | 内置参数 | 内置参数 | 内置参数 | 0.042 / 1000 / 50 | z-score |
+| `jq240_lgb_mid.yaml` | 63 叶、深 7、每叶至少 500 行 | L1 1、L2 50 | 列 0.6、行 0.8 每轮 | 0.02 / 2000 / 100 | z-score |
+| `jq240_lgb_small.yaml` | 31 叶、深 6、每叶至少 1000 行 | L2 10 | 列 0.5、行 0.7 每轮 | 0.02 / 2000 / 100 | z-score |
+| `*_rank.yaml` | 同上 | 同上 | 同上 | 同上 | 排名 |
+
+全部用 IC 早停。这 6 个是事先定好的，不根据结果再加新配置；如果要加，先写进本文件再跑。
+
+## 步骤和命令（Windows PowerShell）
+
+每次运行前先看空闲内存，**至少 6 GB** 才开始；内存占用和现在的 LGB walk-forward 一样。
+
+```powershell
+(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB   # 空闲内存 GB
+```
+
+本 PR 合并前，用 worktree 跑它的代码（主 checkout 保持在 `main`）：
+
+```powershell
+cd D:\自己瞎搞\RQuant2.0
+git fetch origin claude/project-thread-406dhr
+git worktree add ..\RQuant2.0-tuning origin/claude/project-thread-406dhr
+conda activate rquant
+$env:PYTHONPATH = "D:\自己瞎搞\RQuant2.0-tuning\src"
+$W = "D:\自己瞎搞\RQuant2.0-tuning\config\workflows"
+$R = "D:\自己瞎搞\RQuant2.0"
+```
+
+### 第 1 步：6 个配置，只跑到 2021 年
+
+```powershell
+foreach ($name in "base_ic", "mid", "small", "base_ic_rank", "mid_rank", "small_rank") {
+  python -m rquant --root $R --universe sh_main walk-forward --workflow "$W\jq240_lgb_$name.yaml" `
+    --last-year 2021 --through 2026-10-21
+}
+```
+
+每个 run 结束时在输出里给出 run id。逐个出报告（研究口径 top50、每天最多换 5 只）：
+
+```powershell
+python -m rquant --root $R --universe sh_main report <run_id> --topk 50 --n-drop 5 --rebalance-days 1
+```
+
+和基线对比 2013 至 2021 年（基线用已有的全期 run 截到 2021 年）：
+
+```powershell
+python D:\自己瞎搞\RQuant2.0-tuning\scripts\analysis\window_metrics.py $R\runs 2013-01-01 2021-12-31 `
+  base=20261027T202921Z-41fb3dde-top50-drop5 base_ic=<run_id> mid=<run_id> small=<run_id> `
+  base_ic_rank=<run_id> mid_rank=<run_id> small_rank=<run_id>
+```
+
+**选择规则（事先定好）**：2013 至 2021 年 Sharpe 最高的配置胜出；和第二名差距小于 0.1 时选报告里 Rank IC 更高的。
+如果没有一个比基线高 0.1 以上，就保留内置参数，只做第 2 步的多种子平均。
+
+预计每个配置 30 到 90 分钟（基线全期 14 年约 35 分钟；新配置学习率更低、轮数更多），6 个合计约半天，适合晚上跑。
+
+### 第 2 步：胜出配置的多种子平均（仍只到 2021 年）
+
+```powershell
+foreach ($seed in 43, 44, 45, 46) {
+  python -m rquant --root $R --universe sh_main walk-forward --workflow "$W\jq240_lgb_<胜出>.yaml" `
+    --last-year 2021 --through 2026-10-21 --seed $seed
+}
+python D:\自己瞎搞\RQuant2.0-tuning\scripts\analysis\blend_runs.py $R\runs <胜出>-5seeds-2021 `
+  <seed42 的 run_id> <seed43> <seed44> <seed45> <seed46>
+python -m rquant --root $R --universe sh_main report <胜出>-5seeds-2021 --topk 50 --n-drop 5 --rebalance-days 1
+```
+
+5 个种子平均的 Sharpe 不低于单个种子时，最终配置用 5 个种子；否则用 1 个。
+
+### 第 3 步：最终配置跑全期，只看一次 2022 年以后
+
+```powershell
+python -m rquant --root $R --universe sh_main walk-forward --workflow "$W\jq240_lgb_<胜出>.yaml" --through 2026-10-21
+# 用 5 个种子时再跑 --seed 43..46，并用 blend_runs.py 平均
+python -m rquant --root $R --universe sh_main report <run_id> --topk 50 --n-drop 5 --rebalance-days 1
+python D:\自己瞎搞\RQuant2.0-tuning\scripts\analysis\window_metrics.py $R\runs 2022-01-01 `
+  base=20261027T202921Z-41fb3dde-top50-drop5 new=<run_id>
+```
+
+`report` 会覆盖 run 目录里的回测结果；要出实盘口径（top30、每天最多换 3 只、20 万）的报告，先复制目录再跑。
+
+## 第 1 步结果（2026-11-08）
+
+sh_main、jq240、1 日标签，top50 每天最多换 5 只，2013-01-01 至 2021-12-31，净收益。基线是
+`20261027T202921Z-41fb3dde-top50-drop5` 截到 2021 年（它的目录里没有 IC 文件）。
+
+| 配置 | run id | 年化 | Sharpe | 比基线 | 最大回撤 | Rank IC |
+| --- | --- | --- | --- | --- | --- | --- |
+| `base_ic` | `20261108T092004Z-ac9bfa3f` | 49.3% | 1.481 | +0.097 | -46.3% | 0.090 |
+| `mid_rank` | `20261108T110025Z-a188bc08` | 47.8% | 1.468 | +0.084 | -45.8% | 0.103 |
+| `small_rank` | `20261108T113208Z-46930145` | 46.8% | 1.446 | +0.062 | -46.8% | 0.101 |
+| 基线 | `20261027T202921Z-41fb3dde-top50-drop5` | 44.8% | 1.384 | | -46.4% | |
+| `mid` | `20261108T094438Z-9104226d` | 45.6% | 1.369 | -0.015 | -46.3% | 0.085 |
+| `base_ic_rank` | `20261108T102514Z-ae79fb73` | 43.2% | 1.367 | -0.017 | -45.1% | 0.103 |
+| `small` | `20261108T100436Z-7f2b8d25` | 41.9% | 1.281 | -0.103 | -48.1% | 0.084 |
+
+- 按规则没有配置胜出（最好的 `base_ic` 只高 0.097，不到 0.1），保留内置参数。
+- 排名标签在三组参数上都把 Rank IC 从 0.084 至 0.090 提到 0.101 至 0.103，但 Sharpe 没有同样的提升。
+- 换手（约 20.7%/天）、成本（约 4.2%/年）和回撤几乎不变。
+- IC 早停选出的树数大多比 MSE 早停多（`base_ic` 2013 至 2021 年 195 到 877 棵，基线 144 到 741 棵）；`small_rank` 2018 年到了
+  2000 轮上限。
+- 每个配置 20 到 35 分钟；内存峰值工作集约 3.9 GB、提交内存约 5.9 GB（在 `training rows binned` 这一步），空闲 5 GB 就能跑。
+
+## 第 2 步结果（2026-11-09）
+
+`base_ic`（内置参数 + IC 早停）5 个种子，2013-01-01 至 2021-12-31，top50 每天最多换 5 只：
+
+| 种子 | run id | 年化 | Sharpe | 最大回撤 | Rank IC |
+| --- | --- | --- | --- | --- | --- |
+| 46 | `20261109T032828Z-93a5af5a` | 50.3% | 1.495 | -49.3% | 0.0906 |
+| 42 | `20261108T092004Z-ac9bfa3f` | 49.3% | 1.481 | -46.3% | 0.0903 |
+| 43 | `20261109T020953Z-690d0f70` | 49.2% | 1.449 | -48.9% | 0.0904 |
+| 44 | `20261109T023513Z-b1b5b6db` | 48.7% | 1.443 | -48.8% | 0.0902 |
+| 45 | `20261109T030233Z-05bd09ad` | 47.2% | 1.421 | -48.4% | 0.0901 |
+| 5 个平均（`blend_runs.py`） | `base_ic-5seeds-2021` | 49.0% | 1.458 | -47.7% | 0.0919 |
+| 基线 | `20261027T202921Z-41fb3dde-top50-drop5` | 44.8% | 1.384 | -46.4% | |
+
+- 5 个单种子 Sharpe 均值 1.458、标准差 0.030，全部高于基线（+0.037 至 +0.111），平均 +0.074。
+- 平均模型 1.458，不比单个种子好，按规则最终用 1 个种子（42）。实盘不需要多模型打分。
+
+## 第 3 步结果（2026-11-09，全期，2022 年以后只看这一次）
+
+`base_ic` 种子 42 跑 2013 至 2026-10-21：`20261109T055815Z-2a3c074e`（实盘口径副本加 `-top30-drop3-200k`、
+`-top30-drop3-from2022-200k`）。基线是 `20261027T202921Z-41fb3dde` 的对应报告。
+
+| 口径 | 区间 | 基线 年化 / Sharpe / 回撤 | `base_ic` 年化 / Sharpe / 回撤 |
+| --- | --- | --- | --- |
+| 研究（top50 每天换 5） | 2013 至今 | 39.0% / 1.265 / -46.4% | 41.1% / 1.305 / -46.3% |
+| 研究 | 2022 至今 | 28.8% / 1.028 / -35.5% | 26.8% / 0.962 / -37.5% |
+| 研究 | 2022 至今剔除 2025 | 20.4% / 0.772 | 17.0% / 0.668 |
+| 实盘（20 万、top30 每天换 3、2022 年重新起步） | 2022 至今 | 32.7% / 1.122 / -35.1% | 25.2% / 0.916 / -37.4% |
+| 实盘 | 2022 至今剔除 2025 | 24.3% / 0.875 | 15.1% / 0.616 |
+
+2026 年窗口的模型从 8 棵树变成 90 棵，每天同分比例从 30.9% 降到 0；2022 年从 22 棵变成 463 棵。2025 年两者都只有 26 棵，
+2024 年新模型 36 棵（基线 95 棵）。
+
+**结论**：IC 早停只在 2013 至 2021 年更好，2022 年以后研究口径 Sharpe 低 0.07、实盘口径低 0.21，都在 ±0.45 的标准误内，
+看不到新配置更好的证据。实盘模型不换，内置 `lgb` 不改；代码里的选项（IC 早停、排名标签、`--seed`、`blend_runs.py`）保留供以后用。
+2022 年以后的数据已经看过，以后不要再用它挑参数。
+
+## 季度重训和近期加权（2026-11-11 预先声明，跑之前写下）
+
+用户 2026-11-10 选的方向。动机：2022 年以后 Rank IC 逐年下降（`docs/crowding-diagnostics.md`），每年 1 月才重训一次，
+模型最旧的训练样本离预测日最远 4 年；更常重训、让近期样本权重更大，可能更快跟上变化。参数和早停都用内置 `lgb`（MSE 早停），
+只改窗口和权重，这样和基线的差别只来自这两项。
+
+| 文件 | 重训 | 样本权重 |
+| --- | --- | --- |
+| `jq240_lgb_q.yaml` | 每季度（1、4、7、10 月初） | 不加权 |
+| `jq240_lgb_q_hl1.yaml` | 每季度 | 半衰期 1 年（3 年前的样本权重是最新的 1/8） |
+| `jq240_lgb_q_hl2.yaml` | 每季度 | 半衰期 2 年（3 年前的样本约 0.35） |
+
+规则（不根据结果再加配置）：
+
+1. 3 个配置都只跑到 2021 年（`--last-year 2021`），研究口径 top50 每天最多换 5，用 `window_metrics.py` 算 2013-01-01 至
+   2021-12-31 的净 Sharpe。基线是 `20261027T202921Z-41fb3dde-top50-drop5` 同一时段的 1.384。
+2. 比基线高 0.1 以上（Sharpe > 1.484）才算胜出；几个都过就取最高的。都没过就到此为止，不看 2022 年以后。
+3. 胜出的配置跑全期（`--through 2026-10-21`），2022 年以后只看这一次：研究口径 Sharpe 不低于基线 1.028，再出实盘口径
+   （20 万、top30 每天换 3、2022 年起步）对比 1.122；两项都不差才建议换实盘模型。
+4. 单个种子（42）。2022 年以后的数据不用来改配置。
+
+每个窗口的训练量和现在一样，但窗口数是 4 倍（2013 至 2021 年 36 个），每个配置预计 1.5 到 2.5 小时，3 个约半天；
+内存峰值和现在一样（空闲 5 GB 就能跑）。
+
+```powershell
+foreach ($name in "q", "q_hl1", "q_hl2") {
+  python -m rquant --root $R --universe sh_main walk-forward --workflow "$W\jq240_lgb_$name.yaml" `
+    --last-year 2021 --through 2026-10-21
+}
+# 每个 run 出研究口径报告，再和基线比 2013 至 2021 年
+python -m rquant --root $R --universe sh_main report <run_id> --topk 50 --n-drop 5 --rebalance-days 1
+python D:\自己瞎搞\RQuant2.0-tuning\scripts\analysis\window_metrics.py $R\runs 2013-01-01 2021-12-31 `
+  base=20261027T202921Z-41fb3dde-top50-drop5 q=<run_id> q_hl1=<run_id> q_hl2=<run_id>
+```
+
+实盘影响：如果换，QMT 里每季度第一个交易日前要换一次模型文件（用上一季度末为止的 3 年数据训练、导出），打分代码不用改。
+
+## 实盘（QMT）影响
+
+- 换参数和排名标签：只需要用新的 2026 年窗口模型重新导出 `qmt/models/*.json`（PR #28 的 `qmt/export_model.py`），
+  numpy 打分代码不用改。行采样不影响打分。
+- 多种子：要导出 5 个模型，QMT 里把 5 个模型的分数按天 z-score 后平均，需要在 PR #28 的打分代码里加一小段，
+  并重新做一次一致性核对。
