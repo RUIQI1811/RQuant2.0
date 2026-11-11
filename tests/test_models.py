@@ -55,16 +55,26 @@ class ModelConstructionTests(unittest.TestCase):
     def test_tuning_workflows_take_the_lean_path_with_their_label_and_ic_early_stopping(self) -> None:
         from qlib.utils import init_instance_by_config
 
-        from rquant.workflow.tasks import load_workflow, rolling_template
+        from rquant.workflow.tasks import BUILT_IN_WORKFLOWS, load_workflow, rolling_template
         from rquant.workflow.trainer import lean_window
 
         paths = sorted((Path(__file__).resolve().parents[1] / "config" / "workflows").glob("jq240_lgb_*.yaml"))
-        self.assertEqual(6, len(paths))
+        self.assertEqual(9, len(paths))
+        half_lives = {"jq240_lgb_q": None, "jq240_lgb_q_hl1": 1, "jq240_lgb_q_hl2": 2}
         for path in paths:
             with self.subTest(workflow=path.name):
                 workflow = load_workflow(path)
-                self.assertEqual("ic", workflow["rolling"]["early_stopping_metric"])
-                self.assertTrue(workflow["rolling"]["refit"])
+                rolling = workflow["rolling"]
+                if path.stem in half_lives:
+                    # The retraining variants change only the windows and weights of the built-in lgb workflow.
+                    self.assertEqual(("loss", 3), (rolling["early_stopping_metric"], rolling["retrain_months"]))
+                    self.assertEqual(half_lives[path.stem], rolling["sample_half_life_years"])
+                    built_in = load_workflow(BUILT_IN_WORKFLOWS["lgb"])["task"]["model"]
+                    self.assertEqual(built_in, workflow["task"]["model"])
+                else:
+                    self.assertEqual("ic", rolling["early_stopping_metric"])
+                    self.assertEqual((12, None), (rolling["retrain_months"], rolling["sample_half_life_years"]))
+                self.assertTrue(rolling["refit"])
                 task = rolling_template(
                     workflow["task"], factor_root="data/factors-sh_main", factor_set=None, horizon=None,
                     universe="sh_main",
@@ -77,7 +87,8 @@ class ModelConstructionTests(unittest.TestCase):
                 self.assertEqual("LGBModel", type(model).__name__)
                 self.assertEqual(42, model.params["seed"])
 
-    def test_load_workflow_rejects_an_unknown_early_stopping_metric(self) -> None:
+    # Break caught: a workflow whose rolling keys take values the windows or the weighting cannot honour.
+    def test_load_workflow_rejects_bad_rolling_values(self) -> None:
         import tempfile as _tempfile
 
         import yaml
@@ -87,12 +98,24 @@ class ModelConstructionTests(unittest.TestCase):
 
         workflow = yaml.safe_load(BUILT_IN_WORKFLOWS["lgb"].read_text(encoding="utf-8"))
         self.assertEqual("loss", load_workflow(BUILT_IN_WORKFLOWS["lgb"])["rolling"]["early_stopping_metric"])
-        workflow["rolling"]["early_stopping_metric"] = "sharpe"
+        defaults = load_workflow(BUILT_IN_WORKFLOWS["lgb"])["rolling"]
+        self.assertEqual((12, None), (defaults["retrain_months"], defaults["sample_half_life_years"]))
+        bad_values = {
+            "early_stopping_metric": ["sharpe"], "retrain_months": [5, 0, "3"], "sample_half_life_years": [0, -1, True],
+        }
         with _tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bad.yaml"
-            path.write_text(yaml.safe_dump(workflow), encoding="utf-8")
-            with self.assertRaises(DataContractError):
-                load_workflow(path)
+            for key, values in bad_values.items():
+                for value in values:
+                    with self.subTest(key=key, value=value):
+                        changed = dict(workflow, rolling=dict(workflow["rolling"], **{key: value}))
+                        path = Path(directory) / "bad.yaml"
+                        path.write_text(yaml.safe_dump(changed), encoding="utf-8")
+                        with self.assertRaises(DataContractError):
+                            load_workflow(path)
+            changed = dict(workflow, rolling=dict(workflow["rolling"], retrain_months=3, sample_half_life_years=1.5))
+            path.write_text(yaml.safe_dump(changed), encoding="utf-8")
+            self.assertEqual((3, 1.5), (load_workflow(path)["rolling"]["retrain_months"],
+                                        load_workflow(path)["rolling"]["sample_half_life_years"]))
 
     def test_fixed_panel_runs_two_models_two_horizons_three_factor_sets(self) -> None:
         import numpy as np
@@ -357,6 +380,42 @@ class LeanLGBWindowTests(unittest.TestCase):
         changed = dict(task, dataset={"class": "DatasetH", "kwargs": {"handler": {}, "segments": segments}})
         with self.assertRaises(DataContractError):
             fit_task(built_in_model("lgb"), changed, early_stopping_metric="ic")
+
+    # Break caught: recency weights that favour old rows, ignore the half-life or drift from a mean of one, and a
+    # half-life that is silently dropped on a path that cannot weight rows.
+    def test_recency_weights_halve_every_half_life_and_reach_the_lean_lightgbm_fit(self) -> None:
+        import numpy as np
+        from qlib.workflow import R
+
+        from rquant.errors import DataContractError
+        from rquant.workflow.lgb_window import recency_weights
+        from rquant.workflow.trainer import fit_task
+
+        dates = np.array(["2020-01-01", "2021-01-01", "2021-01-01", "2022-01-01"], dtype="datetime64[D]")
+        weight = recency_weights(dates[::-1], 1.0)[::-1]
+        self.assertEqual(np.float32, weight.dtype)
+        self.assertAlmostEqual(1.0, float(weight.mean()), places=6)
+        self.assertEqual(weight[1], weight[2])
+        np.testing.assert_allclose(weight[3] / weight[1], 2 ** (365 / 365.25), rtol=1e-6)
+        np.testing.assert_allclose(weight[1] / weight[0], 2 ** (366 / 365.25), rtol=1e-6)
+        ratio = recency_weights(dates, 2.0) ** 2 / recency_weights(dates, 1.0)  # a 2-year half-life is the square root
+        np.testing.assert_allclose(ratio, ratio[0], rtol=1e-5)
+        with self.assertRaises(ValueError):
+            recency_weights(dates, 0.0)
+
+        panel, all_dates = self._panel(np.random.default_rng(9))
+        day = [value.date().isoformat() for value in all_dates]
+        segments = {"train": (day[1], day[75]), "valid": (day[62], day[75]), "test": (day[78], day[-1])}
+        task = self._task(panel, day, fit_end=day[75], data_end=day[-1], segments=segments, model_name="lgb")
+        with R.start(experiment_name="RQuantLean", recorder_name="lean-weights"):
+            plain = fit_task(built_in_model("lgb", **refit_overrides("lgb", 7)), task)
+            weighted = fit_task(built_in_model("lgb", **refit_overrides("lgb", 7)), task, sample_half_life_years=0.05)
+        self.assertEqual(plain.index.tolist(), weighted.index.tolist())
+        self.assertFalse(plain.equals(weighted))
+
+        changed = dict(task, dataset={"class": "DatasetH", "kwargs": {"handler": {}, "segments": segments}})
+        with self.assertRaises(DataContractError):
+            fit_task(built_in_model("lgb"), changed, sample_half_life_years=1.0)
 
     def test_daily_ic_is_the_mean_of_each_days_pearson_correlation(self) -> None:
         import numpy as np

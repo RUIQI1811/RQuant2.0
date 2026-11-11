@@ -129,6 +129,7 @@ class RollingWorkflowRunner:
                 validation_months=self.validation_months,
                 formal_start_year=self.formal_start_year,
                 holdout_valid=bool(self.workflow["rolling"]["holdout_valid"]),
+                retrain_months=int(self.workflow["rolling"]["retrain_months"]),
             ),
         )
         if not tasks:
@@ -143,6 +144,7 @@ class RollingWorkflowRunner:
             run_directory=self.run_directory,
             factor_names=list(get_catalog().canonical_names(self.factor_set)),
             early_stopping_metric=str(self.workflow["rolling"]["early_stopping_metric"]),
+            sample_half_life_years=self.workflow["rolling"]["sample_half_life_years"],
         )
         trainer.end_train(recorders)
         trained = {recorder.id for recorder in recorders}
@@ -167,6 +169,7 @@ class RollingWorkflowRunner:
             if path.exists():
                 frame = pd.read_parquet(path)
                 frame.insert(0, "prediction_year", windows[-1]["prediction_year"])
+                frame.insert(1, "window", windows[-1].get("window", str(windows[-1]["prediction_year"])))
                 importance.append(frame)
         if importance:
             pd.concat(importance, ignore_index=True).to_parquet(
@@ -174,7 +177,7 @@ class RollingWorkflowRunner:
             )
         manifest = {
             "status": "complete",
-            "engine": "qlib RollingGen (calendar years) + TrainerR + RollingEnsemble",
+            "engine": "qlib RollingGen (calendar years or rolling.retrain_months) + TrainerR + RollingEnsemble",
             "model": self.model_name,
             "workflow": str(self.workflow_path),
             "model_config": self.template["model"],

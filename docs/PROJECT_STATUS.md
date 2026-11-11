@@ -1,6 +1,6 @@
 # RQuant2.0 项目进度（共享记忆）
 
-最后更新：2026-11-10（美西时间）。
+最后更新：2026-11-11（美西时间）。
 
 这份文件是 Claude 和 GPT/Codex 等 agent 共同读取的项目进度。规则见文末「怎么维护」。
 研究口径、目录职责和安全边界以 `agent.md` 为准；本文件只记录「现在做到哪了」。
@@ -86,7 +86,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 | PR | 内容 | 状态 |
 | --- | --- | --- |
 | #28 | QMT 实盘（探测、一致性核对、模拟盘、实盘策略） | 草稿，实盘在用 |
-| #32 | jq240 LightGBM 调参：IC 早停、排名标签、`--seed`、多 run 平均脚本、6 个候选配置 | 草稿，3 步都跑完：2022 年以后没有提升，实盘不换；另含拥挤诊断脚本 `scripts/analysis/crowding_diagnostics.py`；等用户决定是否合并 |
+| #32 | jq240 LightGBM 调参：IC 早停、排名标签、`--seed`、多 run 平均脚本、6 个候选配置；季度重训（`rolling.retrain_months`）和近期加权（`rolling.sample_half_life_years`）及 3 个配置 | 草稿，调参 3 步都跑完：2022 年以后没有提升，实盘不换；季度重训 + 近期加权 2026-11-11 开始在 2013 至 2021 年上比较（方案见 `docs/lgb-tuning.md`）；另含拥挤诊断脚本 `scripts/analysis/crowding_diagnostics.py` |
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |

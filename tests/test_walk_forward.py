@@ -160,6 +160,48 @@ class WalkForwardTests(unittest.TestCase):
         self.assertTrue((run_directory / "mlruns").is_dir())
 
 
+    # Break caught: quarterly windows whose tasks lose their label, share a recorder or run directory, or whose merged
+    # predictions skip or repeat a quarter.
+    def test_quarterly_walk_forward_trains_each_quarter_and_merges_them(self) -> None:
+        import pandas as pd
+        from qlib.workflow import R
+
+        from rquant.workflow.runner import ENSEMBLE_RECORDER, RollingWorkflowRunner
+
+        run_directory = self.root / "run-quarterly"
+        run_directory.mkdir()
+        runner = RollingWorkflowRunner(
+            qlib_root=self.qlib_root, factor_root=self.factor_root, run_directory=run_directory, workflow="lgb",
+            horizon="1d", factor_set="wq_alpha101", seed=7, train_years=1, validation_months=6,
+            formal_start_year=2019, universe="all",
+        )
+        runner.template["model"]["kwargs"].update(num_boost_round=20, num_threads=1)
+        runner.workflow["rolling"].update(retrain_months=6, sample_half_life_years=0.5)
+        manifest = runner.run(first_year=2021, last_year=2021, through=date(2021, 12, 20))
+
+        labels = ["2021-01", "2021-07"]
+        self.assertEqual(labels, [window["window"] for window in manifest["windows"]])
+        self.assertEqual([2021, 2021], [window["prediction_year"] for window in manifest["windows"]])
+        self.assertEqual(
+            [["2021-01-01", "2021-06-30"], ["2021-07-01", "2021-12-20"]],
+            [window["segments"]["test"] for window in manifest["windows"]],
+        )
+        self.assertEqual("2021-06-29", manifest["windows"][1]["segments"]["train"][1])  # purged before July
+        predictions = pd.read_parquet(run_directory / "predictions.parquet")
+        parts = pd.concat([pd.read_parquet(run_directory / f"year={name}" / "predictions.parquet") for name in labels])
+        pd.testing.assert_frame_equal(
+            parts.sort_values(["datetime", "instrument"], kind="mergesort").reset_index(drop=True), predictions
+        )
+        self.assertFalse(predictions.duplicated(["datetime", "instrument"]).any())
+        traded = [day for day in self.calendar if date(2021, 1, 1) <= day <= date(2021, 12, 20)]
+        self.assertEqual(traded, sorted(day.date() for day in predictions["datetime"].unique()))
+        importance = pd.read_parquet(run_directory / "feature_importance.parquet")
+        self.assertEqual(set(labels), set(importance["window"]))
+        recorders = R.list_recorders(experiment_name=runner.experiment_name)
+        names = sorted(recorder.info["name"] for recorder in recorders.values())
+        self.assertEqual([ENSEMBLE_RECORDER, "year=2021-01", "year=2021-07"], names)
+
+
 def _next_trading_day(calendar: list, value: date) -> date:  # type: ignore[type-arg]
     return min(day for day in calendar if day >= value)
 

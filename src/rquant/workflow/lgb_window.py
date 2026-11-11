@@ -131,6 +131,7 @@ def fit_lgb_window(
     log_metrics: Any,
     label_norm: str = "CSZScoreNorm",
     early_stopping_metric: str = "loss",
+    sample_half_life_years: float | None = None,
 ) -> Any:
     """Fit ``model`` (a Qlib ``LGBModel``) on the panel ``load_panel`` returns and return the test predictions (None
     without a test segment).
@@ -138,7 +139,8 @@ def fit_lgb_window(
     The panel is loaded here so that no caller keeps a reference to it: its buffer is reused for the training rows and
     released before boosting starts. ``label_norm`` names the label's daily normalisation (``process_panel``).
     With ``early_stopping_metric`` ``ic`` the validation rows are scored by ``daily_ic`` instead of the objective, and
-    early stopping keeps the round with the best mean daily IC.
+    early stopping keeps the round with the best mean daily IC. ``sample_half_life_years`` weights the training rows
+    by ``recency_weights``; the validation rows stay unweighted.
     """
     if early_stopping_metric not in EARLY_STOPPING_METRICS:
         raise DataContractError(
@@ -176,7 +178,10 @@ def fit_lgb_window(
     _log_memory("segments copied")
 
     # Bin the training rows with the model's parameters, as lgb.train would, then drop the panel buffer.
-    train_set = lgb.Dataset(x_train, label=y_train, params=model.params)
+    weight = None
+    if sample_half_life_years is not None:
+        weight = recency_weights(_learn_dates(dates, train_rows, keep), sample_half_life_years)
+    train_set = lgb.Dataset(x_train, label=y_train, weight=weight, params=model.params)
     train_set.construct()
     _log_memory("training rows binned")
     del x_train, block
@@ -220,6 +225,19 @@ def fit_lgb_window(
     if x_test is None:
         return None
     return pd.Series(model.model.predict(x_test), index=index[test_rows])
+
+
+def recency_weights(dates: Any, half_life_years: float) -> Any:
+    """``0.5 ** (age / half_life_years)`` for every row, its age in years counted back from the latest of ``dates``,
+    scaled to a mean of one so LightGBM's hessian-sum limits keep their meaning."""
+    import numpy as np
+
+    if half_life_years <= 0:
+        raise ValueError(f"half_life_years must be positive, got {half_life_years}")
+    days = np.asarray(dates, dtype="datetime64[D]")
+    age_years = (days.max() - days).astype(np.float64) / 365.25
+    weight = np.power(0.5, age_years / half_life_years)
+    return (weight / weight.mean()).astype(np.float32)
 
 
 def daily_ic(dates: Any, label: Any) -> Callable[[Any, Any], tuple[str, float, bool]]:

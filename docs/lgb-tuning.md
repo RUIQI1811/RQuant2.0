@@ -23,6 +23,10 @@
   `DatasetH` 逐位相同（`tests/test_models.py`）。
 - `rquant walk-forward --seed N` 覆盖 `workflow.seed`。
 - `scripts/analysis/blend_runs.py`：把几个 run 的预测按天 z-score 后平均，写成一个新 run，可以直接 `report`。
+- `rolling.retrain_months`（1、2、3、4、6、12，默认 12）：每隔几个月重训一次。3 是每季度：4 月 1 日开始的窗口用前 3 年
+  （上一个 4 月 1 日起）训练、预测 4 至 6 月。run 目录里每个窗口是 `year=2013-04` 这样的子目录。
+- `rolling.sample_half_life_years`（默认不加权）：训练样本按 `0.5 ** (距训练段最后一天的年数 / 半衰期)` 加权，再缩放到平均 1；
+  验证段不加权。只支持省内存路径上的 `LGBModel`。
 
 ## 6 个候选配置（`config/workflows/`）
 
@@ -167,6 +171,43 @@ sh_main、jq240、1 日标签，top50 每天最多换 5 只，2013-01-01 至 202
 **结论**：IC 早停只在 2013 至 2021 年更好，2022 年以后研究口径 Sharpe 低 0.07、实盘口径低 0.21，都在 ±0.45 的标准误内，
 看不到新配置更好的证据。实盘模型不换，内置 `lgb` 不改；代码里的选项（IC 早停、排名标签、`--seed`、`blend_runs.py`）保留供以后用。
 2022 年以后的数据已经看过，以后不要再用它挑参数。
+
+## 季度重训和近期加权（2026-11-11 预先声明，跑之前写下）
+
+用户 2026-11-10 选的方向。动机：2022 年以后 Rank IC 逐年下降（`docs/crowding-diagnostics.md`），每年 1 月才重训一次，
+模型最旧的训练样本离预测日最远 4 年；更常重训、让近期样本权重更大，可能更快跟上变化。参数和早停都用内置 `lgb`（MSE 早停），
+只改窗口和权重，这样和基线的差别只来自这两项。
+
+| 文件 | 重训 | 样本权重 |
+| --- | --- | --- |
+| `jq240_lgb_q.yaml` | 每季度（1、4、7、10 月初） | 不加权 |
+| `jq240_lgb_q_hl1.yaml` | 每季度 | 半衰期 1 年（3 年前的样本权重是最新的 1/8） |
+| `jq240_lgb_q_hl2.yaml` | 每季度 | 半衰期 2 年（3 年前的样本约 0.35） |
+
+规则（不根据结果再加配置）：
+
+1. 3 个配置都只跑到 2021 年（`--last-year 2021`），研究口径 top50 每天最多换 5，用 `window_metrics.py` 算 2013-01-01 至
+   2021-12-31 的净 Sharpe。基线是 `20261027T202921Z-41fb3dde-top50-drop5` 同一时段的 1.384。
+2. 比基线高 0.1 以上（Sharpe > 1.484）才算胜出；几个都过就取最高的。都没过就到此为止，不看 2022 年以后。
+3. 胜出的配置跑全期（`--through 2026-10-21`），2022 年以后只看这一次：研究口径 Sharpe 不低于基线 1.028，再出实盘口径
+   （20 万、top30 每天换 3、2022 年起步）对比 1.122；两项都不差才建议换实盘模型。
+4. 单个种子（42）。2022 年以后的数据不用来改配置。
+
+每个窗口的训练量和现在一样，但窗口数是 4 倍（2013 至 2021 年 36 个），每个配置预计 1.5 到 2.5 小时，3 个约半天；
+内存峰值和现在一样（空闲 5 GB 就能跑）。
+
+```powershell
+foreach ($name in "q", "q_hl1", "q_hl2") {
+  python -m rquant --root $R --universe sh_main walk-forward --workflow "$W\jq240_lgb_$name.yaml" `
+    --last-year 2021 --through 2026-10-21
+}
+# 每个 run 出研究口径报告，再和基线比 2013 至 2021 年
+python -m rquant --root $R --universe sh_main report <run_id> --topk 50 --n-drop 5 --rebalance-days 1
+python D:\自己瞎搞\RQuant2.0-tuning\scripts\analysis\window_metrics.py $R\runs 2013-01-01 2021-12-31 `
+  base=20261027T202921Z-41fb3dde-top50-drop5 q=<run_id> q_hl1=<run_id> q_hl2=<run_id>
+```
+
+实盘影响：如果换，QMT 里每季度第一个交易日前要换一次模型文件（用上一季度末为止的 3 年数据训练、导出），打分代码不用改。
 
 ## 实盘（QMT）影响
 
