@@ -28,6 +28,7 @@ BAR_CHUNK = 300
 VALUATION_CHUNK = 1000
 STATEMENT_CODES = 200
 STATEMENT_FIELDS_PER_CALL = 30
+CACHE_RECENT_DAYS = 3  # with a cache, the last days are always asked again
 
 # Tushare statement fields used by jq240 -> PTrade get_fundamentals table and field. None: PTrade has no such line,
 # treated as zero on a published statement (as RQuant's ZERO_FILL does for blank lines).
@@ -214,11 +215,28 @@ def price_panels(codes, dates, end, calendar):
     return dict((name, pd.DataFrame(values).reindex(index=dates, columns=codes)) for name, values in columns.items())
 
 
-def valuation_panels(codes, dates, fields, log=print):
-    """{field: dates x codes} from PTrade's daily valuation table; gaps take the stock's nearest known value."""
+def _cacheable(dates):
+    """Days whose answers may be kept for later runs: all but the last CACHE_RECENT_DAYS (they may still change)."""
+    return set(dates[:-CACHE_RECENT_DAYS]) if len(dates) > CACHE_RECENT_DAYS else set()
+
+
+def valuation_panels(codes, dates, fields, log=print, cache=None):
+    """{field: dates x codes} from PTrade's daily valuation table; gaps take the stock's nearest known value.
+
+    ``cache`` (a dict kept between runs, as a live strategy left running does) holds the answers of earlier days, so a
+    later run only asks for the days it has not seen.
+    """
     values = dict((field, {}) for field in fields)
-    began = time.time()
+    store = cache.setdefault(("valuation",) + tuple(fields), {}) if cache is not None else {}
+    keep = _cacheable(dates)
+    began, asked = time.time(), 0
     for number, day in enumerate(dates):
+        if day in store:
+            for field in fields:
+                if field in store[day]:
+                    values[field][day] = store[day][field]
+            continue
+        asked += 1
         stamp = day.strftime("%Y%m%d")
         for chunk in _chunks(codes, VALUATION_CHUNK):
             frame = None
@@ -238,8 +256,12 @@ def valuation_panels(codes, dates, fields, log=print):
                 if field in frame.columns:
                     values[field][day] = pd.to_numeric(frame[field], errors="coerce").combine_first(
                         values[field].get(day, pd.Series(dtype=float)))
+        if day in keep and any(day in values[field] for field in fields):
+            store[day] = dict((field, values[field][day]) for field in fields if day in values[field])
         if number and number % 200 == 0:
             log("inputs.valuation_progress", "%d/%d days %.0fs" % (number, len(dates), time.time() - began))
+    if cache is not None:
+        log("inputs.valuation_asked_days", "%d of %d" % (asked, len(dates)))
     panels = {}
     for field in fields:
         panel = pd.DataFrame(values[field]).T.reindex(index=dates, columns=codes)
@@ -343,16 +365,28 @@ def market_return(codes, dates, end, calendar, opened, floats):
     return weighted.where(count >= MARKET_MIN_STOCKS).reindex(dates), count.reindex(dates)
 
 
-def status_panel(codes, dates, kind, log=print):
-    """dates x codes booleans from get_stock_status(codes, kind, date) (kind 'ST' or 'DELISTING')."""
+def status_panel(codes, dates, kind, log=print, cache=None):
+    """dates x codes booleans from get_stock_status(codes, kind, date) (kind 'ST' or 'DELISTING'); ``cache`` as in
+    valuation_panels."""
     rows = {}
+    store = cache.setdefault(("status", kind), {}) if cache is not None else {}
+    keep = _cacheable(dates)
     for day in dates:
+        known = store.get(day, {})
+        wanted = [code for code in codes if code not in known]
         flags = {}
-        try:
-            flags = get_stock_status(codes, kind, day.strftime("%Y%m%d")) or {}  # noqa: F821
-        except Exception as exc:
-            log("inputs.status_error", "%s %s %s" % (kind, day.date(), exc))
-        rows[day] = dict((code, flags.get(code) is True) for code in codes)
+        if wanted:
+            try:
+                flags = get_stock_status(wanted, kind, day.strftime("%Y%m%d")) or {}  # noqa: F821
+            except Exception as exc:
+                log("inputs.status_error", "%s %s %s" % (kind, day.date(), exc))
+                flags = None
+        row = dict(known)
+        if flags is not None:
+            row.update((code, flags.get(code) is True) for code in wanted)
+            if day in keep:
+                store[day] = row
+        rows[day] = dict((code, row.get(code, False)) for code in codes)
     return pd.DataFrame.from_dict(rows, orient="index").reindex(index=dates, columns=codes).fillna(False).astype(bool)
 
 
@@ -368,11 +402,12 @@ def universe_panel(codes, dates, calendar, traded, opened, excluded):
     return frame & traded & ~excluded
 
 
-def build_inputs(end, days, log=print, codes=None, status_days=None):
+def build_inputs(end, days, log=print, codes=None, status_days=None, cache=None):
     """jq240 inputs for sh_main (or ``codes``) over the ``days`` trading days ending at ``end`` (YYYYMMDD).
 
     ``status_days`` limits the per-day ST lookups to the last that many days (earlier days use the first looked-up
-    day's flags); None looks up every day.
+    day's flags); None looks up every day. ``cache``: a dict kept between calls; the per-day valuation and status
+    answers of earlier days are taken from it (the slow part of a cold run) and new ones are added.
     """
     began = time.time()
     calendar = trading_calendar(end)
@@ -386,7 +421,7 @@ def build_inputs(end, days, log=print, codes=None, status_days=None):
     opened = listing_dates(every)
     start = calendar[max(calendar.searchsorted(dates[0]) - 1, 0)]
     window = calendar[(calendar >= start) & (calendar <= dates[-1])]
-    valuation = valuation_panels(every, window, ["total_shares", "a_floats"], log)
+    valuation = valuation_panels(every, window, ["total_shares", "a_floats"], log, cache)
     log("inputs.valuation_seconds", round(time.time() - began, 2))
     total = valuation["total_shares"].reindex(index=dates, columns=codes)
     floats = valuation["a_floats"].reindex(index=dates, columns=codes)
@@ -414,7 +449,7 @@ def build_inputs(end, days, log=print, codes=None, status_days=None):
     last = count.iloc[-1] if len(count) else 0
     log("inputs.mkt_stocks_last", int(last) if last == last else 0)
     looked = dates if status_days is None else dates[-status_days:]
-    excluded = status_panel(codes, looked, "ST", log) | status_panel(codes, looked, "DELISTING", log)
+    excluded = status_panel(codes, looked, "ST", log, cache) | status_panel(codes, looked, "DELISTING", log, cache)
     excluded = excluded.reindex(index=dates).bfill().fillna(False).astype(bool)
     quotes["st"] = set(code for code in codes if excluded[code].iloc[-1])
     inputs["universe"] = universe_panel(codes, dates, calendar, raw_close.notna(), opened, excluded)

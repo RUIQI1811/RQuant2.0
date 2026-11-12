@@ -186,8 +186,8 @@ def live_buy(C, sold, account, tag):
     With ~6,000 yuan slots and 100-share lots of up to 5,000 yuan, flooring each name to a slot left a quarter of the
     money idle."""
     cash, _ = read_account(account)
-    if LIVE_DRY_RUN:
-        cash += sold["sold"]  # nothing was really sold
+    if LIVE_DRY_RUN and not sold.get("auction"):
+        cash += sold["sold"]  # nothing was really sold (auction buys only ever have the cash before the auction)
     day, limits, kept = sold["day"], sold["limits"], sold["kept"]
     budget = max(0.0, min(cash, sold["capital"] - sold["value_after"]))
     slot = (sold["value_after"] + budget) / LIVE_TOPK
