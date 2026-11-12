@@ -12,7 +12,7 @@ import pandas as pd
 from rquant.errors import DataContractError
 from rquant.qlib_ext.loader import _load_feature_block, _partitions_in_range
 from rquant.qlib_ext.processors import DropnaLabel, Fillna, ProcessInf, ZScoreNorm
-from rquant.workflow.backtest import PortfolioConfig, _metrics, _rebalance_dates, _rebalance_description
+from rquant.workflow.backtest import PortfolioConfig, _rebalance_description, risk_metrics
 
 
 class LoaderPartitionTests(unittest.TestCase):
@@ -23,20 +23,36 @@ class LoaderPartitionTests(unittest.TestCase):
         self.assertEqual(paths, _partitions_in_range(paths, pd, None, None))
 
 
+@unittest.skipUnless(importlib.util.find_spec("qlib") is not None, "pyqlib is required")
 class BacktestMetricTests(unittest.TestCase):
-    def test_sharpe_uses_arithmetic_mean_daily_return(self) -> None:
-        returns = pd.Series([0.01, -0.005, 0.02, 0.0, -0.01])
-        metrics = _metrics(np, returns, pd.Series([0.0] * 5))
-        expected = returns.mean() * 252 / (returns.std(ddof=1) * math.sqrt(252))
-        self.assertAlmostEqual(expected, metrics["sharpe_zero_rf"])
+    # Break caught: report metrics that drift from Qlib's risk_analysis, or a Sharpe ratio on gross returns.
+    def test_metrics_are_qlib_risk_analysis_of_net_returns_in_both_modes(self) -> None:
+        from qlib.contrib.evaluate import risk_analysis
+
+        report = pd.DataFrame(
+            {
+                "return": [0.01, -0.005, 0.02, 0.0, -0.01, 0.015],
+                "cost": [0.001, 0.0, 0.002, 0.0, 0.001, 0.0],
+                "bench": [0.004, -0.002, 0.01, 0.001, -0.006, 0.003],
+            }
+        )
+        metrics = risk_metrics(risk_analysis, report)
+        net = report["return"] - report["cost"]
+        additive, compounded = metrics["net_return"], metrics["net_return_compounded"]
+        self.assertAlmostEqual(net.mean() / net.std(ddof=1) * math.sqrt(252), additive["information_ratio"])
+        self.assertAlmostEqual(net.mean() * 252, additive["annualized_return"])
+        nav = (1 + net).cumprod()
+        self.assertAlmostEqual(nav.iloc[-1] ** (252 / len(net)) - 1, compounded["annualized_return"])
+        self.assertAlmostEqual((nav / nav.cummax() - 1).min(), compounded["max_drawdown"])
+        excess = net - report["bench"]
+        self.assertAlmostEqual(excess.mean() * 252, metrics["excess_return_with_cost"]["annualized_return"])
+        gross_excess = report["return"] - report["bench"]
+        self.assertAlmostEqual(
+            gross_excess.mean() * 252, metrics["excess_return_without_cost"]["annualized_return"]
+        )
 
 
 class RebalanceScheduleTests(unittest.TestCase):
-    def test_rebalance_dates_take_every_nth_trading_day_from_the_first(self) -> None:
-        calendar = pd.bdate_range("2024-01-01", periods=12)
-        self.assertEqual(list(calendar[[0, 5, 10]]), list(_rebalance_dates(pd, calendar, 5)))
-        self.assertEqual(list(calendar), list(_rebalance_dates(pd, calendar, 1)))
-
     def test_portfolio_config_rejects_invalid_rebalance_settings(self) -> None:
         with self.assertRaisesRegex(ValueError, "rebalance_days"):
             PortfolioConfig(rebalance_days=0)

@@ -304,7 +304,7 @@ rquant report RUN_ID   # 自动按该滚动训练的股票池回测
 四年窗口上峰值从 6.1 GB 降到 3.1 GB；剩下的峰值在分箱那一刻：面板、验证与测试副本，加上 LightGBM 为确定分箱抽样的
 20 万行（672 列时约 1.6 GB，用完即释放）。sh_main 上 672 列的最大窗口一份面板约 4.2 GB；每个窗口各阶段的进程内存
 写在日志里（`rquant.workflow.lgb_window`，需要 psutil）。标签由 Qlib 的多进程池计算（Windows 上 5 个子进程合计约 6.3 GB），
-因此先算标签、再分配面板，两者不会同时占用内存。`double-ensemble` 仍走 Qlib 流程。
+因此先算标签、再分配面板，两者不会同时占用内存。`double-ensemble` 用同样的省内存加载与处理（`fit_double_ensemble_window`），再把训练、验证、测试段交给 Qlib 的 `DEnsembleModel`，预测与经 `DatasetH` 的原流程逐位相同。
 `main` 与 `sh_main` 需要 ST 历史：在此功能之前同步的数据须再执行一次 `rquant data sync`（只新增逐只的 `namechange`）与
 `rquant data build-qlib`，否则构建 `main` 因子库会报错提示。业绩基准仍是 `data.benchmark`（默认沪深 300）。
 
@@ -868,10 +868,80 @@ rquant walk-forward \
   --through 2026-08-04
 ```
 
+模型、数据集和处理器写在 Qlib `qrun` 格式的 workflow 文件里（`qlib_init` + `task: model / dataset / record`）。
+`--model lgb` / `--model double-ensemble` 是内置文件 `src/rquant/workflow/workflows/lgb.yaml`、`double_ensemble.yaml`
+的简写；换模型或改参数时复制一份改好，用 `--workflow` 传入：
+
+```bash
+rquant walk-forward --workflow my_lgb.yaml --horizon 1d --factor-set jq240 --through 2026-10-21
+```
+
+walk-forward 把文件里的 `task` 当作 Qlib `RollingGen` 的模板：股票池、因子库路径、`--factor-set`、`--horizon`
+由本次运行填入；`CalendarYearRollingGen`（`RollingGen` 子类）按自然年生成每年的任务，用 Qlib `trunc_segments`
+按标签需要的天数截断训练段（1d 截 2 个交易日、5d 截 6 个），并同步移动 handler 的起止日期和 `ZScoreNorm` 的拟合区间；
+Qlib `TrainerR` 逐年训练，每年一个 MLflow recorder（`params.pkl` 和 `SignalRecord` 格式的 `pred.pkl`）；最后用
+`RecorderCollector` + `RollingEnsemble` 合并成 `predictions.parquet`，合并结果另存为 recorder `rolling-ensemble`。
+文件里的 `rolling.refit: true`（lgb 默认开启）表示先在内部切分上早停选轮数，再在整个训练窗口上按该轮数重训。
+
+训练路径：数据集是 RQuant 的 handler（`KunQuantDataLoader` + RQuant 的处理器）且模型是 `LGBModel` 或
+`DEnsembleModel` 时，`TrainerR` 的训练函数走省内存路径（见上文，与 `DatasetH` 逐位相同）；其他模型或处理器走
+Qlib 原生 `DatasetH`，任何 Qlib 模型都能用，但内存占用是面板的好几倍。
+
+同一个文件也能直接用 Qlib 跑单个窗口（项目根目录下，2013 年一年、csi300，走原生 `DatasetH`）：
+
+```bash
+qrun src/rquant/workflow/workflows/lgb.yaml
+```
+
 可选模型：
 
 - `lgb`：LightGBM；
-- `double-ensemble`：Qlib DoubleEnsemble。
+- `double-ensemble`：Qlib DoubleEnsemble，参数取 Qlib Alpha158 基准配置（3 个子模型、每个 28 轮、学习率 0.2、样本重加权与特征选择都开启）。轮数固定，所以没有调参阶段，每年只拟合一次；特征选择要对每个因子打乱重算一遍预测，因子多、股票池大时明显比 `lgb` 慢，建议先在 csi300 上跑。
+
+### 神经网络时序模型（GRU / ALSTM / HIST / TRA）
+
+Qlib 的 PyTorch 模型也能直接滚动训练。先装 PyTorch：有 NVIDIA 显卡时先按 <https://pytorch.org> 装 CUDA 版
+（例如 `pip install torch --index-url https://download.pytorch.org/whl/cu128`），再 `pip install -e ".[nn]"`；
+模型发现 CUDA 就用第 0 块显卡，否则用 CPU（HIST 只能在 GPU 上跑）。
+
+| `--model` | Qlib 模型 | 输入 |
+| --- | --- | --- |
+| `gru` | `pytorch_gru.GRU` | `qlib_alpha360`，每行 360 列按 60 天 × 6 个字段读 |
+| `alstm` | `pytorch_alstm.ALSTM` | 同上 |
+| `hist` | `pytorch_hist.HIST` | 同上，另需股票-概念矩阵 |
+| `tra` | `pytorch_tra.TRAModel` | `MTSDatasetH`，同上的 60 天 × 6 字段序列 |
+| `gru-ts` | `pytorch_gru_ts.GRU` | `TSDatasetH`，任何因子集最近 20 天的因子行（默认 jq240） |
+| `alstm-ts` | `pytorch_alstm_ts.ALSTM` | 同上 |
+| `tra-ts` | `pytorch_tra.TRAModel` | `MTSDatasetH`，任何因子集最近 60 天的因子行 |
+| `gru-alpha158` | `pytorch_gru_ts.GRU` | `TSDatasetH`，`qlib_alpha158` 中 Qlib 基准选的 20 个因子、最近 20 天 |
+| `alstm-alpha158` | `pytorch_alstm_ts.ALSTM` | 同上 |
+| `tra-alpha158` | `pytorch_tra.TRAModel` | `MTSDatasetH`，同样 20 个因子、最近 60 天 |
+
+```bash
+rquant walk-forward --model hist --horizon 1d --first-year 2013 --last-year 2026 --through 2026-10-21
+rquant walk-forward --model gru-ts --factor-set jq240 --horizon 1d --through 2026-10-21
+rquant --universe sh_main walk-forward --model alstm-ts --factor-set jq240 --through 2026-10-21
+```
+
+- `*-alpha158` 三个文件照搬 Qlib 的 Alpha158 基准：`FilterCol` 只留 20 个因子（RESI5、WVMA5、RSQR5、KLEN 等），
+  `RobustZScoreNorm` 截断到 ±3。只送 20 列给网络，所以内存比 Alpha360 小得多，sh_main 也能跑；换成别的因子集会报错。
+  HIST 只有 Alpha360 版（它按 6 个字段 × 60 天的结构设计）。
+- 前四个模型的 workflow 默认因子集是 `qlib_alpha360`（Qlib 基准用的就是 Alpha360）；`--factor-set` 换成别的会因为
+  列数不是 360 而报错。`*-ts` 的 `d_feat: null`（TRA 是 `model_config.input_size: null`）自动取因子集的列数。参数都取 Qlib Alpha360 / Alpha158 基准配置。
+- 时序窗口：`TSDatasetH` / `MTSDatasetH` 要在每段开头往前多读 `step_len` / `seq_len` 天，walk-forward 会把 handler 的
+  起点相应往前挪（gru-ts 20 天、TRA 60 天），所以训练段第一天的样本也有完整窗口，不会用 0 补齐。
+- 验证集独立：神经网络按验证集早停，所以这些 workflow 设了 `rolling.holdout_valid: true`，训练段在验证段开始前按标签
+  天数截断结束，不再像 LGB 那样“训练窗口含验证段、早停后重训”。
+- HIST 的预定义概念：Qlib 基准下载的是它自己整理的 csi300 概念表，RQuant 改用申万二级行业：每只股票属于它在最后
+  一个预测日之前所属过的所有二级行业，从未有行业的股票共用一个额外概念。文件写在运行目录 `hist/`
+  （`stock2concept.npy`、`stock_index.npy`）；想用自己的概念表就复制 `hist.yaml` 填上这两个路径。没有预训练的 LSTM，
+  主干从随机权重开始。
+- TRA 对所有段都读 handler 的 learn 视图（会去掉没有标签的行），所以运行最后两个交易日（1d 标签还没出来）没有预测。
+- 内存：这些模型走 Qlib 原生数据集，handler 存推理和训练两份面板（滚动训练不留原始面板），时序采样器再存一份。
+  实测 400 只股票、4 年窗口、233 个因子（面板 0.4 GB）时 `gru-ts` / `alstm-ts` 进程峰值比空载多 2.3 GB，约为面板的
+  6 倍；sh_main 的 jq240 窗口约 1.5 GB，估计峰值 9 GB 左右，跑的时候关掉其他大程序。sh_main 的 Alpha360 面板单份就有
+  9-10 GB，跑不了。`n_jobs` 设为 0（在训练进程里取批数据）：Windows 上每个 DataLoader 子进程都会复制一份样本。
+  显存方面 8 GB 显卡够用。
 
 可选预测期限：
 
@@ -889,15 +959,22 @@ rquant walk-forward \
 runs/walk-forward/<run-id>/
 ├── run.json
 ├── run.log
-├── mlflow.db
+├── mlflow.db                  # TrainerR 的 recorder（逐年 + rolling-ensemble）
+├── mlruns/                    # recorder 的 artifact：params.pkl（模型）、pred.pkl、task
 ├── walk_forward.json
 ├── predictions.parquet
+├── feature_importance.parquet
 ├── year=2013/
-│   ├── model.pkl
+│   ├── feature_importance.parquet
 │   ├── predictions.parquet
-│   └── window.json
+│   └── window.json            # 截断后的各段日期、选定轮数、recorder id
 └── year=.../
 ```
+
+MLflow 3 默认拒绝文件存储，所以 recorder 存在 SQLite（`mlflow.db`）里，artifact 指定写到运行目录的 `mlruns/`。
+
+`feature_importance.parquet` 是每年最终模型的因子重要性（`gain`、`split` 和占总 gain 的比例 `gain_share`；DoubleEnsemble
+按子模型权重加总），根目录那份把各年合在一起，`report` 会汇总成表。
 
 检查训练结果：
 
@@ -911,7 +988,7 @@ python -m json.tool runs/walk-forward/RUN_ID/walk_forward.json
 - `run.json.status` 为 `complete`；
 - 输入中的 Qlib 与因子指纹符合预期；
 - `walk_forward.json.status` 为 `complete`；
-- 每个目标年份都有 `window.json`、模型和预测文件；
+- 每个目标年份都有 `window.json` 和预测文件，模型在对应 recorder 的 `params.pkl`；
 - 合并后的 `predictions.parquet` 存在，且年度预测不重叠。
 
 如果长任务失败，先查看 `run.json.error` 和 `run.log`，不要未经诊断直接重新训练。
@@ -927,7 +1004,11 @@ rquant report RUN_ID
 报告命令优先读取 `runs/walk-forward/RUN_ID/`；如果该目录不存在，会回退读取旧版
 `runs/RUN_ID/`，因此已有滚动训练结果仍可使用。
 
-报告命令使用该运行的样本外预测执行 A 股约束下的 long-only TopkDropout 回测：
+报告命令按 Qlib 的 record 流程处理该运行的样本外预测：在新的 recorder（`backtest_mlflow/`，每次报告重建）里存入
+`SignalRecord` 格式的 `pred.pkl` 和 `label.pkl`，`SigAnaRecord` 计算 IC，`PortAnaRecord` 执行 A 股约束下的
+long-only 回测并做 `risk_analysis`。策略（`rquant.qlib_ext.strategy.LiquidatingTopkDropoutStrategy` /
+`LiquidatingEnhancedIndexingStrategy`，带调仓间隔和期末清仓）、执行器和交易所都以 Qlib 配置的形式交给
+`PortAnaRecord`。默认是 TopkDropout：
 
 - 初始资金 100 万元；
 - 目标持股 50 只，每 5 个交易日调仓一次：按调仓日的最新预测把持仓换成前 50 名，其余交易日不交易；
@@ -946,6 +1027,45 @@ rquant report RUN_ID
 ```bash
 rquant report RUN_ID --n-drop 5 --rebalance-days 1
 ```
+
+### 组合优化（增强指数）
+
+`--strategy enhanced-indexing`（或配置 `backtest.strategy`）改用 Qlib 的增强指数组合优化代替等权 top50：
+
+```bash
+rquant report RUN_ID --strategy enhanced-indexing
+```
+
+- 风险模型（`risk_model`，命令行 `--risk-model`）：
+  - `structured`（默认）：结构化风险模型（`rquant.qlib_ext.riskmodel`）。因子是申万一级行业哑变量（按时点归属，
+    当日没有申万归属的股票归入 `industry_unknown`），加上用 `barra_cne6` 描述符合成的 19 个 CNE6 风格因子
+    （size、beta、动量、残差波动、流动性、价值、盈利、杠杆、成长、股息等，组成见 `CNE6_STYLES`）。
+    - 标准化：每个描述符按日截在 1%/99% 分位，按流通市值加权均值为 0、等权标准差为 1；风格取其描述符均值后
+      再标准化，缺失记为 0。
+    - 因子收益：每天把股票收益对前一日暴露做横截面回归，权重为流通市值的平方根。
+    - 协方差和特质风险：因子协方差是过去 `risk_lookback_days` 天因子收益的指数加权协方差，半衰期
+      `risk_half_life`（默认 90 天）；特质风险是回归残差的同口径加权均方。
+    - 用法：先为回测的股票池建好 `barra_cne6` 因子库（例如 `rquant --universe sh_main factors build
+      --factor-set barra_cne6`）。
+    - 偏离上限：通过 Qlib 优化器的 `f_dev` 限制组合相对基准的主动暴露。每个行业的主动权重不超过
+      `industry_deviation`（默认 3%），size 主动暴露不超过 `size_deviation`（默认 0.2 个标准差），
+      其他风格不超过 `style_deviation`（默认不限）。
+  - `statistical`：Qlib `StructuredCovEstimator`（`risk_factors` 个 PCA 统计因子）拟合当日股票池过去 240 个交易日的
+    日收益，收益按股票截在 2.5%/97.5% 分位，与 Qlib `examples/portfolio/prepare_riskdata.py` 一致；停牌日价格沿用，
+    复牌日计入跨停牌的涨跌。PCA 因子没有行业、市值含义，不能限制行业和市值暴露。
+- 基准：当日股票池按流通市值（参考数据 `daily_basic` 的 `circ_mv`）加权，csi300、main、sh_main 都适用；
+  报告里对比的基准收益仍是 `data.benchmark`。
+- 优化：Qlib `EnhancedIndexingOptimizer`，最大化相对基准的预期收益减去 `risk_aversion` 倍跟踪方差；只做多、满仓，
+  每只股票偏离基准不超过 `benchmark_deviation`（默认 1%），每次调仓总换手不超过 `turnover_limit`（默认 0.2）。
+  投资比例 `risk_degree` 默认 0.95，其余留作现金应对费用和整手取整。前一日无成交量的股票保持原权重。
+- 参数在 `backtest.enhanced_indexing`；`topk`、`n_drop` 在这种模式下不用，`rebalance_days` 照常生效。
+- 需要参考数据（`rquant data build-reference`），以及 `ecos` 和 `scikit-learn`（已写入依赖，旧环境需重新
+  `pip install -e ".[dev]"`）。
+- 每次调仓的股票池大小、持股数、换手、主动份额和事前年化跟踪误差写在 `optimizations.parquet`，报告里有平均值。
+  结构化模型还记录最大的行业主动权重和 size 主动暴露；求解失败的调仓保持原持仓（空仓时改持基准权重），次数也在报告里。
+
+小账户注意：增强指数通常持有上百只、单只权重很低，100 万初始资金下整手取整会让实际持仓偏离优化结果，
+可以把 `backtest.initial_capital` 调大再比较。
 
 两种口径的 LGB walk-forward 对比（2013-2026，净收益，换手为年化双边成交额 / 账户市值）：
 
@@ -968,8 +1088,36 @@ runs/walk-forward/<run-id>/
 ├── positions.parquet
 ├── trades.parquet
 ├── trade_indicators.parquet
+├── optimizations.parquet      # 仅 enhanced-indexing
+├── signal_ic.parquet
+├── signal_analysis.json
+├── backtest_mlflow/           # 本次报告的 recorder：pred/label、sig_analysis/、portfolio_analysis/
 ├── report.json
 └── report.md
+```
+
+收益指标全部由 `qlib.contrib.evaluate.risk_analysis` 计算（传 `N=252`，一年按 252 个交易日折算；Qlib 自己的默认是 238），写在 `backtest.json.metrics`：
+
+- `net_return_compounded`（mode `product`）：报告的主口径。年化 = 期末净值 ^ (252 / 天数) − 1，最大回撤按净值算；
+- `net_return`（Qlib 默认 mode `sum`）：年化 = 日均收益 × 252，回撤按日收益累加曲线算（Qlib 的默认累加方式）；
+  其中 `information_ratio` = 日均 / 日标准差 × √252，就是报告里的夏普；
+- `benchmark_return(_compounded)`：基准的同样两种口径；
+- `excess_return_with_cost` / `excess_return_without_cost`：与 `PortAnaRecord` 同定义的超额收益（mode `sum`）。
+  `PortAnaRecord` 自己按 238 天算的那份记在 `backtest_mlflow/` 里，报告不用。
+
+和之前的报告相比，回测本身（成交、持仓、每日收益）和复利年化、夏普都不变；`report.md` 的表把复利口径和
+Qlib 默认的累加口径并列。
+
+`report` 还会用 Qlib `SigAnaRecord` 计算模型预测的 IC：每个预测日把分数与模型训练用的标签（下一开盘起的 1d/5d
+收益）做截面 Pearson（IC）和 Spearman（Rank IC）相关；ICIR 为日均值除以标准差，不年化。逐日结果在
+`signal_ic.parquet`，全期与分年汇总在 `signal_analysis.json` 和 `report.md`。
+`report.md` 也会列出全期平均 gain 占比最高的 30 个因子，以及从未被使用的因子数。
+
+只想比较模型、不跑回测时，用 `--signal-only`：只运行 `SigAnaRecord`（记录在 `<run>/signal_mlflow/`），
+写出 `signal_ic.parquet`、`signal_analysis.json` 并重新生成 `report.md`（目录里没有回测结果时只含 IC 与因子重要性）：
+
+```bash
+rquant report RUN_ID --signal-only
 ```
 
 `report.json` 与 `report.md` 会同时包含按自然年汇总的稳定性表。策略年度收益按每日净收益
@@ -1003,7 +1151,7 @@ python scripts/analysis/window_metrics.py runs 2019-01-01 2026-10-21 \
   jq240_5d=20261028T222815Z-b7072fd9 jq240_1d_drop5=20261027T202921Z-41fb3dde-top50-drop5
 ```
 
-每个 `标签=目录` 指向 `runs/walk-forward/` 下已经运行过 `report` 的目录，结束日期可以省略。输出按夏普排序，包含年化、夏普、最大回撤、Calmar、累计收益、相对基准的年化超额和信息比率、日均换手和年化成本。口径与报告相同：每日净收益为 `return - cost`，夏普为日均收益 × 252 / (日收益标准差 × √252)。
+每个 `标签=目录` 指向 `runs/walk-forward/` 下已经运行过 `report` 的目录，结束日期可以省略。输出按夏普排序，包含年化、夏普、最大回撤、Calmar、累计收益、相对基准的年化超额和信息比率、日均换手和年化成本。每日净收益为 `return - cost`，夏普为日均收益 × 252 / (日收益标准差 × √252)，和报告一样按 252 天折算。
 
 ## 9. 运行清单与状态判断
 
