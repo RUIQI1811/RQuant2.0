@@ -3,10 +3,11 @@
 # from QMT (qmt/) to PTrade.
 #
 # How to run: PTrade -> research -> new notebook -> paste this whole file into one cell -> run. It takes a few
-# minutes. Copy everything it prints (or the file probe_result.txt it writes next to the notebook) and send it back.
+# minutes (PTrade research forbids two standard modules, so this file never imports them). Copy everything it
+# prints (or the file probe_result.txt it writes next to the notebook) and send it back.
 
 import builtins
-import sys
+import platform
 import time
 import traceback
 
@@ -50,8 +51,7 @@ def shape(value):
 
 # 1. Python and libraries ---------------------------------------------------------------------------------------
 say("probe", "start " + time.strftime("%Y-%m-%d %H:%M:%S"))
-say("python", sys.version)
-say("maxsize_64bit", sys.maxsize > 2 ** 32)
+say("python", platform.python_version() + " " + platform.machine())
 for name in ["numpy", "pandas", "scipy", "sklearn", "statsmodels", "lightgbm", "xgboost", "talib", "numba",
              "bottleneck", "numexpr", "pickle", "json", "zlib", "gzip", "lzma", "sqlite3", "tables", "h5py"]:
     try:
@@ -59,10 +59,6 @@ for name in ["numpy", "pandas", "scipy", "sklearn", "statsmodels", "lightgbm", "
         say("lib." + name, getattr(module, "__version__", "ok"))
     except Exception as exc:
         say("lib." + name, "MISSING %s" % type(exc).__name__)
-import os  # noqa: E402
-
-say("cwd", os.getcwd())
-attempt("cwd_files", lambda: say("cwd_listing", sorted(os.listdir("."))[:40]))
 for name in ["get_research_path", "get_price", "get_history", "get_fundamentals", "get_Ashares", "get_stock_status",
              "get_stock_info", "get_trade_days", "get_all_trades_days", "get_index_stocks", "get_snapshot",
              "get_stock_blocks", "get_industry_stocks", "get_trading_day"]:
@@ -180,6 +176,6 @@ say("probe", "done " + time.strftime("%Y-%m-%d %H:%M:%S"))
 try:
     with open("probe_result.txt", "w") as handle:
         handle.write("\n".join(OUT) + "\n")
-    say("written", os.path.abspath("probe_result.txt"))
+    say("written", "probe_result.txt next to this notebook")
 except Exception as exc:
     say("write_error", exc)
