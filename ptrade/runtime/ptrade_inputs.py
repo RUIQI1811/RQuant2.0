@@ -31,7 +31,8 @@ STATEMENT_FIELDS_PER_CALL = 30
 CACHE_RECENT_DAYS = 3  # with a cache, the last days are always asked again
 
 # Tushare statement fields used by jq240 -> PTrade get_fundamentals table and field. None: PTrade has no such line,
-# treated as zero on a published statement (as RQuant's ZERO_FILL does for blank lines).
+# treated as zero on a published statement (as RQuant's ZERO_FILL does for blank lines). A tuple: the first field
+# with a value on that row.
 PT_INCOME, PT_BALANCE, PT_CASHFLOW = "income_statement", "balance_statement", "cashflow_statement"
 PTRADE_FIELDS = {
     "income": {
@@ -68,7 +69,8 @@ PTRADE_FIELDS = {
         "inventories": "inventories",
         "total_cur_assets": "total_current_assets",
         "lt_eqt_invest": "longterm_equity_invest",
-        "fix_assets": "fixed_assets",
+        # Third-quarter reports leave fixed_assets blank; total_fixed_asset (with assets in liquidation) is filled.
+        "fix_assets": ("fixed_assets", "total_fixed_asset"),
         "intan_assets": "intangible_assets",
         "goodwill": "good_will",
         "total_assets": "total_assets",
@@ -301,6 +303,13 @@ def _statement_table(codes, table, fields, start_year, end_year, log=print):
     return frame
 
 
+def _candidates(value):
+    """The PTrade fields of one PTRADE_FIELDS entry, in order of preference."""
+    if value is None:
+        return ()
+    return tuple(value) if isinstance(value, tuple) else (value,)
+
+
 def fundamentals_frame(codes, start_year, end_year, log=print):
     """One row per stock and quarter end in Tushare column names, as rquant's fundamentals.parquet."""
     names = [name for endpoint in ("income", "balancesheet", "cashflow") for name in PTRADE_FIELDS[endpoint]]
@@ -308,14 +317,19 @@ def fundamentals_frame(codes, start_year, end_year, log=print):
     absent = []
     for endpoint, mapping in PTRADE_FIELDS.items():
         table = ENDPOINT_TABLES[endpoint]
-        fields = sorted(set(field for field in mapping.values() if field is not None))
+        fields = sorted(set(field for value in mapping.values() for field in _candidates(value)))
         absent += [name for name, field in mapping.items() if field is None]
         frame = _statement_table(codes, table, fields, start_year, end_year, log)
         frame = frame.rename(columns={"publ_date": "publ_" + endpoint})
         out = frame[["secu_code", "end_date", "publ_" + endpoint]].copy()
-        for name, field in mapping.items():
-            if field is not None:
-                out[name] = pd.to_numeric(frame[field], errors="coerce") if field in frame.columns else np.nan
+        for name, value in mapping.items():
+            if value is None:
+                continue
+            column = pd.Series(np.nan, index=frame.index)
+            for field in _candidates(value):
+                if field in frame.columns:
+                    column = column.combine_first(pd.to_numeric(frame[field], errors="coerce"))
+            out[name] = column
         merged = out if merged is None else merged.merge(out, on=["secu_code", "end_date"], how="outer")
     published = merged[["publ_" + endpoint for endpoint in PTRADE_FIELDS]].apply(
         lambda column: pd.to_datetime(column, errors="coerce"))

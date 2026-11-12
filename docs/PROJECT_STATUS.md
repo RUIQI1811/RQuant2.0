@@ -58,7 +58,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 - **2026-11-11 起迁到 PTrade**（策略跑在券商服务器上，不用开电脑）。说明在 `ptrade/README.md`。
   研究模块对账已通过（2026-11-12）：用 2026-11-10 数据打分，top30 与 QMT 11-11 实盘的 `live.top30` 同一组股票。
   实盘策略 `ptrade/generated/jq240_ptrade_live.py`：08:00 打分，09:21 竞价卖出和买入，下单规模与 QMT 同一份代码，
-  默认 `LIVE_DRY_RUN = True`。已知差异：`jq_029`、`jq_051`（固定资产）在 PTrade 上全空，字段名待查。
+  默认 `LIVE_DRY_RUN = True`。固定资产在三季报里取 `total_fixed_asset`（`fixed_assets` 为空）。
   切换前要先停掉 QMT 策略，避免两边同时下单。以下是 QMT 的记录。
 
 - miniQMT/xtquant 外接在关停，大 QMT 内置 Python 从 2026-10-23 起禁止读写文件和联网，所以整个策略（因子计算 + numpy 版 LightGBM 打分）

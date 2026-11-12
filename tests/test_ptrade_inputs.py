@@ -39,7 +39,7 @@ class FakePTrade:
         self.statements = {}
         for offset, (endpoint, mapping) in enumerate(fields.items()):
             table = build_namespace()["ENDPOINT_TABLES"][endpoint]
-            names = sorted({field for field in mapping.values() if field})
+            names = sorted({field for value in mapping.values() for field in build_namespace()["_candidates"](value)})
             rows = []
             for code in self.bars:
                 for quarter in quarters:
@@ -158,10 +158,24 @@ def test_fundamentals_rows_and_dates() -> None:
     source = fake.statements["income_statement"].loc[("2010-06-30", "600001.SS")]
     assert row["n_income_attr_p"] == source["np_parent_company_owners"]
     assert row["oth_eqt_tools_p_shr"] == 0.0 and row["fin_exp_int_inc"] == 0.0
+    balance = fake.statements["balance_statement"].loc[("2010-06-30", "600001.SS")]
+    assert row["fix_assets"] == balance["fixed_assets"]  # the first field of the tuple wins when it has a value
     # Statements start FUNDAMENTAL_YEARS_BACK years before the first day.
     assert frame["end_date"].min() == pd.Timestamp("2005-03-31")
     pe = inputs["basic_pe_ttm"]
     assert (pe > 0).to_numpy().any() and not (pe <= 0).to_numpy().any()  # only positive TTM profit gives a P/E
+
+
+def test_a_blank_first_field_falls_back_to_the_next() -> None:
+    names = build_namespace()
+    fake = FakePTrade()
+    table = fake.statements["balance_statement"]
+    table.loc[(slice(None), "600001.SS"), "fixed_assets"] = np.nan
+    for name in API:
+        names[name] = getattr(fake, name)
+    frame = names["fundamentals_frame"](["600001.SS"], 2009, 2010, log=lambda *args: None)
+    row = frame[frame["end_date"] == pd.Timestamp("2010-09-30")].iloc[0]
+    assert row["fix_assets"] == table.loc[("2010-09-30", "600001.SS"), "total_fixed_asset"]
 
 
 def test_universe_uses_point_in_time_status() -> None:
