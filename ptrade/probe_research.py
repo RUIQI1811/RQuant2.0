@@ -3,13 +3,10 @@
 # from QMT (qmt/) to PTrade.
 #
 # How to run: PTrade -> research -> new notebook -> paste this whole file into one cell -> run. It takes a few
-# minutes (PTrade research forbids two standard modules, so this file never imports them). Copy everything it
-# prints (or the file probe_result.txt it writes next to the notebook) and send it back.
+# minutes (it imports only numeric libraries; PTrade research rejects some standard modules). Copy everything it
+# prints and send it back.
 
-import builtins
-import platform
 import time
-import traceback
 
 OUT = []
 
@@ -35,7 +32,6 @@ def attempt(key, fn):
         return value
     except Exception as exc:
         say(key + ".error", "%s: %s" % (type(exc).__name__, exc))
-        say(key + ".trace", traceback.format_exc()[-600:])
         return None
 
 
@@ -51,18 +47,61 @@ def shape(value):
 
 # 1. Python and libraries ---------------------------------------------------------------------------------------
 say("probe", "start " + time.strftime("%Y-%m-%d %H:%M:%S"))
-say("python", platform.python_version() + " " + platform.machine())
-for name in ["numpy", "pandas", "scipy", "sklearn", "statsmodels", "lightgbm", "xgboost", "talib", "numba",
-             "bottleneck", "numexpr", "pickle", "json", "zlib", "gzip", "lzma", "sqlite3", "tables", "h5py"]:
-    try:
-        module = __import__(name)
-        say("lib." + name, getattr(module, "__version__", "ok"))
-    except Exception as exc:
-        say("lib." + name, "MISSING %s" % type(exc).__name__)
-for name in ["get_research_path", "get_price", "get_history", "get_fundamentals", "get_Ashares", "get_stock_status",
-             "get_stock_info", "get_trade_days", "get_all_trades_days", "get_index_stocks", "get_snapshot",
-             "get_stock_blocks", "get_industry_stocks", "get_trading_day"]:
-    say("api." + name, name in globals() or hasattr(builtins, name))
+try:
+    import numpy
+    say("lib.numpy", numpy.__version__)
+except Exception as exc:
+    say("lib.numpy", "MISSING %s" % type(exc).__name__)
+try:
+    import pandas
+    say("lib.pandas", pandas.__version__)
+except Exception as exc:
+    say("lib.pandas", "MISSING %s" % type(exc).__name__)
+try:
+    import scipy
+    say("lib.scipy", scipy.__version__)
+except Exception as exc:
+    say("lib.scipy", "MISSING %s" % type(exc).__name__)
+try:
+    import sklearn
+    say("lib.sklearn", sklearn.__version__)
+except Exception as exc:
+    say("lib.sklearn", "MISSING %s" % type(exc).__name__)
+try:
+    import lightgbm  # noqa: F401
+    say("lib.lightgbm", lightgbm.__version__)
+except Exception as exc:
+    say("lib.lightgbm", "MISSING %s" % type(exc).__name__)
+try:
+    import xgboost  # noqa: F401
+    say("lib.xgboost", xgboost.__version__)
+except Exception as exc:
+    say("lib.xgboost", "MISSING %s" % type(exc).__name__)
+try:
+    import talib
+    say("lib.talib", getattr(talib, '__version__', 'ok'))
+except Exception as exc:
+    say("lib.talib", "MISSING %s" % type(exc).__name__)
+try:
+    import statsmodels  # noqa: F401
+    say("lib.statsmodels", statsmodels.__version__)
+except Exception as exc:
+    say("lib.statsmodels", "MISSING %s" % type(exc).__name__)
+try:
+    import pickle  # noqa: F401
+    say("lib.pickle", 'ok')
+except Exception as exc:
+    say("lib.pickle", "MISSING %s" % type(exc).__name__)
+try:
+    import json  # noqa: F401
+    say("lib.json", 'ok')
+except Exception as exc:
+    say("lib.json", "MISSING %s" % type(exc).__name__)
+try:
+    import zlib  # noqa: F401
+    say("lib.zlib", 'ok')
+except Exception as exc:
+    say("lib.zlib", "MISSING %s" % type(exc).__name__)
 
 
 # 2. Calendar and universe ---------------------------------------------------------------------------------------
@@ -173,9 +212,3 @@ if val is not None:
     say("valuation_day.head", val.head(3))
 
 say("probe", "done " + time.strftime("%Y-%m-%d %H:%M:%S"))
-try:
-    with open("probe_result.txt", "w") as handle:
-        handle.write("\n".join(OUT) + "\n")
-    say("written", "probe_result.txt next to this notebook")
-except Exception as exc:
-    say("write_error", exc)
