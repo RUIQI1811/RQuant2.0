@@ -79,7 +79,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |
-| #33 | J Law 规则型策略的量化近似和回测脚本（`docs/jlaw-rules.md`） | 草稿，等 Windows 上跑回测 |
+| #33 | J Law 规则型策略的量化近似和回测脚本（`docs/jlaw-rules.md`） | 草稿，已回测，结果为负 |
 
 已合并的重要 PR：#29（2026-11-08，qlib 原生化：walk-forward 用 RollingGen + TrainerR + RollingEnsemble，模型写成
 `src/rquant/workflow/workflows/` 下的 qrun YAML，报告用 PortAnaRecord、年化按 252 天；另有 DoubleEnsemble、qlib PyTorch 模型、
@@ -91,9 +91,11 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 - RD-Agent 自动挖因子能跑通（WSL2 + 通义千问，PR #14 已合并），三次运行只重新发现了 Alpha158 类因子，暂停。
 - FinRL 不建议用；以后要试强化学习，用 qlib.rl。
 - 日内数据：Tushare `stk_mins` 足够做沪深 300 分钟级研究，还没开始。
-- J Law 策略（美股波段冠军，突破 + 紧止损 + 0.3% 单笔风险）没有公开的机械规则，PR #33 把他公开讲过的原则改写成规则
-  （每条注明是原话还是近似），用 `scripts/analysis/jlaw_backtest.py` 在 canonical 日线上回测，不需要因子库和模型；
-  sh_main 结果还没跑。
+- J Law 策略（美股波段冠军，放量突破 + 紧止损 + 每笔风险 0.3%）没有公开的机械规则，PR #33 把他公开讲过的原则改写成 16 条规则
+  （每条注明是原话还是近似，见 `docs/jlaw-rules.md`），用 `scripts/analysis/jlaw_backtest.py` 在 canonical 日线上回测。
+  sh_main、25 万、2013-01-04 至 2026-10-21（run `runs/jlaw/20261114T132653Z`）：base 年化 -5.5%、Sharpe -0.76、最大回撤 -53%；
+  2022 年以后 -5.8%/-0.78/-24.5%；6 个变体（回调买点、去掉大盘过滤、不加仓、去掉 beta、每笔风险 0.5%）全部为负。
+  胜率约 13%，盈利平均 +5R、亏损平均 -1.1R，四分之三的交易被止损打掉。不用于实盘。
 - `report` 会覆盖原 run 目录；换参数重跑报告前先复制目录（如 `<run>-top30-drop3`）。
 
 ## 怎么维护

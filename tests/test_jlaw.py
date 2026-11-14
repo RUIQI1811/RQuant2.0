@@ -216,3 +216,27 @@ def test_strong_sectors_keeps_top_share() -> None:
     marked = strong_sectors(returns, sector, 1.0 / 3.0)
     assert marked.loc[dates[0]].tolist() == [True, False, False]
     assert marked.loc[dates[1]].tolist() == [False, False, True]
+
+
+def test_units_hold_the_raw_shares_value_when_prices_are_adjusted() -> None:
+    # factor != 1: adjusted price = raw * factor, so a buy of N raw shares holds N / factor adjusted units and is worth
+    # N * raw price in money.
+    panels = make_panels(uptrend(), volume_a=breakout_volume())
+    factor = 0.125
+    for name in ("open", "high", "low", "close", "vwap"):
+        panels[name] = panels[name] * factor
+    panels["factor"] = panels["factor"] * factor
+    result = run(panels)
+    entry_row = SIGNAL + 1
+    raw_vwap = panels["vwap"]["SH600000"].iloc[entry_row] / factor
+    units = result.open_positions.loc[0, "units"]
+    raw_shares = units * factor
+    assert raw_shares == pytest.approx(round(raw_shares))
+    assert raw_shares % 100 == pytest.approx(0)
+    entry = result.daily.iloc[entry_row - 260]
+    held = entry["equity"] - entry["cash"]
+    # Same money at risk as the unadjusted fixture: about risk / min_stop of equity.
+    expected_value = OPEN_SCREEN.risk_per_trade * OPEN_SCREEN.initial_capital / OPEN_SCREEN.min_stop
+    assert expected_value - 100 * raw_vwap * 1.01 <= raw_shares * raw_vwap <= expected_value * 1.01
+    assert held == pytest.approx(units * panels["close"]["SH600000"].iloc[entry_row])
+    assert held == pytest.approx(raw_shares * panels["close"]["SH600000"].iloc[entry_row] / factor)

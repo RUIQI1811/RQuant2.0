@@ -23,9 +23,9 @@ The strategy is long only (A shares cannot be shorted in an ordinary account) an
   account is more than ``drawdown_reduce`` below its peak, the risk per trade drops to ``risk_reduced``.
 
 Prices are adjusted (``raw * factor``); a position holds ``units`` of adjusted price, so dividends and bonus shares are
-reinvested in kind. Buys are rounded to 100 raw shares. Costs follow ``AshareCostModel`` (commission with a minimum,
-date-aware sell stamp tax). Daily bars cannot tell whether a stop or a target was hit first within a day, so stops are
-approximated as described above.
+reinvested in kind. Buys are rounded to 100 raw shares (N raw shares are N / factor units). Costs follow
+``AshareCostModel`` (commission with a minimum, date-aware sell stamp tax). Daily bars cannot tell whether a stop or a
+target was hit first within a day, so stops are approximated as described above.
 """
 
 from __future__ import annotations
@@ -419,7 +419,7 @@ def run_backtest(
             value = lots * params.trade_unit * raw_price
             charge = fee(value, dates[row], sell=False)
             if value + charge <= cash and value <= budget + 1e-9:
-                return lots * params.trade_unit * arr["factor"][row, code], charge
+                return lots * params.trade_unit / arr["factor"][row, code], charge
             lots -= 1
         return 0.0, 0.0
 
