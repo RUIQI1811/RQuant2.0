@@ -1,6 +1,6 @@
 # RQuant2.0 项目进度（共享记忆）
 
-最后更新：2026-11-08（美西时间）。
+最后更新：2026-11-14（美西时间）。
 
 这份文件是 Claude 和 GPT/Codex 等 agent 共同读取的项目进度。规则见文末「怎么维护」。
 研究口径、目录职责和安全边界以 `agent.md` 为准；本文件只记录「现在做到哪了」。
@@ -79,6 +79,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |
+| #33 | J Law 规则型策略的量化近似和回测脚本（`docs/jlaw-rules.md`） | 草稿，等 Windows 上跑回测 |
 
 已合并的重要 PR：#29（2026-11-08，qlib 原生化：walk-forward 用 RollingGen + TrainerR + RollingEnsemble，模型写成
 `src/rquant/workflow/workflows/` 下的 qrun YAML，报告用 PortAnaRecord、年化按 252 天；另有 DoubleEnsemble、qlib PyTorch 模型、
@@ -90,6 +91,9 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 - RD-Agent 自动挖因子能跑通（WSL2 + 通义千问，PR #14 已合并），三次运行只重新发现了 Alpha158 类因子，暂停。
 - FinRL 不建议用；以后要试强化学习，用 qlib.rl。
 - 日内数据：Tushare `stk_mins` 足够做沪深 300 分钟级研究，还没开始。
+- J Law 策略（美股波段冠军，突破 + 紧止损 + 0.3% 单笔风险）没有公开的机械规则，PR #33 把他公开讲过的原则改写成规则
+  （每条注明是原话还是近似），用 `scripts/analysis/jlaw_backtest.py` 在 canonical 日线上回测，不需要因子库和模型；
+  sh_main 结果还没跑。
 - `report` 会覆盖原 run 目录；换参数重跑报告前先复制目录（如 `<run>-top30-drop3`）。
 
 ## 怎么维护
