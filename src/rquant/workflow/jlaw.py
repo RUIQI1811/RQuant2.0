@@ -143,6 +143,10 @@ class JLawParams:
     drawdown_reduce: float = 0.10
     min_stop: float = 0.02
     max_stop: float = 0.08
+    # "low": the signal day's low (pullback: the window's low); "atr": signal close minus atr_mult x ATR(atr_window).
+    stop_mode: str = "low"
+    atr_window: int = 14
+    atr_mult: float = 2.0
     max_weight: float = 0.25
     max_positions: int = 10
     # Pyramiding
@@ -214,6 +218,7 @@ class BacktestResult:
 
 def compute_signals(panels: dict[str, Any], benchmark_close: Any, params: JLawParams) -> dict[str, Any]:
     """Return the dates x instruments signal panels (computed from data up to and including each day's close)."""
+    import numpy as np
     import pandas as pd
 
     close = panels["close"]
@@ -273,7 +278,18 @@ def compute_signals(panels: dict[str, Any], benchmark_close: Any, params: JLawPa
         & (close > prior_high)
         & (panels["raw_volume"] >= params.volume_mult * volume_avg.shift(1))
     )
-    breakout_stop = panels["low"]
+    if params.stop_mode == "atr":
+        previous = filled.shift(1)
+        high, low = panels["high"].to_numpy(dtype=float), panels["low"].to_numpy(dtype=float)
+        prior = previous.to_numpy(dtype=float)
+        ranges = np.fmax(np.fmax(high - low, np.abs(high - prior)), np.abs(low - prior))
+        true_range = pd.DataFrame(ranges, index=close.index, columns=close.columns)
+        atr = true_range.rolling(params.atr_window, min_periods=params.atr_window // 2).mean()
+        breakout_stop = close - params.atr_mult * atr
+    elif params.stop_mode == "low":
+        breakout_stop = panels["low"]
+    else:
+        raise ValueError(f"Unknown stop_mode {params.stop_mode!r}; expected 'low' or 'atr'")
 
     if params.enable_pullback:
         window = params.pullback_window
@@ -281,6 +297,8 @@ def compute_signals(panels: dict[str, Any], benchmark_close: Any, params: JLawPa
         confirm = (close > panels["high"].shift(1)) & (close > ema10) & (close > ema21)
         pullback = screen & (rs_pct >= params.pullback_rs_min_pct) & touched & confirm & ~breakout
         pullback_stop = panels["low"].rolling(window, min_periods=1).min()
+        if params.stop_mode == "atr":
+            pullback_stop = breakout_stop
     else:
         pullback = pd.DataFrame(False, index=close.index, columns=close.columns)
         pullback_stop = breakout_stop

@@ -31,6 +31,13 @@ VARIANTS = {
     "no_pyramid": {"add_fractions": ()},
     "no_beta": {"min_beta": None},
     "risk_0.5pct": {"risk_per_trade": 0.005, "risk_reduced": 0.0025},
+    # Wider stops: 2 x ATR(14) under the signal close, kept 5%..15% under the entry.
+    "atr2_stop": {"stop_mode": "atr", "atr_mult": 2.0, "min_stop": 0.05, "max_stop": 0.15},
+    "atr3_stop": {"stop_mode": "atr", "atr_mult": 3.0, "min_stop": 0.05, "max_stop": 0.15},
+    # O'Neil-style fixed 8% stop.
+    "fixed8_stop": {"min_stop": 0.08, "max_stop": 0.08},
+    # Wider stop with a slower trend exit (close under the 50-day EMA).
+    "atr2_stop_ema50": {"stop_mode": "atr", "atr_mult": 2.0, "min_stop": 0.05, "max_stop": 0.15, "exit_ema": 50},
 }
 FRESH_START = "2022-01-04"
 

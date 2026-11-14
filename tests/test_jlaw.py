@@ -240,3 +240,29 @@ def test_units_hold_the_raw_shares_value_when_prices_are_adjusted() -> None:
     assert expected_value - 100 * raw_vwap * 1.01 <= raw_shares * raw_vwap <= expected_value * 1.01
     assert held == pytest.approx(units * panels["close"]["SH600000"].iloc[entry_row])
     assert held == pytest.approx(raw_shares * panels["close"]["SH600000"].iloc[entry_row] / factor)
+
+
+def test_atr_stop_sits_atr_mult_true_ranges_under_the_signal_close() -> None:
+    panels = make_panels(uptrend(), volume_a=breakout_volume())
+    wide = {"stop_mode": "atr", "atr_mult": 2.0, "min_stop": 0.0, "max_stop": 1.0}
+    params = JLawParams(**{**OPEN_SCREEN.to_dict(), **wide})
+    signals = compute_signals(panels, benchmark(panels), params)
+    close = panels["close"]["SH600000"]
+    prior = close.shift(1)
+    true_range = pd.concat(
+        [panels["high"]["SH600000"] - panels["low"]["SH600000"], (panels["high"]["SH600000"] - prior).abs(),
+         (panels["low"]["SH600000"] - prior).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.rolling(14, min_periods=7).mean()
+    expected = close.iloc[SIGNAL] - 2.0 * atr.iloc[SIGNAL]
+    assert signals["breakout_stop"]["SH600000"].iloc[SIGNAL] == pytest.approx(expected)
+    result = run(panels, params)
+    assert result.open_positions.loc[0, "initial_stop"] == pytest.approx(expected)
+
+
+def test_unknown_stop_mode_is_rejected() -> None:
+    panels = make_panels(uptrend(), volume_a=breakout_volume())
+    params = JLawParams(**{**OPEN_SCREEN.to_dict(), "stop_mode": "nope"})
+    with pytest.raises(ValueError, match="stop_mode"):
+        compute_signals(panels, benchmark(panels), params)
