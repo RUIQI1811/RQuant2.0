@@ -222,3 +222,11 @@ def test_a_plan_made_the_evening_before_stands_and_a_missing_session_is_retried(
     before = live.fake.calls["get_price"]
     live.run("rq_prepare", "20110704082000")
     assert live.fake.calls["get_price"] > before
+
+
+def test_handle_data_logs_a_heartbeat() -> None:
+    live = Live({})
+    live.run("rq_prepare", "20110701080000")
+    live.clock = "20110701145000"
+    live.names["handle_data"](live.context, None)
+    assert any(line.startswith("[RQ] live.alive=201107011450 plan 20110630") for line in live.lines())

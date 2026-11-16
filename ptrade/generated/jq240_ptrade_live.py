@@ -1854,5 +1854,12 @@ def before_trading_start(context, data):
 
 
 def handle_data(context, data):
-    pass
+    """Once a day (14:50 for a daily trade): a heartbeat line, so a day without any log shows the trade did not run."""
+    try:
+        plan = _pt["plan"]
+        rq_log("live.alive", "%s plan %s done %s cash %.0f" % (
+            beijing_clock()[:12], plan["date"].strftime("%Y%m%d") if plan is not None else "none",
+            _pt["done"] or getattr(g, "rq_done", None), float(context.portfolio.cash)))  # noqa: F821
+    except Exception as exc:
+        rq_log("live.error", _where(exc))
 
