@@ -1572,8 +1572,11 @@ def live_buy(C, sold, account, tag):
 #   against the real holdings and the previous close, and sends the sells at the limit-down price and the buys at
 #   most LIVE_AUCTION_BUY above the previous close, so the opening auction fills both at the open. Buys only use the
 #   cash on hand before the auction, so the account keeps about LIVE_N_DROP slots in cash for the next day.
-# * If the plan was not ready for the auction: sells at LIVE_SELL_AT and buys at LIVE_BUY_AT after the open, as
-#   marketable limit orders.
+# * If the plan was not ready for the auction: sells at the first of LIVE_SELL_AT it is ready for and buys at the
+#   LIVE_BUY_AT a minute later, as marketable limit orders. Nothing is sent after 10:00.
+# * The plan is also kept in PTrade's ``g``, which survives a server restart: a trade the broker restarts (as on
+#   2026-11-16, after the weekend) trades on the plan it already had instead of planning again from cold (20 minutes,
+#   which missed both the auction and the after-open orders).
 # It trades at most once a day, and not at all on a day the account already has orders for sh_main stocks.
 #
 # LIVE_DRY_RUN = True (the default) sends nothing: it logs the orders it would send, once at start and then at each
@@ -1587,8 +1590,8 @@ LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600
 LIVE_AUCTION = True
 LIVE_PLAN_AT = ("21:00", "08:00", "08:20", "08:35", "08:50", "09:00")  # each run plans only if still needed
 LIVE_AUCTION_AT = "09:21"  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
-LIVE_SELL_AT = "09:31"
-LIVE_BUY_AT = "09:32"
+LIVE_SELL_AT = ("09:31", "09:40", "09:50")  # after-open fallback: each sells only if nothing went out yet today
+LIVE_BUY_AT = ("09:32", "09:41", "09:51")  # buys a minute after the sells, once
 LIVE_AUCTION_BUY = 0.03  # auction buy limit above the previous close (the cash it ties up); above it, no fill at the open
 LIVE_SLIP = 0.01  # after the open: limit price offset from the last price; capped at the daily limit
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
@@ -1721,6 +1724,34 @@ def live_plan():
     return {"date": last, "scores": scores, "st": inputs["quotes"]["st"], "made": clock[:8]}
 
 
+def keep_plan(plan):
+    """Store the plan in g (PTrade pickles g and restores it after a restart) as plain values."""
+    scores = plan["scores"]
+    g.rq_plan = {"date": plan["date"].strftime("%Y%m%d"), "codes": [str(code) for code in scores.index],  # noqa: F821
+                 "values": [float(value) for value in scores.values], "st": sorted(plan["st"]), "made": plan["made"]}
+
+
+def restore_plan():
+    """The plan kept in g, after a restart wiped the module's memory (logged), or None."""
+    kept = getattr(g, "rq_plan", None)  # noqa: F821
+    if not kept:
+        return None
+    plan = {"date": pd.Timestamp(kept["date"]), "scores": pd.Series(kept["values"], index=kept["codes"], dtype=float),
+            "st": set(kept["st"]), "made": kept["made"]}
+    rq_log("live.plan_restored", "%s, made %s" % (kept["date"], kept["made"]))
+    return plan
+
+
+def current_plan():
+    """The plan in memory, else the one kept in g."""
+    if _pt["plan"] is None:
+        try:
+            _pt["plan"] = restore_plan()
+        except Exception as exc:
+            rq_log("live.error", "kept plan unreadable: %s" % _where(exc))
+    return _pt["plan"]
+
+
 def latest_session(clock):
     """The last session whose daily bars should exist at ``clock``: today from 15:00 on a trading day, else the last
     trading day before today."""
@@ -1733,14 +1764,17 @@ def latest_session(clock):
 def rq_prepare(context):
     """Plan unless the plan in hand already scores the latest finished session (or another job is making one)."""
     _pt["context"] = context
-    plan = _pt["plan"]
     if _pt["planning"]:
         return
+    plan = current_plan()
     if plan is not None and plan["date"] == latest_session(beijing_clock()):
         return
     _pt["planning"] = True
     try:
-        _pt["plan"] = live_plan()
+        made = live_plan()
+        if made is not None:
+            _pt["plan"] = made
+            keep_plan(made)
     except Exception as exc:
         rq_log("live.error", _where(exc))
     finally:
@@ -1749,7 +1783,7 @@ def rq_prepare(context):
 
 def _ready_plan(today):
     """Today's plan when it scores the session before today, else None (logged)."""
-    plan = _pt["plan"]
+    plan = current_plan()
     if plan is None:
         rq_log("live.skip", "no plan yet (still planning: %s)" % _pt["planning"])
         return None
@@ -1773,10 +1807,12 @@ def rq_trade(context, mode):
         return
     if LIVE_DRY_RUN and ((today, mode) in _pt["dry"] or (mode == "sell" and (today, "auction") in _pt["dry"])):
         return
+    if mode == "sell" and (_pt["sold"] is not None and _pt["sold"][0] == today or clock[8:12] >= "1000"):
+        return  # an earlier after-open run sold already (its buy job follows), or it is too late in the day
     if mode != "dry":
         plan = _ready_plan(today)
     else:
-        plan = _pt["plan"]
+        plan = current_plan()
     if plan is None:
         return
     if not LIVE_DRY_RUN:
@@ -1837,8 +1873,10 @@ def initialize(context):
     for moment in LIVE_PLAN_AT:
         run_daily(context, rq_prepare, time=moment)  # noqa: F821
     run_daily(context, rq_auction, time=LIVE_AUCTION_AT)  # noqa: F821
-    run_daily(context, rq_after_open_sell, time=LIVE_SELL_AT)  # noqa: F821
-    run_daily(context, rq_after_open_buy, time=LIVE_BUY_AT)  # noqa: F821
+    for moment in LIVE_SELL_AT:
+        run_daily(context, rq_after_open_sell, time=moment)  # noqa: F821
+    for moment in LIVE_BUY_AT:
+        run_daily(context, rq_after_open_buy, time=moment)  # noqa: F821
 
 
 def before_trading_start(context, data):
@@ -1856,7 +1894,7 @@ def before_trading_start(context, data):
 def handle_data(context, data):
     """Once a day (14:50 for a daily trade): a heartbeat line, so a day without any log shows the trade did not run."""
     try:
-        plan = _pt["plan"]
+        plan = current_plan()
         rq_log("live.alive", "%s plan %s done %s cash %.0f" % (
             beijing_clock()[:12], plan["date"].strftime("%Y%m%d") if plan is not None else "none",
             _pt["done"] or getattr(g, "rq_done", None), float(context.portfolio.cash)))  # noqa: F821

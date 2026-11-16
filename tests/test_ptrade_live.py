@@ -114,7 +114,8 @@ def test_jobs_and_auction_trade_sells_and_buys_at_once() -> None:
     live = Live({"600002.SS": (300, 300), "000001.SZ": (500, 500)})
     live.run("initialize", "20110701080000")
     plans = [("rq_prepare", moment) for moment in ("21:00", "08:00", "08:20", "08:35", "08:50", "09:00")]
-    trades = [("rq_auction", "09:21"), ("rq_after_open_sell", "09:31"), ("rq_after_open_buy", "09:32")]
+    trades = [("rq_auction", "09:21")] + [("rq_after_open_sell", moment) for moment in ("09:31", "09:40", "09:50")]
+    trades += [("rq_after_open_buy", moment) for moment in ("09:32", "09:41", "09:51")]
     assert live.jobs == plans + trades
     live.run("rq_prepare", "20110701080000")
     assert live.sent == []
@@ -217,7 +218,7 @@ def test_a_plan_made_the_evening_before_stands_and_a_missing_session_is_retried(
     # The next morning the 07-01 bars are not in yet (the fake market ends on 06-30): no plan, and each later job
     # tries again.
     live.run("rq_prepare", "20110704080000")
-    assert live.names["_pt"]["plan"] is None
+    assert live.names["_pt"]["plan"]["date"] == pd.Timestamp("2011-06-30")  # the old plan stays; it is not today's
     assert any("live.error=daily bars of 20110701 are missing" in line for line in live.lines())
     before = live.fake.calls["get_price"]
     live.run("rq_prepare", "20110704082000")
@@ -230,3 +231,40 @@ def test_handle_data_logs_a_heartbeat() -> None:
     live.clock = "20110701145000"
     live.names["handle_data"](live.context, None)
     assert any(line.startswith("[RQ] live.alive=201107011450 plan 20110630") for line in live.lines())
+
+
+def test_a_restarted_trade_uses_the_plan_kept_in_g() -> None:
+    live = Live({"600002.SS": (300, 300)})
+    live.run("rq_prepare", "20110630210000")
+    assert live.g.rq_plan["date"] == "20110630" and len(live.g.rq_plan["codes"]) == len(live.g.rq_plan["values"])
+    scores = live.names["_pt"]["plan"]["scores"]
+    # The broker restarts the trade: module memory is gone, g is restored; initialize and the start-up run follow.
+    live.names["_pt"].update(plan=None, cache={}, sold=None, done=None)
+    calls = dict(live.fake.calls)
+    live.run("initialize", "20110701090500")
+    live.run("before_trading_start", "20110701090500")
+    assert live.fake.calls == calls  # no planning from cold
+    assert any(line.startswith("[RQ] live.plan_restored=20110630") for line in live.lines())
+    pd.testing.assert_series_equal(live.names["_pt"]["plan"]["scores"], scores, check_names=False)
+    live.run("rq_auction", "20110701092100")
+    assert any(amount < 0 for _, amount, _ in live.sent) and live.g.rq_done == "20110701"
+
+
+def test_after_open_fallback_retries_until_ten_and_sells_once() -> None:
+    live = Live({"600002.SS": (300, 300)})
+    live.names["_pt"]["planning"] = True  # a cold plan still running through the first after-open run
+    live.run("rq_after_open_sell", "20110701093100")
+    live.run("rq_after_open_buy", "20110701093200")
+    assert live.sent == []
+    live.names["_pt"]["planning"] = False
+    live.run("rq_prepare", "20110701093500")
+    live.run("rq_after_open_sell", "20110701094000")
+    assert [(code, amount) for code, amount, _ in live.sent] == [("600002.SS", -300)]
+    live.run("rq_after_open_sell", "20110701095000")  # sold already: no second round of sells
+    assert len(live.sent) == 1
+    live.run("rq_after_open_buy", "20110701094100")
+    assert any(amount > 0 for _, amount, _ in live.sent) and live.g.rq_done == "20110701"
+    late = Live({"600002.SS": (300, 300)})
+    late.run("rq_prepare", "20110701080000")
+    late.run("rq_after_open_sell", "20110701100100")
+    assert late.sent == []
