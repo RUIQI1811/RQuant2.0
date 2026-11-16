@@ -21,10 +21,10 @@ TODAY = pd.Timestamp("2011-07-01")  # the session after the synthetic market's l
 
 
 class LiveFake(pti.FakePTrade):
-    """FakePTrade whose calendar also lists TODAY, which has no daily bar yet (get_price stops before today)."""
+    """FakePTrade whose calendar also lists TODAY and the Monday after; neither has daily bars (they end on 06-30)."""
 
     def get_trade_days(self, start, end):
-        days = qmt.CALENDAR.append(pd.DatetimeIndex([TODAY]))
+        days = qmt.CALENDAR.append(pd.DatetimeIndex([TODAY, pd.Timestamp("2011-07-04")]))
         days = days[(days >= pd.Timestamp(start)) & (days <= pd.Timestamp(end))]
         return np.array(days.strftime("%Y-%m-%d"))
 
@@ -113,8 +113,9 @@ def test_jobs_and_auction_trade_sells_and_buys_at_once() -> None:
     # 600002 is an ST name, out of the universe, so it goes; the SZ holding is not the strategy's.
     live = Live({"600002.SS": (300, 300), "000001.SZ": (500, 500)})
     live.run("initialize", "20110701080000")
-    assert live.jobs == [("rq_prepare", "08:00"), ("rq_auction", "09:21"), ("rq_after_open_sell", "09:31"),
-                         ("rq_after_open_buy", "09:32")]
+    plans = [("rq_prepare", moment) for moment in ("21:00", "08:00", "08:20", "08:35", "08:50", "09:00")]
+    trades = [("rq_auction", "09:21"), ("rq_after_open_sell", "09:31"), ("rq_after_open_buy", "09:32")]
+    assert live.jobs == plans + trades
     live.run("rq_prepare", "20110701080000")
     assert live.sent == []
     live.run("before_trading_start", "20110701091000")  # the plan is in hand: nothing more
@@ -202,3 +203,22 @@ def test_committed_ptrade_live_bundle_is_current() -> None:
     for word in ("import os", "import sys", "import traceback", "globals(", "__import__", "\ndef log("):
         assert word not in source
     assert "LIVE_DRY_RUN = True" in source
+
+
+def test_a_plan_made_the_evening_before_stands_and_a_missing_session_is_retried() -> None:
+    live = Live({"600002.SS": (300, 300)})
+    live.run("rq_prepare", "20110630210000")  # after the close: the 06-30 bars are in
+    assert live.names["_pt"]["plan"]["date"] == pd.Timestamp("2011-06-30")
+    calls = dict(live.fake.calls)
+    live.run("rq_prepare", "20110701080000")  # the plan already scores the last session: nothing to do
+    assert live.fake.calls == calls
+    live.run("rq_auction", "20110701092100")
+    assert any(amount < 0 for _, amount, _ in live.sent)
+    # The next morning the 07-01 bars are not in yet (the fake market ends on 06-30): no plan, and each later job
+    # tries again.
+    live.run("rq_prepare", "20110704080000")
+    assert live.names["_pt"]["plan"] is None
+    assert any("live.error=daily bars of 20110701 are missing" in line for line in live.lines())
+    before = live.fake.calls["get_price"]
+    live.run("rq_prepare", "20110704082000")
+    assert live.fake.calls["get_price"] > before

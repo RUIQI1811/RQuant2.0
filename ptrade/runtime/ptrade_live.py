@@ -2,9 +2,11 @@
 # (ptrade/generated/jq240_ptrade_live.py) into a new PTrade strategy, daily frequency, and start a trade with it.
 #
 # PTrade runs the strategy on the broker's servers and leaves it running from day to day. Each trading day:
-# * LIVE_PLAN_AT (08:00 Beijing) builds the jq240 inputs from PTrade's data through the last finished session and
-#   scores sh_main with the exported LightGBM window. The first run after a start takes about 20 minutes; the per-day
-#   lookups stay in memory, so later days take a few minutes. It also plans at once when the trade is started.
+# * LIVE_PLAN_AT (21:00 the evening before, then 08:00 to 09:05 Beijing) builds the jq240 inputs from PTrade's data
+#   through the last finished session and scores sh_main with the exported LightGBM window, until it has a plan for
+#   that session. PTrade's daily bars of a session are not always in by 08:00 (2026-11-13: missing at 08:05, in at
+#   09:10), hence the retries. The first run after a start takes about 20 minutes; the per-day lookups stay in memory,
+#   so later runs take about 8. It also plans at once when the trade is started, and at 09:10 if still without a plan.
 # * LIVE_AUCTION_AT (09:21) decides like the backtest's TopkDropoutStrategy (top LIVE_TOPK, drop at most LIVE_N_DROP)
 #   against the real holdings and the previous close, and sends the sells at the limit-down price and the buys at
 #   most LIVE_AUCTION_BUY above the previous close, so the opening auction fills both at the open. Buys only use the
@@ -22,7 +24,7 @@ LIVE_TOPK = 30
 LIVE_N_DROP = 3
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SS"])
 LIVE_AUCTION = True
-LIVE_PLAN_AT = "08:00"
+LIVE_PLAN_AT = ("21:00", "08:00", "08:20", "08:35", "08:50", "09:00")  # each run plans only if still needed
 LIVE_AUCTION_AT = "09:21"  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
 LIVE_SELL_AT = "09:31"
 LIVE_BUY_AT = "09:32"
@@ -158,12 +160,22 @@ def live_plan():
     return {"date": last, "scores": scores, "st": inputs["quotes"]["st"], "made": clock[:8]}
 
 
+def latest_session(clock):
+    """The last session whose daily bars should exist at ``clock``: today from 15:00 on a trading day, else the last
+    trading day before today."""
+    days = trading_calendar(clock[:8])
+    if len(days) and days[-1] == pd.Timestamp(clock[:8]) and clock[8:12] < "1500":
+        days = days[:-1]
+    return days[-1] if len(days) else None
+
+
 def rq_prepare(context):
-    """Plan for the next session unless today's plan is in hand (or another job is making it)."""
+    """Plan unless the plan in hand already scores the latest finished session (or another job is making one)."""
     _pt["context"] = context
-    today = beijing_clock()[:8]
     plan = _pt["plan"]
-    if (plan is not None and plan["made"] == today) or _pt["planning"]:
+    if _pt["planning"]:
+        return
+    if plan is not None and plan["date"] == latest_session(beijing_clock()):
         return
     _pt["planning"] = True
     try:
@@ -261,7 +273,8 @@ def initialize(context):
     _pt["context"] = context
     rq_log("live", "start dry_run=%s auction=%s topk=%d n_drop=%d" % (LIVE_DRY_RUN, LIVE_AUCTION, LIVE_TOPK,
                                                                       LIVE_N_DROP))
-    run_daily(context, rq_prepare, time=LIVE_PLAN_AT)  # noqa: F821
+    for moment in LIVE_PLAN_AT:
+        run_daily(context, rq_prepare, time=moment)  # noqa: F821
     run_daily(context, rq_auction, time=LIVE_AUCTION_AT)  # noqa: F821
     run_daily(context, rq_after_open_sell, time=LIVE_SELL_AT)  # noqa: F821
     run_daily(context, rq_after_open_buy, time=LIVE_BUY_AT)  # noqa: F821
