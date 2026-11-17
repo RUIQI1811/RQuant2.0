@@ -78,6 +78,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 - 每天第一次运行会先补最近 10 天日线；最新一天不到约 90% 的股票有日线就报 `live.error`、不下单。
 - QMT 日志：`D:\国金证券QMT交易端\userdata\log\XtClient_FormulaOutput_YYYYMMDD.log`（GBK 编码）。
 - 硬规则：没有用户明确确认，任何 agent 都不能下真实订单或改 `LIVE_DRY_RUN`。
+- 2026-11-17 用户要求：交给他的 PTrade 实盘文件（Windows 的 `ptrade_jq240_live.py`）直接改好 `LIVE_DRY_RUN = False`，不用他自己改；仓库里的生成文件仍保持 `True`。
 
 ## 6. 打开的 PR
 
