@@ -1,6 +1,6 @@
 # RQuant2.0 项目进度（共享记忆）
 
-最后更新：2026-11-15 晚（美西时间）。
+最后更新：2026-11-17（美西时间）。
 
 这份文件是 Claude 和 GPT/Codex 等 agent 共同读取的项目进度。规则见文末「怎么维护」。
 研究口径、目录职责和安全边界以 `agent.md` 为准；本文件只记录「现在做到哪了」。
@@ -13,7 +13,8 @@
   内存是瓶颈，用户开游戏或桌面应用时空闲常不足 1 GB。**任何运行前先看空闲内存**；神经网络、walk-forward、
   甚至 NN 的 pytest 都要至少 6 GB 空闲，否则会卡死。
 - Windows 主 checkout（`D:\自己瞎搞\RQuant2.0`）从 2026-11-08 起在 `main` 上。原来 `codex/rquant-subagent-rules` 上的未提交改动
-  已存成那个分支上的本地提交 `f0891dd`（没有推送）。其他旧 worktree（`.claude\worktrees`、`RQuant2.0-oap` 等）可能还有未提交改动，不要删。
+  已存成那个分支上的本地提交 `f0891dd`（没有推送）。2026-11-17 清理了旧 worktree（`D:\自己瞎搞\RQuant2.0-*`、`rq-bppikk`、
+  `.claude\worktrees` 和 `reports\*\worktree`，送进回收站）；它们独有的未提交文件保存在 `runs\_worktree-leftovers\<名字>\`。
   跑某个未合并 PR 的代码用 worktree + `PYTHONPATH=<worktree>\src` + `--root D:\自己瞎搞\RQuant2.0`。
 - Mac 用来讨论和审阅，不跑重任务。
 - 用户在美西时间（UTC-8）。A 股时间是北京时间，两者相差 16 小时；给用户写时间时注明时区。
@@ -53,7 +54,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 - **实盘口径**（20 万、top30、每天最多换 3 只、最低佣金 5 元）：2022 年以后 32.7%/1.12/-35.1%；最低佣金每年拖累约 1%。
 - 风险提示：2022 年以后的收益主要来自 2025 年；Sharpe 的标准误约 ±0.45；没有计冲击成本。
 
-## 5. 实盘（国金证券，PR #28 草稿；正在从 QMT 迁到 PTrade）
+## 5. 实盘（国金证券，PR #28 已于 2026-11-17 合并；2026-11-13 起用 PTrade）
 
 - **2026-11-11 起迁到 PTrade**（策略跑在券商服务器上，不用开电脑）。说明在 `ptrade/README.md`。
   研究模块对账已通过（2026-11-12）：用 2026-11-10 数据打分，top30 与 QMT 11-11 实盘的 `live.top30` 同一组股票。
@@ -64,7 +65,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
   2026-11-16（周一）没有下单（原因未确认）。11-17 09:21 竞价卖 3 买 3，09:25 全部成交；PTrade 前一天日线 09:10 后才到，打分 09:18 才完成。之后改成：打分存进 `g`（重启不丢）、早上先抽查日线再打分（约 4 分钟）、09:00 起每两三分钟重试、09:23 补一次竞价、开盘后补单到 09:50。用户 11-17 起换用新交易 JQ2.0。以下是 QMT 的记录。
 
 - miniQMT/xtquant 外接在关停，大 QMT 内置 Python 从 2026-10-23 起禁止读写文件和联网，所以整个策略（因子计算 + numpy 版 LightGBM 打分）
-  打包成一个文件粘贴进 QMT 内置 Python 3.6 运行。源码在 `qmt/`，说明在 `qmt/README.md`（都在 PR #28 分支上）。
+  打包成一个文件粘贴进 QMT 内置 Python 3.6 运行。源码在 `qmt/`，说明在 `qmt/README.md`（PR #28，已合并）。
 - 模型：2026 年窗口（训练 2023-01-03 至 2025-12-30）导出到 `qmt/models/lgb_jq240_sh_main.json`，只有 8 棵树，很多股票同分，同分按代码排序。
 - 一致性核对已通过（2026-11-05）：2026-10-21 的 top30/top50 和回测完全相同，排序相关系数 0.997。
   QMT 没有折旧摊销数据（EBITDA 实际是 EBIT），这两个因子重要性约 0.1%，可以接受。
@@ -84,12 +85,12 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 
 | PR | 内容 | 状态 |
 | --- | --- | --- |
-| #28 | 实盘：QMT（已停用）和 PTrade（2026-11-13 起实盘）的探测、对账、实盘策略 | 草稿 |
+| #32 | jq240 LightGBM 调参（IC 早停、排名标签、`--seed`、多 run 平均）和季度重训 | 草稿 |
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |
 
-已合并的重要 PR：#29（2026-11-08，qlib 原生化：walk-forward 用 RollingGen + TrainerR + RollingEnsemble，模型写成
+已合并的重要 PR：#28（2026-11-17，QMT 和 PTrade 实盘：`qmt/`、`ptrade/`）、#33（2026-11-17，J Law 规则型策略回测，结果为负，不用于实盘）、#29（2026-11-08，qlib 原生化：walk-forward 用 RollingGen + TrainerR + RollingEnsemble，模型写成
 `src/rquant/workflow/workflows/` 下的 qrun YAML，报告用 PortAnaRecord、年化按 252 天；另有 DoubleEnsemble、qlib PyTorch 模型、
 `report --signal-only`、`report --strategy enhanced-indexing` 和结构化风险模型）、#30（本文件）、#22（oap_jq_cnc、默认因子集 jq240）、#23（`scripts/analysis/window_metrics.py`，从已保存的 run 算任意时间段指标）、
 #24（`AGENTS.md` 和 `docs/adding-factor-sets.md`）。
@@ -99,6 +100,13 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 - RD-Agent 自动挖因子能跑通（WSL2 + 通义千问，PR #14 已合并），三次运行只重新发现了 Alpha158 类因子，暂停。
 - FinRL 不建议用；以后要试强化学习，用 qlib.rl。
 - 日内数据：Tushare `stk_mins` 足够做沪深 300 分钟级研究，还没开始。
+- J Law 策略（美股波段冠军，放量突破 + 紧止损 + 每笔风险 0.3%）没有公开的机械规则，PR #33（已合并）把他公开讲过的原则改写成 16 条规则
+  （每条注明是原话还是近似，见 `docs/jlaw-rules.md`），用 `scripts/analysis/jlaw_backtest.py` 在 canonical 日线上回测。
+  sh_main、25 万、2013-01-04 至 2026-10-21（run `runs/jlaw/20261114T132653Z`）：base 年化 -5.5%、Sharpe -0.76、最大回撤 -53%；
+  2022 年以后 -5.8%/-0.78/-24.5%；6 个变体（回调买点、去掉大盘过滤、不加仓、去掉 beta、每笔风险 0.5%）全部为负。
+  胜率约 13%，盈利平均 +5R、亏损平均 -1.1R，四分之三的交易被止损打掉。
+  放宽止损（run `runs/jlaw/20261114T135300Z`）好一些但仍为负：3 倍 ATR（5%–15%）全期 -0.4%/-0.08/-23.6%，2022 年以后 -0.5%/-0.19；
+  2 倍 ATR -1.7%/-0.32；固定 8% -1.1%/-0.17；2 倍 ATR + 50 日 EMA 出场 -1.8%/-0.33。平均仓位只有 6%–9%。不用于实盘。
 - `report` 会覆盖原 run 目录；换参数重跑报告前先复制目录（如 `<run>-top30-drop3`）。
 
 ## 怎么维护
