@@ -1,6 +1,6 @@
 # RQuant2.0 项目进度（共享记忆）
 
-最后更新：2026-11-15 晚（美西时间）。
+最后更新：2026-11-17（美西时间）。
 
 这份文件是 Claude 和 GPT/Codex 等 agent 共同读取的项目进度。规则见文末「怎么维护」。
 研究口径、目录职责和安全边界以 `agent.md` 为准；本文件只记录「现在做到哪了」。
@@ -53,7 +53,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 - **实盘口径**（20 万、top30、每天最多换 3 只、最低佣金 5 元）：2022 年以后 32.7%/1.12/-35.1%；最低佣金每年拖累约 1%。
 - 风险提示：2022 年以后的收益主要来自 2025 年；Sharpe 的标准误约 ±0.45；没有计冲击成本。
 
-## 5. 实盘（国金证券，PR #28 草稿；正在从 QMT 迁到 PTrade）
+## 5. 实盘（国金证券 PTrade；代码在 PR #28，2026-11-17 已合并）
 
 - **2026-11-11 起迁到 PTrade**（策略跑在券商服务器上，不用开电脑）。说明在 `ptrade/README.md`。
   研究模块对账已通过（2026-11-12）：用 2026-11-10 数据打分，top30 与 QMT 11-11 实盘的 `live.top30` 同一组股票。
@@ -64,7 +64,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
   2026-11-16（周一）没有下单（原因未确认）。11-17 09:21 竞价卖 3 买 3，09:25 全部成交；PTrade 前一天日线 09:10 后才到，打分 09:18 才完成。之后改成：打分存进 `g`（重启不丢）、早上先抽查日线再打分（约 4 分钟）、09:00 起每两三分钟重试、09:23 补一次竞价、开盘后补单到 09:50。用户 11-17 起换用新交易 JQ2.0。以下是 QMT 的记录。
 
 - miniQMT/xtquant 外接在关停，大 QMT 内置 Python 从 2026-10-23 起禁止读写文件和联网，所以整个策略（因子计算 + numpy 版 LightGBM 打分）
-  打包成一个文件粘贴进 QMT 内置 Python 3.6 运行。源码在 `qmt/`，说明在 `qmt/README.md`（都在 PR #28 分支上）。
+  打包成一个文件粘贴进 QMT 内置 Python 3.6 运行。源码在 `qmt/`，说明在 `qmt/README.md`（PR #28 已合并进 `main`）。
 - 模型：2026 年窗口（训练 2023-01-03 至 2025-12-30）导出到 `qmt/models/lgb_jq240_sh_main.json`，只有 8 棵树，很多股票同分，同分按代码排序。
 - 一致性核对已通过（2026-11-05）：2026-10-21 的 top30/top50 和回测完全相同，排序相关系数 0.997。
   QMT 没有折旧摊销数据（EBITDA 实际是 EBIT），这两个因子重要性约 0.1%，可以接受。
@@ -84,12 +84,11 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 
 | PR | 内容 | 状态 |
 | --- | --- | --- |
-| #28 | 实盘：QMT（已停用）和 PTrade（2026-11-13 起实盘）的探测、对账、实盘策略 | 草稿 |
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |
 
-已合并的重要 PR：#29（2026-11-08，qlib 原生化：walk-forward 用 RollingGen + TrainerR + RollingEnsemble，模型写成
+已合并的重要 PR：#28（2026-11-17，实盘：QMT（已停用）和 PTrade 的探测、对账、实盘策略，`ptrade/`、`qmt/`）、#29（2026-11-08，qlib 原生化：walk-forward 用 RollingGen + TrainerR + RollingEnsemble，模型写成
 `src/rquant/workflow/workflows/` 下的 qrun YAML，报告用 PortAnaRecord、年化按 252 天；另有 DoubleEnsemble、qlib PyTorch 模型、
 `report --signal-only`、`report --strategy enhanced-indexing` 和结构化风险模型）、#30（本文件）、#22（oap_jq_cnc、默认因子集 jq240）、#23（`scripts/analysis/window_metrics.py`，从已保存的 run 算任意时间段指标）、
 #24（`AGENTS.md` 和 `docs/adding-factor-sets.md`）。
