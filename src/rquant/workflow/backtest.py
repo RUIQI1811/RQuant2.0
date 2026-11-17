@@ -63,6 +63,11 @@ class PortfolioConfig:
     # With entry "open": do not buy a stock whose open is more than this fraction above its previous close (TopkDropout
     # takes the next-ranked tradable stock instead), as a buy order capped at previous close * (1 + max_open_gap) would.
     max_open_gap: float | None = None
+    # TopkDropout only (rquant.qlib_ext.strategy.ScoreRulesMixin). min_score_z: buy a stock only when its score is at
+    # least this many standard deviations above the day's mean score; a skipped buy stays in cash. exit_rank_pct: also
+    # sell every holding that ranks outside the day's top exit_rank_pct (0.2 = top 20%) and replace it.
+    min_score_z: float | None = None
+    exit_rank_pct: float | None = None
 
     def __post_init__(self) -> None:
         if self.topk < 1:
@@ -97,6 +102,12 @@ class PortfolioConfig:
             raise ValueError("entry 'close' and max_open_gap are only supported with the topk-dropout strategy")
         if self.max_open_gap is not None and (self.entry != "open" or self.max_open_gap <= 0):
             raise ValueError(f"max_open_gap needs entry 'open' and must be positive, got {self.max_open_gap}")
+        if self.strategy != "topk-dropout" and (self.min_score_z is not None or self.exit_rank_pct is not None):
+            raise ValueError("min_score_z and exit_rank_pct are only supported with the topk-dropout strategy")
+        if self.exit_rank_pct is not None and not 0 < self.exit_rank_pct < 1:
+            raise ValueError(f"exit_rank_pct must be in (0, 1), got {self.exit_rank_pct}")
+        if self.min_score_z is not None and not math.isfinite(self.min_score_z):
+            raise ValueError(f"min_score_z must be a finite number, got {self.min_score_z}")
 
 
 class PortfolioBacktestRunner:
@@ -219,6 +230,9 @@ class PortfolioBacktestRunner:
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": False,
             }
+            if self.config.min_score_z is not None or self.config.exit_rank_pct is not None:
+                strategy_class = "ScoreRuleTopkDropoutStrategy"
+                strategy_kwargs.update(min_score_z=self.config.min_score_z, exit_rank_pct=self.config.exit_rank_pct)
         port_analysis_config = {
             "strategy": {
                 "class": strategy_class,
@@ -611,8 +625,14 @@ def _rebalance_description(config: PortfolioConfig) -> str:
     if config.strategy == "enhanced-indexing":
         return f"{cadence}, re-optimised weights"
     if config.n_drop == config.topk:
-        return f"{cadence}, full rebalance into the latest top {config.topk}"
-    return f"{cadence}, drop at most {config.n_drop} of the top {config.topk}"
+        rule = f"{cadence}, full rebalance into the latest top {config.topk}"
+    else:
+        rule = f"{cadence}, drop at most {config.n_drop} of the top {config.topk}"
+    if config.exit_rank_pct is not None:
+        rule += f"; also sell every holding outside the day's top {config.exit_rank_pct:.0%}"
+    if config.min_score_z is not None:
+        rule += f"; buy only scores at least {config.min_score_z:g} daily standard deviations above the mean"
+    return rule
 
 
 def _position_artifact(pd: Any, positions: dict[Any, Any], exchange: Any) -> Any:

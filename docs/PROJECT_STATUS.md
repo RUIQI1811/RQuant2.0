@@ -95,7 +95,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 
 | PR | 内容 | 状态 |
 | --- | --- | --- |
-| #32 | jq240 LightGBM 调参：IC 早停、排名标签、`--seed`、多 run 平均脚本、6 个候选配置；季度重训（`rolling.retrain_months`）和近期加权（`rolling.sample_half_life_years`）及 3 个配置 | 草稿，调参 3 步都跑完：2022 年以后没有提升，实盘不换；季度重训 + 近期加权 2026-11-11 开始在 2013 至 2021 年上比较（方案见 `docs/lgb-tuning.md`）；另含拥挤诊断脚本 `scripts/analysis/crowding_diagnostics.py` |
+| #32 | jq240 LightGBM 调参：IC 早停、排名标签、`--seed`、多 run 平均脚本、6 个候选配置；季度重训（`rolling.retrain_months`）和近期加权（`rolling.sample_half_life_years`）及 3 个配置 | 草稿，调参 3 步都跑完：2022 年以后没有提升，实盘不换；季度重训 + 近期加权 2026-11-11 开始在 2013 至 2021 年上比较（方案见 `docs/lgb-tuning.md`）；另含拥挤诊断脚本 `scripts/analysis/crowding_diagnostics.py`；2026-11-17 加了买入分数线和跌出百分位卖出两个 `report` 选项（`docs/score-rules.md`），待在 Windows 上比较 |
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |

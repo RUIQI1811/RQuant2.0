@@ -175,6 +175,18 @@ def build_parser() -> argparse.ArgumentParser:
         "above their previous close (e.g. 0.03); the next-ranked tradable stock is bought instead",
     )
     report.add_argument(
+        "--min-score-z",
+        type=float,
+        help="Override backtest.min_score_z: buy only stocks whose score is at least this many standard deviations "
+        "above the day's mean score (e.g. 3); a skipped buy stays in cash",
+    )
+    report.add_argument(
+        "--exit-rank-pct",
+        type=float,
+        help="Override backtest.exit_rank_pct: also sell every holding that ranks outside the day's top fraction "
+        "(e.g. 0.2 = top 20%%) and replace it",
+    )
+    report.add_argument(
         "--signal-only",
         action="store_true",
         help="Score the predictions (Qlib SigAnaRecord IC / Rank IC) and summarise feature importance, without the "
@@ -691,7 +703,7 @@ def _report(args: argparse.Namespace) -> int:
         if args.signal_only:
             portfolio_options = (
                 args.topk, args.n_drop, args.rebalance_days, args.strategy, args.risk_model, args.entry,
-                args.max_open_gap,
+                args.max_open_gap, args.min_score_z, args.exit_rank_pct,
             )
             if any(value is not None for value in portfolio_options):
                 raise DataContractError("--signal-only runs no backtest; drop the portfolio options")
@@ -713,6 +725,8 @@ def _report(args: argparse.Namespace) -> int:
             strategy=args.strategy or str(backtest.get("strategy", "topk-dropout")),
             entry=args.entry or str(backtest.get("entry", "open")),
             max_open_gap=args.max_open_gap if args.max_open_gap is not None else backtest.get("max_open_gap"),
+            min_score_z=args.min_score_z if args.min_score_z is not None else backtest.get("min_score_z"),
+            exit_rank_pct=args.exit_rank_pct if args.exit_rank_pct is not None else backtest.get("exit_rank_pct"),
             **{
                 **_enhanced_indexing_options(backtest.get("enhanced_indexing") or {}),
                 **({"risk_model": args.risk_model} if args.risk_model else {}),

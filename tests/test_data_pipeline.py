@@ -426,6 +426,20 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual({"SZ000002"}, bought(loose))
         self.assertIn("2.0% above the previous close", result["constraints"]["price_limit"])
 
+    # Break caught: score rules Qlib cannot build into a strategy (keyword chain through the rebalancing mixin), or a
+    # score line that still buys below it.
+    def test_score_line_runs_through_the_backtest(self) -> None:
+        self._add_trading_day_2020_01_07()
+        CanonicalBuilder(self.raw, self.canonical).build()
+        QlibProviderBuilder(self.canonical, self.qlib).build()
+        # Daily z-scores on 2020-01-03: SZ000002 +0.71, SZ000001 -0.71.
+        rows = [("2020-01-03", "SZ000002", 2.0), ("2020-01-03", "SZ000001", 1.0), ("2020-01-06", "SZ000002", 1.0)]
+        # (A line above both would place no order at all, which Qlib's indicator analysis cannot score.)
+        result, low = self._backtest_trades(rows, min_score_z=0.5, exit_rank_pct=0.9)
+
+        self.assertEqual({"SZ000002"}, set(low.loc[low["direction"] == "buy", "instrument"]))
+        self.assertIn("standard deviations above the mean", result["constraints"]["rebalance"])
+
     # Break caught: an option silently ignored where it cannot apply.
     def test_entry_options_reject_combinations_they_do_not_support(self) -> None:
         for options in (

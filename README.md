@@ -1043,6 +1043,11 @@ rquant report RUN_ID --n-drop 5 --rebalance-days 1
   收盘涨停不可买、收盘跌停不可卖（收盘价等于最高价或最低价且涨跌幅至少 9.5%，沪市主板）。信号仍用 t 日全天的日线，
   所以是「14:50 左右打分、尾盘集合竞价买入」的上限。
 
+打分规则的两个实验选项（只用于 `topk-dropout`，见 `docs/score-rules.md`）：
+
+- `--min-score-z 3`（`backtest.min_score_z`）：要买的股票当天分数的截面 z-score 低于 3 就不买，那份钱留作现金。
+- `--exit-rank-pct 0.2`（`backtest.exit_rank_pct`）：除了每天卖最低的 `n_drop` 只，持仓里跌出当天前 20% 的全部卖出并补上。
+
 ### 组合优化（增强指数）
 
 `--strategy enhanced-indexing`（或配置 `backtest.strategy`）改用 Qlib 的增强指数组合优化代替等权 top50：
