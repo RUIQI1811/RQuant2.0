@@ -29,6 +29,7 @@ VALUATION_CHUNK = 1000
 STATEMENT_CODES = 200
 STATEMENT_FIELDS_PER_CALL = 30
 CACHE_RECENT_DAYS = 3  # with a cache, the last days are always asked again
+FUNDAMENTALS_MAX_AGE = 14 * 3600  # with a cache, statements fetched less than this many seconds ago are reused
 
 # Tushare statement fields used by jq240 -> PTrade get_fundamentals table and field. None: PTrade has no such line,
 # treated as zero on a published statement (as RQuant's ZERO_FILL does for blank lines). A tuple: the first field
@@ -352,8 +353,30 @@ def listing_dates(codes):
     return opened
 
 
-def market_return(codes, dates, end, calendar, opened, floats):
-    """Circulating-cap-weighted all-A return, as rquant.data.reference's ``mkt``."""
+def market_return(codes, dates, end, calendar, opened, floats, cache=None):
+    """Circulating-cap-weighted all-A return, as rquant.data.reference's ``mkt``, and the stocks behind each day.
+
+    ``cache`` as in valuation_panels: days already worked out are taken from it and only the days from the first new
+    one on are read again (a day needs only its own bars and the day before's).
+    """
+    store = cache.setdefault(("mkt",), {}) if cache is not None else {}
+    todo = [day for day in dates if day not in store]
+    if not todo:
+        return (pd.Series([store[day][0] for day in dates], index=dates),
+                pd.Series([store[day][1] for day in dates], index=dates))
+    fresh = dates[dates >= todo[0]]
+    mkt, count = _market_return(codes, fresh, end, calendar, opened, floats)
+    keep = _cacheable(dates)
+    for day in fresh:
+        if day in keep:
+            store[day] = (mkt[day], count[day])
+    old = dates[dates < todo[0]]
+    mkt = pd.concat([pd.Series([store[day][0] for day in old], index=old, dtype=float), mkt])
+    count = pd.concat([pd.Series([store[day][1] for day in old], index=old, dtype=float), count])
+    return mkt.reindex(dates), count.reindex(dates)
+
+
+def _market_return(codes, dates, end, calendar, opened, floats):
     start = calendar[max(calendar.searchsorted(dates[0]) - 1, 0)]
     window = calendar[(calendar >= start) & (calendar <= dates[-1])]
     closes, returns = {}, {}
@@ -420,8 +443,9 @@ def build_inputs(end, days, log=print, codes=None, status_days=None, cache=None)
     """jq240 inputs for sh_main (or ``codes``) over the ``days`` trading days ending at ``end`` (YYYYMMDD).
 
     ``status_days`` limits the per-day ST lookups to the last that many days (earlier days use the first looked-up
-    day's flags); None looks up every day. ``cache``: a dict kept between calls; the per-day valuation and status
-    answers of earlier days are taken from it (the slow part of a cold run) and new ones are added.
+    day's flags); None looks up every day. ``cache``: a dict kept between calls; the per-day valuation, status and
+    market-return answers of earlier days are taken from it (the slow part of a cold run) and new ones are added, and
+    the statements are reused for FUNDAMENTALS_MAX_AGE (an evening fetch serves the next morning).
     """
     began = time.time()
     calendar = trading_calendar(end)
@@ -451,14 +475,22 @@ def build_inputs(end, days, log=print, codes=None, status_days=None, cache=None)
     # Tushare's turnover_rate: traded shares / circulating shares, in percent.
     inputs["basic_turnover_rate"] = (raw_volume / floats.where(floats > 0) * 100.0).where(raw_close.notna())
     first_year = max(2005, dates[0].year - FUNDAMENTAL_YEARS_BACK)
-    fundamentals = fundamentals_frame(codes, first_year, _day(end).year, log)
+    key = ("fundamentals", tuple(codes), first_year, _day(end).year)
+    kept = cache.get(key) if cache is not None else None
+    if kept is not None and time.time() - kept[0] < FUNDAMENTALS_MAX_AGE:
+        fundamentals = kept[1]
+        log("inputs.fundamentals_reused", "fetched %.0f minutes ago" % ((time.time() - kept[0]) / 60.0))
+    else:
+        fundamentals = fundamentals_frame(codes, first_year, _day(end).year, log)
+        if cache is not None:
+            cache[key] = (time.time(), fundamentals)
     inputs["fundamentals"] = fundamentals
     log("inputs.fundamental_rows", len(fundamentals))
     log("inputs.fundamentals_seconds", round(time.time() - began, 2))
     grid = QuarterGrid(prepare_fundamentals(fundamentals), dates, pd.Index(codes))  # noqa: F821
     profit = grid.panel(grid.ttm("n_income_attr_p"))
     inputs["basic_pe_ttm"] = (inputs["cap"] / profit.where(profit > 0)).where(raw_close.notna())
-    mkt, count = market_return(every, dates, end, calendar, opened, valuation["a_floats"])
+    mkt, count = market_return(every, dates, end, calendar, opened, valuation["a_floats"], cache)
     inputs["mkt"] = mkt
     last = count.iloc[-1] if len(count) else 0
     log("inputs.mkt_stocks_last", int(last) if last == last else 0)

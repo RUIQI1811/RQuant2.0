@@ -2,13 +2,16 @@
 # (ptrade/generated/jq240_ptrade_live.py) into a new PTrade strategy, daily frequency, and start a trade with it.
 #
 # PTrade runs the strategy on the broker's servers and leaves it running from day to day. Each trading day:
-# * LIVE_PLAN_AT (21:00 the evening before, then 08:00 to 09:05 Beijing) builds the jq240 inputs from PTrade's data
-#   through the last finished session and scores sh_main with the exported LightGBM window, until it has a plan for
-#   that session. PTrade's daily bars of a session are not always in by 08:00 (2026-11-13: missing at 08:05, in at
-#   09:10), hence the retries. The first run after a start takes about 20 minutes; the per-day lookups stay in memory,
-#   so later runs take about 8. It also plans at once when the trade is started, and at 09:10 if still without a plan.
-# * LIVE_AUCTION_AT (09:21) decides like the backtest's TopkDropoutStrategy (top LIVE_TOPK, drop at most LIVE_N_DROP)
-#   against the real holdings and the previous close, and sends the sells at the limit-down price and the buys at
+# * LIVE_PLAN_AT (21:00 the evening before, then from 08:00 to 09:42 Beijing) builds the jq240 inputs from PTrade's
+#   data through the last finished session and scores sh_main with the exported LightGBM window, until it has a plan
+#   for that session. PTrade's daily bars of a session come in only around 09:10 the next morning (2026-11-13 and
+#   2026-11-17: missing at 09:05, in by 09:12), so a morning run first checks a sample of them (a second) and plans
+#   only once they are in, every two minutes from 09:00. The 21:00 run plans the session before (its bars are in) and
+#   so fills the cache: the per-day lookups, the market return and the statements stay in memory, and the morning run
+#   takes about 4 minutes instead of 8 (the first run after a start, about 20). It also plans at once when the trade
+#   is started, and at 09:10.
+# * LIVE_AUCTION_AT (09:21, again at 09:23 if the plan came late) decides like the backtest's TopkDropoutStrategy
+#   (top LIVE_TOPK, drop at most LIVE_N_DROP) against the real holdings and the previous close, and sends the sells at the limit-down price and the buys at
 #   most LIVE_AUCTION_BUY above the previous close, so the opening auction fills both at the open. Buys only use the
 #   cash on hand before the auction, so the account keeps about LIVE_N_DROP slots in cash for the next day.
 # * If the plan was not ready for the auction: sells at the first of LIVE_SELL_AT it is ready for and buys at the
@@ -27,8 +30,11 @@ LIVE_TOPK = 30
 LIVE_N_DROP = 3
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SS"])
 LIVE_AUCTION = True
-LIVE_PLAN_AT = ("21:00", "08:00", "08:20", "08:35", "08:50", "09:00")  # each run plans only if still needed
-LIVE_AUCTION_AT = "09:21"  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
+LIVE_PLAN_AT = ("21:00", "08:00", "08:30", "09:00", "09:03", "09:06", "09:08", "09:12", "09:14", "09:16", "09:18",
+                "09:20", "09:22", "09:25", "09:28", "09:35", "09:42")  # each run plans only if still needed
+LIVE_AUCTION_AT = ("09:21", "09:23")  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
+LIVE_BARS_SAMPLE = 40  # sh_main codes checked for the last session's daily bar before planning
+LIVE_BARS_SHARE = 0.5  # planning starts once this share of the sample has the bar
 LIVE_SELL_AT = ("09:31", "09:40", "09:50")  # after-open fallback: each sells only if nothing went out yet today
 LIVE_BUY_AT = ("09:32", "09:41", "09:51")  # buys a minute after the sells, once
 LIVE_AUCTION_BUY = 0.03  # auction buy limit above the previous close (the cash it ties up); above it, no fill at the open
@@ -137,10 +143,27 @@ def previous_session(today):
     return (before[-1] if len(before) else None), bool(len(days) and days[-1] == stamp)
 
 
+def session_bars_in(day, clock):
+    """Whether PTrade has the daily bars of ``day`` yet, from a sample of sh_main codes (one quick lookup)."""
+    codes = sh_main_codes(clock[:8])
+    sample = codes[::max(1, len(codes) // LIVE_BARS_SAMPLE)][:LIVE_BARS_SAMPLE]
+    stamp = day.strftime("%Y%m%d")
+    found = sum(1 for _, dates, _ in _bars(sample, ["close", "volume"], stamp, stamp, trading_calendar(clock[:8]))
+                if day in dates)
+    return found >= LIVE_BARS_SHARE * len(sample), found, len(sample)
+
+
 def live_plan():
     """Scores of the last finished session, or None (logged) when the data is not current."""
     began = time.time()
     clock = beijing_clock()
+    wanted = latest_session(clock)
+    if wanted is not None and clock[8:12] < "1000":  # mornings only: an evening run warms the cache regardless
+        ready, found, asked = session_bars_in(wanted, clock)
+        if not ready:
+            rq_log("live.wait", "daily bars of %s not in yet (%d of %d sampled) at %s" % (
+                wanted.strftime("%Y%m%d"), found, asked, clock[8:12]))
+            return None
     inputs = build_inputs(clock[:8], LIVE_DAYS, rq_log, cache=_pt["cache"])
     listed = inputs["close"].index
     counts = inputs["close"].notna().sum(axis=1)
@@ -311,7 +334,8 @@ def initialize(context):
                                                                       LIVE_N_DROP))
     for moment in LIVE_PLAN_AT:
         run_daily(context, rq_prepare, time=moment)  # noqa: F821
-    run_daily(context, rq_auction, time=LIVE_AUCTION_AT)  # noqa: F821
+    for moment in LIVE_AUCTION_AT:
+        run_daily(context, rq_auction, time=moment)  # noqa: F821
     for moment in LIVE_SELL_AT:
         run_daily(context, rq_after_open_sell, time=moment)  # noqa: F821
     for moment in LIVE_BUY_AT:

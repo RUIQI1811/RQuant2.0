@@ -113,8 +113,10 @@ def test_jobs_and_auction_trade_sells_and_buys_at_once() -> None:
     # 600002 is an ST name, out of the universe, so it goes; the SZ holding is not the strategy's.
     live = Live({"600002.SS": (300, 300), "000001.SZ": (500, 500)})
     live.run("initialize", "20110701080000")
-    plans = [("rq_prepare", moment) for moment in ("21:00", "08:00", "08:20", "08:35", "08:50", "09:00")]
-    trades = [("rq_auction", "09:21")] + [("rq_after_open_sell", moment) for moment in ("09:31", "09:40", "09:50")]
+    plans = [("rq_prepare", moment) for moment in live.names["LIVE_PLAN_AT"]]
+    assert plans[:4] == [("rq_prepare", moment) for moment in ("21:00", "08:00", "08:30", "09:00")]
+    trades = [("rq_auction", "09:21"), ("rq_auction", "09:23")]
+    trades += [("rq_after_open_sell", moment) for moment in ("09:31", "09:40", "09:50")]
     trades += [("rq_after_open_buy", moment) for moment in ("09:32", "09:41", "09:51")]
     assert live.jobs == plans + trades
     live.run("rq_prepare", "20110701080000")
@@ -215,11 +217,13 @@ def test_a_plan_made_the_evening_before_stands_and_a_missing_session_is_retried(
     assert live.fake.calls == calls
     live.run("rq_auction", "20110701092100")
     assert any(amount < 0 for _, amount, _ in live.sent)
-    # The next morning the 07-01 bars are not in yet (the fake market ends on 06-30): no plan, and each later job
-    # tries again.
+    # The next morning the 07-01 bars are not in yet (the fake market ends on 06-30): a quick check finds them
+    # missing, nothing else is looked up, and each later job tries again.
+    valuation = live.fake.calls["get_fundamentals.valuation"]
     live.run("rq_prepare", "20110704080000")
     assert live.names["_pt"]["plan"]["date"] == pd.Timestamp("2011-06-30")  # the old plan stays; it is not today's
-    assert any("live.error=daily bars of 20110701 are missing" in line for line in live.lines())
+    assert any("live.wait=daily bars of 20110701 not in yet (0 of" in line for line in live.lines())
+    assert live.fake.calls["get_fundamentals.valuation"] == valuation
     before = live.fake.calls["get_price"]
     live.run("rq_prepare", "20110704082000")
     assert live.fake.calls["get_price"] > before
@@ -268,3 +272,18 @@ def test_after_open_fallback_retries_until_ten_and_sells_once() -> None:
     late.run("rq_prepare", "20110701080000")
     late.run("rq_after_open_sell", "20110701100100")
     assert late.sent == []
+
+
+def test_a_warm_plan_reuses_statements_and_market_return_and_scores_as_a_cold_one() -> None:
+    warm = Live({})
+    warm.run("rq_prepare", "20110630080000")  # plans 06-29
+    statements = {name: count for name, count in warm.fake.calls.items()
+                  if name.startswith("get_fundamentals.") and not name.endswith("valuation")}
+    warm.run("rq_prepare", "20110630210000")  # plans 06-30 from the cache
+    assert warm.names["_pt"]["plan"]["date"] == pd.Timestamp("2011-06-30")
+    assert any(line.startswith("[RQ] inputs.fundamentals_reused=") for line in warm.lines())
+    assert {name: warm.fake.calls[name] for name in statements} == statements
+    cold = Live({})
+    cold.run("rq_prepare", "20110630210000")
+    pd.testing.assert_series_equal(warm.names["_pt"]["plan"]["scores"], cold.names["_pt"]["plan"]["scores"])
+    assert warm.names["_pt"]["plan"]["st"] == cold.names["_pt"]["plan"]["st"]
