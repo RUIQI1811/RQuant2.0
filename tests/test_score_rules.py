@@ -129,7 +129,7 @@ class ScoreRulesTests(unittest.TestCase):
     def test_score_line_skips_weak_buys_and_keeps_their_cash(self) -> None:
         import pandas as pd
 
-        scores = pd.Series({"A": 5.0, "B": 4.0, "C": 3.0, **{f"N{i:02d}": 0.0 for i in range(40)}, "H1": -1.0})
+        scores = pd.Series({"A": 5.0, "B": 4.0, "C": 3.0, **{f"N{i:02d}": -0.0001 * i for i in range(40)}, "H1": -1.0})
         holdings = ["H1"]
         plain = self._strategy(scores, holdings, topk=4, n_drop=1, min_score_z=-1e9).generate_trade_decision()
         lined = self._strategy(scores, holdings, topk=4, n_drop=1, min_score_z=3.0).generate_trade_decision()
