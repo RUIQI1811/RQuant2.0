@@ -20,6 +20,7 @@ from typing import Any
 from rquant.errors import DataContractError
 
 try:
+    from qlib.contrib.strategy.signal_strategy import BaseSignalStrategy as _BaseSignalStrategy
     from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy as _TopkDropoutStrategy
     from qlib.contrib.strategy.signal_strategy import WeightStrategyBase as _WeightStrategyBase
 except ImportError:  # pragma: no cover - Qlib is a locked dependency
@@ -28,6 +29,9 @@ except ImportError:  # pragma: no cover - Qlib is a locked dependency
         pass
 
     class _TopkDropoutStrategy:  # type: ignore[no-redef]
+        pass
+
+    class _BaseSignalStrategy:  # type: ignore[no-redef]
         pass
 
 
@@ -393,6 +397,116 @@ class ScoreRuleTopkDropoutStrategy(  # type: ignore[misc]
     RebalancingLiquidationMixin, ScoreRulesMixin, _TopkDropoutStrategy
 ):
     """``LiquidatingTopkDropoutStrategy`` with a buy score line and a rank exit (``ScoreRulesMixin``)."""
+
+
+class ScoreLineEqualWeightStrategy(RebalancingLiquidationMixin, _BaseSignalStrategy):  # type: ignore[misc]
+    """Hold every stock whose score is at least ``min_score_z`` daily standard deviations above the day's mean score,
+    equally weighted and fully invested; hold cash on a day when no stock passes the line.
+
+    Each day the target is ``risk_degree`` times the book value split equally over the stocks above the line. A
+    holding below the line (or no longer scored) is sold. A stock above the line that is not held is bought at the
+    target. A holding above the line is only resized when it is outside ``band`` of the target (0.5: below half or
+    above one and a half times the target), so small drifts do not trade every day. When the cash after the sales
+    does not cover every buy, the buys are scaled down together. Limit and suspension rules, T+1 (``hold_thresh``)
+    and lot rounding are the exchange's, as in Qlib's ``TopkDropoutStrategy``.
+    """
+
+    def __init__(self, *, min_score_z: float, band: float = 0.5, hold_thresh: int = 1, **kwargs: Any) -> None:
+        import math
+
+        if not math.isfinite(min_score_z):
+            raise ValueError(f"min_score_z must be a finite number, got {min_score_z}")
+        if not 0 <= band < 1:
+            raise ValueError(f"band must be in [0, 1), got {band}")
+        self.min_score_z = min_score_z
+        self.band = band
+        self.hold_thresh = hold_thresh
+        super().__init__(**kwargs)
+
+    def generate_trade_decision(self, execute_result: Any = None) -> Any:
+        import copy
+
+        import pandas as pd
+        from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
+
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
+        pred_start, pred_end = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start, end_time=pred_end)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+        pred_score = pred_score.dropna()
+
+        def tradable(code: str, direction: Any) -> bool:
+            return bool(
+                self.trade_exchange.is_stock_tradable(
+                    stock_id=code, start_time=trade_start, end_time=trade_end, direction=direction
+                )
+            )
+
+        def price(code: str, direction: Any) -> float:
+            return float(
+                self.trade_exchange.get_deal_price(
+                    stock_id=code, start_time=trade_start, end_time=trade_end, direction=direction
+                )
+            )
+
+        def lots(code: str, value: float, direction: Any) -> float:
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start, end_time=trade_end)
+            return float(self.trade_exchange.round_amount_by_trade_unit(value / price(code, direction), factor))
+
+        current = copy.deepcopy(self.trade_position)
+        z = daily_zscore(pred_score)
+        passing = list(z[z >= self.min_score_z].sort_values(ascending=False).index)
+        target = current.calculate_value() * self.risk_degree / len(passing) if passing else 0.0
+        low, high = (1 - self.band) * target, (1 + self.band) * target
+
+        sell_orders = []
+        cash = current.get_cash()
+        for code in current.get_stock_list():
+            amount = float(current.get_stock_amount(code=code))
+            if code in passing:
+                held_value = amount * float(current.get_stock_price(code))
+                if held_value <= high:
+                    continue
+                amount = min(amount, lots(code, held_value - target, OrderDir.SELL))
+            if amount <= 0 or not tradable(code, OrderDir.SELL):
+                continue
+            if current.get_stock_count(code, bar=self.trade_calendar.get_freq()) < self.hold_thresh:
+                continue
+            order = Order(
+                stock_id=code, amount=amount, start_time=trade_start, end_time=trade_end, direction=Order.SELL
+            )
+            if self.trade_exchange.check_order(order):
+                sell_orders.append(order)
+                trade_value, trade_cost, _ = self.trade_exchange.deal_order(order, position=current)
+                cash += trade_value - trade_cost
+
+        wanted: dict[str, float] = {}
+        held = set(current.get_stock_list())
+        for code in passing:
+            held_value = (
+                float(current.get_stock_amount(code=code)) * float(current.get_stock_price(code))
+                if code in held
+                else 0.0
+            )
+            if code in held and held_value >= low:
+                continue
+            if tradable(code, OrderDir.BUY):
+                wanted[code] = target - held_value
+        scale = min(1.0, cash * self.risk_degree / sum(wanted.values())) if wanted else 0.0
+        buy_orders = []
+        for code, value in wanted.items():
+            amount = lots(code, value * scale, OrderDir.BUY)
+            if amount > 0:
+                buy_orders.append(
+                    Order(
+                        stock_id=code, amount=amount, start_time=trade_start, end_time=trade_end, direction=Order.BUY
+                    )
+                )
+        return TradeDecisionWO(sell_orders + buy_orders, self)
 
 
 class LiquidatingEnhancedIndexingStrategy(RebalancingLiquidationMixin, EnhancedIndexingStrategy):  # type: ignore[misc]

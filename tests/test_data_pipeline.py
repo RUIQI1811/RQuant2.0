@@ -440,6 +440,18 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual({"SZ000002"}, set(low.loc[low["direction"] == "buy", "instrument"]))
         self.assertIn("standard deviations above the mean", result["constraints"]["rebalance"])
 
+    # Break caught: the score-line strategy not wired into the backtest (unknown class, ignored line).
+    def test_score_line_strategy_runs_through_the_backtest(self) -> None:
+        self._add_trading_day_2020_01_07()
+        CanonicalBuilder(self.raw, self.canonical).build()
+        QlibProviderBuilder(self.canonical, self.qlib).build()
+        rows = [("2020-01-03", "SZ000002", 2.0), ("2020-01-03", "SZ000001", 1.0), ("2020-01-06", "SZ000002", 1.0)]
+        result, low = self._backtest_trades(rows, strategy="score-line", min_score_z=0.5)
+
+        self.assertEqual({"SZ000002"}, set(low.loc[low["direction"] == "buy", "instrument"]))
+        self.assertEqual("ScoreLineEqualWeightStrategy", result["strategy"])
+        self.assertIn("above the score line", result["constraints"]["rebalance"])
+
     # Break caught: an option silently ignored where it cannot apply.
     def test_entry_options_reject_combinations_they_do_not_support(self) -> None:
         for options in (
@@ -447,6 +459,8 @@ class DataPipelineTests(unittest.TestCase):
             {"entry": "close", "max_open_gap": 0.03},
             {"max_open_gap": 0.0},
             {"strategy": "enhanced-indexing", "entry": "close"},
+            {"strategy": "score-line"},
+            {"strategy": "score-line", "min_score_z": 2.0, "exit_rank_pct": 0.2},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 PortfolioConfig(**options)

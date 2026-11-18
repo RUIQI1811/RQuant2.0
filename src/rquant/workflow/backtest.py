@@ -11,7 +11,7 @@ from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.exchange import AshareCostModel, AshareExchange
 from rquant.qlib_ext.loader import LABEL_EXPRESSIONS
 
-STRATEGIES = ("topk-dropout", "enhanced-indexing")
+STRATEGIES = ("topk-dropout", "enhanced-indexing", "score-line")
 RISK_MODELS = ("statistical", "structured")
 ENTRIES = ("open", "close")
 # A Shanghai main-board stock (not ST) closes at its +/-10% limit when its close is the day's high (low) and the raw
@@ -37,7 +37,9 @@ class PortfolioConfig:
     rebalance_days: int = 1
     # "topk-dropout" holds the equal-weighted top K. "enhanced-indexing" weights the whole universe with Qlib's
     # EnhancedIndexingOptimizer against the universe's float-cap index (rquant.qlib_ext.strategy); topk and n_drop are
-    # then unused.
+    # then unused. "score-line" holds every stock at least min_score_z daily standard deviations above the mean score,
+    # equally weighted and fully invested, and cash when none passes (ScoreLineEqualWeightStrategy); topk and n_drop
+    # are unused.
     strategy: str = "topk-dropout"
     # "statistical": Qlib's StructuredCovEstimator (risk_factors PCA factors of past returns). "structured": Shenwan
     # industries + CNE6 styles from the barra_cne6 factor store (rquant.qlib_ext.riskmodel), which the industry,
@@ -102,7 +104,10 @@ class PortfolioConfig:
             raise ValueError("entry 'close' and max_open_gap are only supported with the topk-dropout strategy")
         if self.max_open_gap is not None and (self.entry != "open" or self.max_open_gap <= 0):
             raise ValueError(f"max_open_gap needs entry 'open' and must be positive, got {self.max_open_gap}")
-        if self.strategy != "topk-dropout" and (self.min_score_z is not None or self.exit_rank_pct is not None):
+        if self.strategy == "score-line":
+            if self.min_score_z is None or self.exit_rank_pct is not None:
+                raise ValueError("the score-line strategy needs min_score_z and takes no exit_rank_pct")
+        elif self.strategy != "topk-dropout" and (self.min_score_z is not None or self.exit_rank_pct is not None):
             raise ValueError("min_score_z and exit_rank_pct are only supported with the topk-dropout strategy")
         if self.exit_rank_pct is not None and not 0 < self.exit_rank_pct < 1:
             raise ValueError(f"exit_rank_pct must be in (0, 1), got {self.exit_rank_pct}")
@@ -220,6 +225,9 @@ class PortfolioBacktestRunner:
                 "optimization_log": optimization_log,
                 "risk_degree": self.config.risk_degree,
             }
+        elif self.config.strategy == "score-line":
+            strategy_class = "ScoreLineEqualWeightStrategy"
+            strategy_kwargs = {"min_score_z": self.config.min_score_z, "risk_degree": 1.0, "hold_thresh": 1}
         else:
             strategy_class = "LiquidatingTopkDropoutStrategy"
             strategy_kwargs = {
@@ -322,11 +330,11 @@ class PortfolioBacktestRunner:
                     else "next trading day open"
                 ),
                 "long_only": True,
-                "equal_weight": self.config.strategy == "topk-dropout",
+                "equal_weight": self.config.strategy in ("topk-dropout", "score-line"),
                 "weights": _weighting_description(self.config),
                 "t_plus_one": (
                     "TopkDropoutStrategy hold_thresh=1"
-                    if self.config.strategy == "topk-dropout"
+                    if self.config.strategy in ("topk-dropout", "score-line")
                     else "daily steps: a stock bought at one open is sold at the earliest on the next"
                 ),
                 "suspension": "Qlib $close NaN",
@@ -557,6 +565,11 @@ def _labels(D: Any, pd: Any, signal: Any, horizon: str) -> Any:
 def _weighting_description(config: PortfolioConfig) -> str:
     if config.strategy == "topk-dropout":
         return f"equal weight across the top {config.topk}"
+    if config.strategy == "score-line":
+        return (
+            f"equal weight across every stock at least {config.min_score_z:g} daily standard deviations above the "
+            "mean score (resized when outside 50%-150% of the target), cash when none passes"
+        )
     if config.risk_model == "structured":
         risk = (
             f"Shenwan L1 industry + CNE6 style risk model over {config.risk_lookback_days} days (half-life "
@@ -624,6 +637,8 @@ def _rebalance_description(config: PortfolioConfig) -> str:
     cadence = "daily" if config.rebalance_days == 1 else f"every {config.rebalance_days} trading days"
     if config.strategy == "enhanced-indexing":
         return f"{cadence}, re-optimised weights"
+    if config.strategy == "score-line":
+        return f"{cadence}, hold every stock above the score line"
     if config.n_drop == config.topk:
         rule = f"{cadence}, full rebalance into the latest top {config.topk}"
     else:

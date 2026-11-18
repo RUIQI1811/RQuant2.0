@@ -154,7 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--strategy",
         choices=STRATEGIES,
-        help="Override backtest.strategy: equal-weight top-K, or Qlib enhanced indexing with a risk model",
+        help="Override backtest.strategy: equal-weight top-K, Qlib enhanced indexing with a risk model, or score-line "
+        "(equal weight across every stock above --min-score-z, cash when none passes)",
     )
     report.add_argument(
         "--risk-model",

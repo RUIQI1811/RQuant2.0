@@ -1047,6 +1047,8 @@ rquant report RUN_ID --n-drop 5 --rebalance-days 1
 
 - `--min-score-z 3`（`backtest.min_score_z`）：要买的股票当天分数的截面 z-score 低于 3 就不买，那份钱留作现金。
 - `--exit-rank-pct 0.2`（`backtest.exit_rank_pct`）：除了每天卖最低的 `n_drop` 只，持仓里跌出当天前 20% 的全部卖出并补上。
+- `--strategy score-line --min-score-z 2`：不用 top-K，每天等权满仓持有所有 z-score ≥ 2 的股票，一只都没过就空仓；
+  持仓偏离目标权重一半以上才调整。
 
 ### 组合优化（增强指数）
 

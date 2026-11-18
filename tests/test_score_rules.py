@@ -45,6 +45,12 @@ class _Position:
     def get_stock_count(self, code: str, bar: str) -> int:
         return self.counts[code]
 
+    def get_stock_price(self, code: str) -> float:
+        return 10.0
+
+    def calculate_value(self) -> float:
+        return self.cash + 10.0 * sum(self.amounts.values())
+
 
 class _Exchange:
     """Every stock trades at 10 a share unless it is listed as blocked; selling pays 0.1% cost."""
@@ -60,7 +66,10 @@ class _Exchange:
 
     def deal_order(self, order, position):  # type: ignore[no-untyped-def]
         value = order.amount * 10.0
-        position.amounts.pop(order.stock_id)
+        position.amounts[order.stock_id] -= order.amount
+        if position.amounts[order.stock_id] <= 0:
+            position.amounts.pop(order.stock_id)
+        position.cash += value * 0.999
         return value, value * 0.001, 10.0
 
     def get_deal_price(self, stock_id, start_time, end_time, direction):  # type: ignore[no-untyped-def]
@@ -158,6 +167,41 @@ class ScoreRulesTests(unittest.TestCase):
         self.assertEqual(["S00", "S02", "S03"], bought)
         blocked = self._strategy(scores, holdings, topk=6, n_drop=1, blocked={"S60"}, exit_rank_pct=0.2)
         self.assertNotIn("S60", [order[0] for order in self._orders(blocked.generate_trade_decision())])
+
+    def _line_strategy(self, scores, amounts, *, cash=0.0, blocked=(), min_score_z=1.0):  # type: ignore[no-untyped-def]
+        from rquant.qlib_ext.strategy import ScoreLineEqualWeightStrategy
+
+        strategy = object.__new__(ScoreLineEqualWeightStrategy)
+        strategy.min_score_z, strategy.band, strategy.hold_thresh, strategy.risk_degree = min_score_z, 0.5, 1, 1.0
+        strategy.signal = _Signal(scores)
+        account = type("Account", (), {})()
+        account.current_position = _Position(cash, amounts, {code: 2 for code in amounts})
+        strategy.level_infra = {"trade_calendar": _Calendar()}
+        strategy.common_infra = {"trade_account": account, "trade_exchange": _Exchange(set(blocked))}
+        return strategy
+
+    # Break caught: a score-line book that is not equally weighted over the stocks above the line, keeps stocks
+    # below it, trades holdings that are within the band, or invests on a day when nothing passes.
+    def test_score_line_strategy_holds_every_stock_above_the_line_equally(self) -> None:
+        import pandas as pd
+
+        # z-scores (sample std): A 1.26, B 0.63, C 0, D -0.63, E -1.26; line 0.6 keeps A and B.
+        scores = pd.Series({"A": 2.0, "B": 1.0, "C": 0.0, "D": -1.0, "E": -2.0})
+        empty = self._line_strategy(scores, {}, cash=100_000.0, min_score_z=0.6).generate_trade_decision()
+        self.assertEqual([("A", 1, 5000.0), ("B", 1, 5000.0)], sorted(self._orders(empty)))
+
+        # Book 10,000 (A 4,000, C 6,000): A is within the band of its 5,000 target and stays; C is sold; B is bought.
+        held = self._line_strategy(scores, {"A": 400.0, "C": 600.0}, min_score_z=0.6).generate_trade_decision()
+        orders = self._orders(held)
+        self.assertEqual([("C", 0, 600.0)], [order for order in orders if order[1] == 0])
+        self.assertEqual(["B"], [order[0] for order in orders if order[1] == 1])
+        self.assertEqual(500.0, [order[2] for order in orders if order[1] == 1][0])  # its 5,000 target at 10 a share
+
+        # A (90,000 of a 100,000 book) is cut back to its 50,000 target; a line nothing reaches sells everything.
+        heavy = self._line_strategy(scores, {"A": 9000.0, "B": 1000.0}, min_score_z=0.6).generate_trade_decision()
+        self.assertIn(("A", 0, 4000.0), self._orders(heavy))
+        none = self._line_strategy(scores, {"A": 500.0}, cash=10.0, min_score_z=5.0).generate_trade_decision()
+        self.assertEqual([("A", 0, 500.0)], self._orders(none))
 
     def test_config_rejects_rules_where_they_cannot_apply(self) -> None:
         from rquant.workflow.backtest import PortfolioConfig
