@@ -1383,12 +1383,16 @@ def ranked(scores):
     return scores.index[np.argsort(-scores.values, kind="mergesort")]
 
 
-def decide(scores, book, day, topk, n_drop):
+def decide(scores, book, day, topk, n_drop, exit_rank_pct=None):
     """Qlib TopkDropoutStrategy.generate_trade_decision for ``day``.
 
     ``scores`` is the previous trading day's prediction (a Series indexed by code); ``day`` holds the quotes the
     tradability checks and the sell simulation use. Ties in score are ordered by ``ranked``. Returns (sells, buys):
     sells and buys as (code, adjusted amount) in the order Qlib places them.
+
+    ``exit_rank_pct`` (e.g. 0.7) also sells every scored, tradable holding that ranks outside the top
+    ``exit_rank_pct`` of the day's scored stocks and replaces it, as RQuant's ScoreRulesMixin does in the backtest
+    (``report --exit-rank-pct``).
     """
     scores = scores.dropna()
 
@@ -1404,10 +1408,14 @@ def decide(scores, book, day, topk, n_drop):
     temp = book.copy()
     current = list(temp.amount)
     last = ranked(scores.reindex(current))
+    forced = []
+    if exit_rank_pct is not None:
+        rank = scores.rank(ascending=False, pct=True, method="max")
+        forced = [code for code in last if rank.get(code, 0.0) > exit_rank_pct and day.tradable(code)]
     others = ranked(scores[~scores.index.isin(last)])
-    today = first_n(others, n_drop + topk - len(last))
+    today = first_n(others, n_drop + len(forced) + topk - len(last))
     comb = ranked(scores.reindex(last.union(pd.Index(today))))
-    sell = last[last.isin(first_n(comb, n_drop, reverse=True))]
+    sell = last[last.isin(first_n(comb, n_drop, reverse=True)) | last.isin(forced)]
     buy = today[: len(sell) + topk - len(last)]
     sells = []
     for code in current:
@@ -1503,7 +1511,7 @@ def live_sell(C, plan, account, tag, auction=False):
     budget = max(0.0, min(cash, capital - value))
     rq_log('live.account', '%s cash %.2f holdings %d value %.2f budget %.2f at %s' % (masked(account), cash, len(held), value, budget, beijing_clock()[8:]))
     book = Book(budget, dict(((code, float(positions[code][0])) for code in held)), dict(((code, day.close[code]) for code in held)), dict(((code, 1 if positions[code][1] > 0 else 0) for code in held)))
-    sells, buys = decide(plan['scores'], book, day, LIVE_TOPK, LIVE_N_DROP)
+    sells, buys = decide(plan['scores'], book, day, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT)
     sold, sent, proceeds = (0.0, 0, 0.0)
     kept = dict(((code, positions[code][0]) for code in held))
     for code, shares in sells:
@@ -1604,8 +1612,9 @@ def live_buy(C, sold, account, tag):
 #   takes about 4 minutes instead of 8 (the first run after a start, about 20). It also plans at once when the trade
 #   is started, and at 09:10.
 # * LIVE_AUCTION_AT (09:21, again at 09:23 if the plan came late) decides like the backtest's TopkDropoutStrategy
-#   (top LIVE_TOPK, drop at most LIVE_N_DROP) against the real holdings and the previous close, and sends the sells at the limit-down price and the buys at
-#   most LIVE_AUCTION_BUY above the previous close, so the opening auction fills both at the open. Buys only use the
+#   (top LIVE_TOPK, drop at most LIVE_N_DROP, and also sell every holding ranked outside the top LIVE_EXIT_RANK_PCT
+#   of sh_main) against the real holdings and the previous close, and sends the sells at the limit-down price and the
+#   buys at most LIVE_AUCTION_BUY above the previous close, so the opening auction fills both at the open. Buys only use the
 #   cash on hand before the auction, so the account keeps about LIVE_N_DROP slots in cash for the next day.
 # * If the plan was not ready for the auction: sells at the first of LIVE_SELL_AT it is ready for and buys at the
 #   LIVE_BUY_AT a minute later, as marketable limit orders. Nothing is sent after 10:00.
@@ -1621,6 +1630,9 @@ LIVE_DRY_RUN = True
 LIVE_CAPITAL = 0  # the most the strategy may hold (holdings at market plus cash); 0 = all its holdings and cash
 LIVE_TOPK = 30
 LIVE_N_DROP = 3
+# Also sell every holding ranked outside the top 70% of the day's scored sh_main stocks (backtest x70, 2026-11-18:
+# 2022+ at 200k 34.5% / Sharpe 1.17 against 32.7% / 1.12 without it; see docs/score-rules.md). None turns it off.
+LIVE_EXIT_RANK_PCT = 0.7
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SS"])
 LIVE_AUCTION = True
 LIVE_PLAN_AT = ("21:00", "08:00", "08:30", "09:00", "09:03", "09:06", "09:08", "09:12", "09:14", "09:16", "09:18",
@@ -1923,8 +1935,8 @@ def rq_after_open_buy(context):
 
 def initialize(context):
     _pt["context"] = context
-    rq_log("live", "start dry_run=%s auction=%s topk=%d n_drop=%d" % (LIVE_DRY_RUN, LIVE_AUCTION, LIVE_TOPK,
-                                                                      LIVE_N_DROP))
+    rq_log("live", "start dry_run=%s auction=%s topk=%d n_drop=%d exit_rank_pct=%s" % (
+        LIVE_DRY_RUN, LIVE_AUCTION, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT))
     for moment in LIVE_PLAN_AT:
         run_daily(context, rq_prepare, time=moment)  # noqa: F821
     for moment in LIVE_AUCTION_AT:

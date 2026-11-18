@@ -206,6 +206,46 @@ class ScoreRulesTests(unittest.TestCase):
         none = self._line_strategy(scores, {"A": 500.0}, cash=10.0, min_score_z=5.0).generate_trade_decision()
         self.assertEqual([("A", 0, 500.0)], self._orders(none))
 
+    # Break caught: the live strategy's rank exit (qmt/runtime/paper.py decide, used by the PTrade strategy) choosing
+    # different stocks to sell or buy than the backtest's ScoreRulesMixin it was validated on.
+    def test_live_decide_sells_and_buys_the_same_stocks_as_the_backtest_rank_exit(self) -> None:
+        import runpy
+        from pathlib import Path
+
+        paper = runpy.run_path(str(Path(__file__).resolve().parents[1] / "qmt" / "runtime" / "paper.py"))
+        binding = 0
+        for seed in range(40):
+            with self.subTest(seed=seed):
+                scores = self._scores(seed, stocks=80)
+                codes = list(scores.index)
+                holdings = codes[seed % 5 :: 3][: 6 + seed % 10]
+                blocked = set(codes[seed % 7 :: 11])
+                pct = (0.3, 0.5, 0.7)[seed % 3]
+                options = {"topk": 10, "n_drop": 1 + seed % 3}
+                backtest = self._orders(
+                    self._strategy(
+                        scores, holdings, blocked=blocked, exit_rank_pct=pct, **options
+                    ).generate_trade_decision()
+                )
+                quotes = {code: 10.0 for code in codes}
+                day = paper["Day"](
+                    None,
+                    quotes,
+                    {code: (float("nan") if code in blocked else 10.0) for code in codes},
+                    {code: 1.0 for code in codes},
+                    {code: False for code in codes},
+                    {code: False for code in codes},
+                )
+                book = paper["Book"](
+                    100_000.0, {code: 300.0 for code in holdings}, dict.fromkeys(holdings, 10.0),
+                    dict.fromkeys(holdings, 2),
+                )
+                sells, buys = paper["decide"](scores, book, day, options["topk"], options["n_drop"], pct)
+                self.assertEqual(sorted(o[0] for o in backtest if o[1] == 0), sorted(code for code, _ in sells))
+                self.assertEqual(sorted(o[0] for o in backtest if o[1] == 1), sorted(code for code, _ in buys))
+                binding += len(sells) > options["n_drop"]
+        self.assertGreater(binding, 10)  # the exit sells more than the dropout on many of the days
+
     def test_config_rejects_rules_where_they_cannot_apply(self) -> None:
         from rquant.workflow.backtest import PortfolioConfig
 

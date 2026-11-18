@@ -18,6 +18,7 @@ LIVE_ACCOUNT = ""  # empty: the account selected for the strategy in QMT
 LIVE_CAPITAL = 0  # the most the strategy may hold (holdings at market plus cash); 0 = all its holdings and cash
 LIVE_TOPK = 30
 LIVE_N_DROP = 3
+LIVE_EXIT_RANK_PCT = None  # e.g. 0.7: also sell holdings ranked outside the day's top 70% (the PTrade strategy does)
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SH"])
 LIVE_AUCTION = True  # trade in the opening call auction (at the open); False: after the open, as below
 LIVE_AUCTION_AT = "092100"  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
@@ -155,7 +156,7 @@ def live_sell(C, plan, account, tag, auction=False):
     book = Book(budget, dict((code, float(positions[code][0])) for code in held),
                 dict((code, day.close[code]) for code in held),
                 dict((code, 1 if positions[code][1] > 0 else 0) for code in held))
-    sells, buys = decide(plan["scores"], book, day, LIVE_TOPK, LIVE_N_DROP)
+    sells, buys = decide(plan["scores"], book, day, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT)
     sold, sent, proceeds = 0.0, 0, 0.0
     kept = dict((code, positions[code][0]) for code in held)
     for code, shares in sells:
