@@ -73,7 +73,7 @@ class _Exchange:
         return value, value * 0.001, 10.0
 
     def get_deal_price(self, stock_id, start_time, end_time, direction):  # type: ignore[no-untyped-def]
-        return 10.0
+        return None if stock_id in self.blocked else 10.0
 
     def get_factor(self, stock_id, start_time, end_time) -> float:  # type: ignore[no-untyped-def]
         return 1.0
@@ -200,6 +200,9 @@ class ScoreRulesTests(unittest.TestCase):
         # A (90,000 of a 100,000 book) is cut back to its 50,000 target; a line nothing reaches sells everything.
         heavy = self._line_strategy(scores, {"A": 9000.0, "B": 1000.0}, min_score_z=0.6).generate_trade_decision()
         self.assertIn(("A", 0, 4000.0), self._orders(heavy))
+        # A suspended overweight holding (no deal price) is left alone instead of failing the day.
+        suspended = self._line_strategy(scores, {"A": 9000.0, "B": 1000.0}, blocked={"A"}, min_score_z=0.6)
+        self.assertNotIn("A", [order[0] for order in self._orders(suspended.generate_trade_decision())])
         none = self._line_strategy(scores, {"A": 500.0}, cash=10.0, min_score_z=5.0).generate_trade_decision()
         self.assertEqual([("A", 0, 500.0)], self._orders(none))
 

@@ -466,13 +466,16 @@ class ScoreLineEqualWeightStrategy(RebalancingLiquidationMixin, _BaseSignalStrat
         sell_orders = []
         cash = current.get_cash()
         for code in current.get_stock_list():
+            # A suspended stock has no deal price, so tradability is checked before sizing the sale.
+            if not tradable(code, OrderDir.SELL):
+                continue
             amount = float(current.get_stock_amount(code=code))
             if code in passing:
                 held_value = amount * float(current.get_stock_price(code))
                 if held_value <= high:
                     continue
                 amount = min(amount, lots(code, held_value - target, OrderDir.SELL))
-            if amount <= 0 or not tradable(code, OrderDir.SELL):
+            if amount <= 0:
                 continue
             if current.get_stock_count(code, bar=self.trade_calendar.get_freq()) < self.hold_thresh:
                 continue
