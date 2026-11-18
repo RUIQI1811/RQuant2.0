@@ -53,6 +53,7 @@ def train_rolling_task(
     factor_names: list[str] | None = None,
     early_stopping_metric: str = "loss",
     sample_half_life_years: float | None = None,
+    sample_full_weight_years: float = 0.0,
 ) -> Any:
     """Train ``task_config`` in a new recorder of ``experiment_name`` and return the recorder.
 
@@ -60,7 +61,8 @@ def train_rolling_task(
     to its position in the calendar) keeps only the predictions of every fifth trading day, the 5-day anchors.
     With ``run_directory``, the window's predictions, feature importance and segments are also written to
     ``<run_directory>/year=<window>/``, the window being the prediction year or, with sub-year retraining, the year
-    and first month (``2013-04``). ``sample_half_life_years`` weights the training rows by age (``fit_lgb_window``).
+    and first month (``2013-04``). ``sample_half_life_years`` weights the training rows by age (``fit_lgb_window``),
+    rows younger than ``sample_full_weight_years`` keeping the full weight.
     """
     import numpy as np
     import pandas as pd
@@ -90,6 +92,7 @@ def train_rolling_task(
                 log_metrics=_prefixed(R.log_metrics, "tune."),
                 early_stopping_metric=early_stopping_metric,
                 sample_half_life_years=sample_half_life_years,
+                sample_full_weight_years=sample_full_weight_years,
             )
             chosen_iterations = best_iterations(tuning)
             # Release the tuning model before the refit panel is loaded.
@@ -105,6 +108,7 @@ def train_rolling_task(
             log_metrics=R.log_metrics,
             early_stopping_metric=early_stopping_metric,
             sample_half_life_years=sample_half_life_years,
+            sample_full_weight_years=sample_full_weight_years,
         )
         if prediction is None:
             raise DataContractError(f"The {year} task has no test segment to predict")
@@ -139,6 +143,7 @@ def fit_task(
     log_metrics: Any = None,
     early_stopping_metric: str = "loss",
     sample_half_life_years: float | None = None,
+    sample_full_weight_years: float = 0.0,
 ) -> Any:
     """Fit ``model`` on ``task``'s dataset and return its test predictions (None without a test segment)."""
     from qlib.data.dataset import Dataset
@@ -174,6 +179,7 @@ def fit_task(
                 log_metrics=log_metrics or _ignore,
                 early_stopping_metric=early_stopping_metric,
                 sample_half_life_years=sample_half_life_years,
+                sample_full_weight_years=sample_full_weight_years,
                 **window,
             )
         return fit_double_ensemble_window(model, load_panel, **window)

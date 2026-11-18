@@ -37,13 +37,19 @@ def generate_rolling_windows(
     validation_months: int = 6,
     formal_start_year: int = 2010,
     retrain_months: int = 12,
+    older_train_years: int = 0,
 ) -> list[RollingWindow]:
     """One window per ``retrain_months`` of every prediction year: the model is trained on the ``train_years`` before
-    the window's first day (its last ``validation_months`` are the validation months) and predicts the window."""
+    the window's first day (its last ``validation_months`` are the validation months) and predicts the window.
+
+    ``older_train_years`` starts training that many years earlier still, but never before Jan 1 of
+    ``formal_start_year``; the first prediction year is still bounded by ``train_years`` alone."""
     if retrain_months not in RETRAIN_MONTHS:
         raise ValueError(f"retrain_months must be one of {RETRAIN_MONTHS} (a divisor of 12), got {retrain_months}")
     if train_years < 1:
         raise ValueError("train_years must be at least 1")
+    if older_train_years < 0:
+        raise ValueError("older_train_years cannot be negative")
     if not 1 <= validation_months < train_years * 12:
         raise ValueError("validation_months must be at least 1 and shorter than the training window")
     earliest = formal_start_year + train_years
@@ -68,7 +74,9 @@ def generate_rolling_windows(
             windows.append(
                 RollingWindow(
                     prediction_year=year,
-                    train_start=date(year - train_years, month, 1),
+                    train_start=max(
+                        date(year - train_years - older_train_years, month, 1), date(formal_start_year, 1, 1)
+                    ),
                     inner_train_end=validation_start - timedelta(days=1),
                     validation_start=validation_start,
                     validation_end=test_start - timedelta(days=1),

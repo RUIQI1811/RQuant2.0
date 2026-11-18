@@ -59,13 +59,22 @@ class ModelConstructionTests(unittest.TestCase):
         from rquant.workflow.trainer import lean_window
 
         paths = sorted((Path(__file__).resolve().parents[1] / "config" / "workflows").glob("jq240_lgb_*.yaml"))
-        self.assertEqual(9, len(paths))
+        self.assertEqual(10, len(paths))
         half_lives = {"jq240_lgb_q": None, "jq240_lgb_q_hl1": 1, "jq240_lgb_q_hl2": 2}
         for path in paths:
             with self.subTest(workflow=path.name):
                 workflow = load_workflow(path)
                 rolling = workflow["rolling"]
-                if path.stem in half_lives:
+                if path.stem == "jq240_lgb_y6_hl1":
+                    # Yearly retraining on six years: the last three at full weight, older ones halving every year.
+                    self.assertEqual(
+                        ("loss", 12, 3, 1, 3),
+                        (rolling["early_stopping_metric"], rolling["retrain_months"], rolling["older_train_years"],
+                         rolling["sample_half_life_years"], rolling["sample_full_weight_years"]),
+                    )
+                    built_in = load_workflow(BUILT_IN_WORKFLOWS["lgb"])["task"]["model"]
+                    self.assertEqual(built_in, workflow["task"]["model"])
+                elif path.stem in half_lives:
                     # The retraining variants change only the windows and weights of the built-in lgb workflow.
                     self.assertEqual(("loss", 3), (rolling["early_stopping_metric"], rolling["retrain_months"]))
                     self.assertEqual(half_lives[path.stem], rolling["sample_half_life_years"])
@@ -102,6 +111,7 @@ class ModelConstructionTests(unittest.TestCase):
         self.assertEqual((12, None), (defaults["retrain_months"], defaults["sample_half_life_years"]))
         bad_values = {
             "early_stopping_metric": ["sharpe"], "retrain_months": [5, 0, "3"], "sample_half_life_years": [0, -1, True],
+            "older_train_years": [-1, 1.5, True, "3"], "sample_full_weight_years": [-1, True, "3", 3],
         }
         with _tempfile.TemporaryDirectory() as directory:
             for key, values in bad_values.items():
@@ -402,6 +412,18 @@ class LeanLGBWindowTests(unittest.TestCase):
         np.testing.assert_allclose(ratio, ratio[0], rtol=1e-5)
         with self.assertRaises(ValueError):
             recency_weights(dates, 0.0)
+        # With a full-weight span the youngest rows weigh alike and the half-life starts at the span's edge.
+        days = np.array(["2016-01-01", "2017-01-01", "2018-01-01", "2020-01-01", "2022-01-01"], dtype="datetime64[D]")
+        flat = recency_weights(days, 1.0, full_weight_years=3.0)
+        self.assertAlmostEqual(1.0, float(flat.mean()), places=6)
+        age = (days.max() - days).astype(float) / 365.25
+        expected = 0.5 ** np.maximum(age - 3.0, 0.0)
+        np.testing.assert_allclose(flat, expected / expected.mean(), rtol=1e-6)
+        self.assertEqual(flat[3], flat[4])
+        self.assertLess(flat[2], flat[3])
+        np.testing.assert_allclose(recency_weights(days, 1.0, full_weight_years=0.0), recency_weights(days, 1.0))
+        with self.assertRaises(ValueError):
+            recency_weights(days, 1.0, full_weight_years=-1.0)
 
         panel, all_dates = self._panel(np.random.default_rng(9))
         day = [value.date().isoformat() for value in all_dates]
@@ -410,8 +432,13 @@ class LeanLGBWindowTests(unittest.TestCase):
         with R.start(experiment_name="RQuantLean", recorder_name="lean-weights"):
             plain = fit_task(built_in_model("lgb", **refit_overrides("lgb", 7)), task)
             weighted = fit_task(built_in_model("lgb", **refit_overrides("lgb", 7)), task, sample_half_life_years=0.05)
+            flat = fit_task(
+                built_in_model("lgb", **refit_overrides("lgb", 7)), task, sample_half_life_years=0.05,
+                sample_full_weight_years=0.1,
+            )
         self.assertEqual(plain.index.tolist(), weighted.index.tolist())
         self.assertFalse(plain.equals(weighted))
+        self.assertFalse(flat.equals(weighted))
 
         changed = dict(task, dataset={"class": "DatasetH", "kwargs": {"handler": {}, "segments": segments}})
         with self.assertRaises(DataContractError):

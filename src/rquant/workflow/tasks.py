@@ -71,6 +71,12 @@ ROLLING_DEFAULTS = {
     # Weight each training row by 0.5 ** (its age / half-life), its age counted back from the window's last training
     # day in years, so recent rows count more; null weighs every row alike. Needs the lean LightGBM path.
     "sample_half_life_years": None,
+    # Years of history before the `train_years` window that are added to every window's training rows (never before
+    # data.formal_start), so the model also sees older years; 0 keeps the plain `train_years` window.
+    "older_train_years": 0,
+    # Rows younger than this many years keep the full weight and the half-life applies only to the years beyond it:
+    # weight 0.5 ** (max(age - full, 0) / half-life). Needs sample_half_life_years.
+    "sample_full_weight_years": 0,
 }
 
 EARLY_STOPPING_METRICS = ("loss", "ic")
@@ -165,6 +171,14 @@ def load_workflow(path: str | Path) -> dict[str, Any]:
         isinstance(half_life, bool) or not isinstance(half_life, (int, float)) or half_life <= 0
     ):
         raise DataContractError(f"{path}: rolling.sample_half_life_years must be null or a positive number of years")
+    older = rolling["older_train_years"]
+    if isinstance(older, bool) or not isinstance(older, int) or older < 0:
+        raise DataContractError(f"{path}: rolling.older_train_years must be a whole number of years, 0 or more")
+    full = rolling["sample_full_weight_years"]
+    if isinstance(full, bool) or not isinstance(full, (int, float)) or full < 0:
+        raise DataContractError(f"{path}: rolling.sample_full_weight_years must be a number of years, 0 or more")
+    if full and half_life is None:
+        raise DataContractError(f"{path}: rolling.sample_full_weight_years needs rolling.sample_half_life_years")
     if rolling["early_stopping_metric"] not in EARLY_STOPPING_METRICS:
         raise DataContractError(
             f"{path}: rolling.early_stopping_metric must be one of {EARLY_STOPPING_METRICS}, "
@@ -285,7 +299,8 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
     For prediction year Y the segments are train = Jan 1 of Y - train_years through Dec 31 of Y - 1, valid = the last
     ``validation_months`` of it, and test = Y (clipped to ``through``), aligned to trading days. With
     ``retrain_months`` 3 the same holds per quarter: the window starting April 1 of Y trains from April 1 of
-    Y - train_years through March 31 of Y. With
+    Y - train_years through March 31 of Y. ``older_train_years`` moves every train start that many years earlier
+    (not before ``formal_start_year``). With
     ``holdout_valid`` train stops before the validation months instead. ``trunc_segments``
     then ends train and valid ``trunc_days`` trading days before the test starts, so no training label looks into the
     test year, and ``window_handler_mod`` moves the handler's data and fit period with them.
@@ -303,6 +318,7 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
         formal_start_year: int = 2010,
         holdout_valid: bool = False,
         retrain_months: int = 12,
+        older_train_years: int = 0,
     ) -> None:
         self.holdout_valid = holdout_valid
         if horizon not in TRUNC_DAYS:
@@ -317,6 +333,7 @@ class CalendarYearRollingGen(_RollingGen):  # type: ignore[misc,valid-type]
             validation_months=validation_months,
             formal_start_year=formal_start_year,
             retrain_months=retrain_months,
+            older_train_years=older_train_years,
         )
 
     def generate(self, task: dict[str, Any]) -> list[dict[str, Any]]:

@@ -130,6 +130,7 @@ class RollingWorkflowRunner:
                 formal_start_year=self.formal_start_year,
                 holdout_valid=bool(self.workflow["rolling"]["holdout_valid"]),
                 retrain_months=int(self.workflow["rolling"]["retrain_months"]),
+                older_train_years=int(self.workflow["rolling"]["older_train_years"]),
             ),
         )
         if not tasks:
@@ -145,6 +146,7 @@ class RollingWorkflowRunner:
             factor_names=list(get_catalog().canonical_names(self.factor_set)),
             early_stopping_metric=str(self.workflow["rolling"]["early_stopping_metric"]),
             sample_half_life_years=self.workflow["rolling"]["sample_half_life_years"],
+            sample_full_weight_years=float(self.workflow["rolling"]["sample_full_weight_years"]),
         )
         trainer.end_train(recorders)
         trained = {recorder.id for recorder in recorders}

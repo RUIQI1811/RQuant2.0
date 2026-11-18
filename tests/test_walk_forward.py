@@ -176,8 +176,13 @@ class WalkForwardTests(unittest.TestCase):
             formal_start_year=2019, universe="all",
         )
         runner.template["model"]["kwargs"].update(num_boost_round=20, num_threads=1)
-        runner.workflow["rolling"].update(retrain_months=6, sample_half_life_years=0.5)
+        runner.workflow["rolling"].update(
+            retrain_months=6, sample_half_life_years=0.5, older_train_years=1, sample_full_weight_years=0.25
+        )
         manifest = runner.run(first_year=2021, last_year=2021, through=date(2021, 12, 20))
+        # One older year moves each train start a year back: the January window starts in 2019, not 2020.
+        self.assertEqual("2019-01", manifest["windows"][0]["segments"]["train"][0][:7])
+        self.assertEqual("2019-07", manifest["windows"][1]["segments"]["train"][0][:7])
 
         labels = ["2021-01", "2021-07"]
         self.assertEqual(labels, [window["window"] for window in manifest["windows"]])

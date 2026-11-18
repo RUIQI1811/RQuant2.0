@@ -242,3 +242,28 @@ python D:\自己瞎搞\RQuant2.0-tuning\scripts\analysis\window_metrics.py $R\ru
   numpy 打分代码不用改。行采样不影响打分。
 - 多种子：要导出 5 个模型，QMT 里把 5 个模型的分数按天 z-score 后平均，需要在 PR #28 的打分代码里加一小段，
   并重新做一次一致性核对。
+
+## 6 年窗口、3 年以前降权（2026-11-18，用户提出）
+
+用户看完季度重训的结果后要求再测一个：仍然每年重训一次，以过去 3 年为主，但把更早的数据也放进训练集，
+3 年以前的部分按半衰期降权。配置 `config/workflows/jq240_lgb_y6_hl1.yaml`：
+
+- `rolling.older_train_years: 3`：训练从通常的 3 年窗口再往前 3 年开始（共 6 年），不早于 2010-01-01，
+  所以 2013 至 2015 年的窗口不足 6 年。验证期、测试期和基线完全相同。
+- `rolling.sample_half_life_years: 1` 加 `rolling.sample_full_weight_years: 3`：最近 3 年权重都是 1，更早的每年减半
+  （4 年前 0.5、5 年前 0.25、6 年前 0.125）。
+- 模型参数、MSE 早停、种子 42 和内置 `lgb` 相同，只有这一个配置。
+
+按用户要求只跑 2020 至 2026 年（`--first-year 2020`），和基线在同一时间段比：研究口径看 2020 年以后和 2022 年以后，
+实盘口径（20 万 top30 换 3）从 2022 年起步。2022 年以后的数据已经用过多次，这次的结果只作参考，不算干净的样本外检验。
+训练数据比基线多一倍，内存峰值预计 8 到 10 GB，只在电脑空闲时跑。
+
+```powershell
+$env:PYTHONPATH = "D:\自己瞎搞\RQuant2.0-pr32\src"
+$R = "D:\自己瞎搞\RQuant2.0"
+python -m rquant --root $R --universe sh_main walk-forward `
+  --workflow D:\自己瞎搞\RQuant2.0-pr32\config\workflows\jq240_lgb_y6_hl1.yaml --first-year 2020 --through 2026-10-21
+python -m rquant --root $R --universe sh_main report <run_id> --topk 50 --n-drop 5 --rebalance-days 1
+python D:\自己瞎搞\RQuant2.0-pr32\scripts\analysis\window_metrics.py $R\runs 2022-01-01 `
+  base=20261027T202921Z-41fb3dde-top50-drop5 new=<run_id>
+```
