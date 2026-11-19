@@ -559,6 +559,7 @@ class KunQuantFactorEngine:
         except ImportError as exc:
             raise DependencyError("pandas, pyarrow and NumPy are required to read canonical Parquet") from exc
 
+        _use_system_arrow_pool()
         bars_path = Path(canonical_root) / "bars"
         canonical_manifest_path = Path(canonical_root) / "manifest.json"
         if not canonical_manifest_path.exists():
@@ -777,6 +778,7 @@ class PanelFactorEngine:
         except ImportError as exc:
             raise DependencyError("pandas, pyarrow and NumPy are required for panel factor libraries") from exc
 
+        _use_system_arrow_pool()
         canonical_root = Path(canonical_root)
         bars_path = canonical_root / "bars"
         canonical_manifest_path = canonical_root / "manifest.json"
@@ -1339,6 +1341,20 @@ class _QuotePacking:
         target[...] = self.np.nan
         target[self.times, self.stocks] = values
         return target
+
+
+def _use_system_arrow_pool() -> None:
+    """Make pyarrow allocate with the C runtime instead of its default pool.
+
+    The default mimalloc pool keeps freed Parquet buffers instead of handing them back to Windows: on the main-board
+    jq240 build it held about 2.5 GiB more by the time the inputs were loaded. The system pool frees them.
+    """
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return
+    if pa.default_memory_pool().backend_name != "system":
+        pa.set_memory_pool(pa.system_memory_pool())
 
 
 def _flush(array: Any) -> None:

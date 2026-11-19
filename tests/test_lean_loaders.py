@@ -221,3 +221,18 @@ class PartitionWriterTests(unittest.TestCase):
                         }
                     )
                     pd.testing.assert_frame_equal(expected, stored)
+
+
+class ArrowPoolTests(unittest.TestCase):
+    def test_builds_switch_pyarrow_to_the_system_pool(self) -> None:
+        import pyarrow as pa
+
+        from rquant.factors import engine
+
+        previous = pa.default_memory_pool()
+        try:
+            pa.set_memory_pool(pa.mimalloc_memory_pool() if hasattr(pa, "mimalloc_memory_pool") else previous)
+            engine._use_system_arrow_pool()
+            self.assertEqual("system", pa.default_memory_pool().backend_name)
+        finally:
+            pa.set_memory_pool(previous)
