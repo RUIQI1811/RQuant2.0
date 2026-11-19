@@ -28,7 +28,7 @@ task:
       max_depth: 6
       num_leaves: 31
       min_data_in_leaf: 1000
-      num_threads: 8
+      num_threads: 16
       seed: 42
   dataset:
     class: DatasetH

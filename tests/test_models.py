@@ -33,7 +33,8 @@ class ModelConstructionTests(unittest.TestCase):
             with self.subTest(model=name):
                 self.assertEqual(expected, type(built_in_model(name, **refit_overrides(name, 7))).__name__)
 
-    # Break caught: built-in workflows whose model parameters drift from the ones every past run was trained with.
+    # Break caught: built-in workflows whose model parameters drift from the trained ones (runs before 2026-11-20 used
+    # num_threads 8; 16 only changes floating-point summation order, so results differ slightly, not systematically).
     def test_built_in_models_keep_the_trained_parameters(self) -> None:
         lgb_model = built_in_model("lgb")
         self.assertEqual((50, 1000), (lgb_model.early_stopping_rounds, lgb_model.num_boost_round))
@@ -41,7 +42,7 @@ class ModelConstructionTests(unittest.TestCase):
             {
                 "objective": "mse", "verbosity": -1, "learning_rate": 0.0421, "colsample_bytree": 0.8879,
                 "subsample": 0.8789, "lambda_l1": 205.6999, "lambda_l2": 580.9768, "max_depth": 8, "num_leaves": 210,
-                "num_threads": 8, "seed": 42,
+                "num_threads": 16, "seed": 42,
             },
             lgb_model.params,
         )
