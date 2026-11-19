@@ -200,6 +200,34 @@ class JQ240CalculationTests(unittest.TestCase):
                 self.outputs[name], expected[name], rtol=1e-7, atol=1e-9, equal_nan=True, err_msg=name
             )
 
+    # Break caught: inputs kept on disk (the low-memory build path) that are packed, padded or reused across graph
+    # groups differently from the in-memory path, which would change factor values.
+    def test_inputs_kept_on_disk_give_bitwise_identical_factors(self) -> None:
+        from rquant.factors.engine import _DiskArrays
+
+        _, engine, module, statement_module = compiled()
+        inputs = {**synthetic_inputs(days=400, stocks=11, seed=5)}
+        close = inputs["close"]
+        inputs["universe"] = pd.DataFrame(True, index=close.index, columns=close.columns)
+        statements = engine.run_statements(inputs, close.index, close.columns, statement_module)
+        arrays = {}
+        for name in (name for name in engine.input_fields if name not in statements):
+            value = inputs[name]
+            if isinstance(value, pd.Series):
+                value = np.repeat(value.to_numpy()[:, None], len(close.columns), axis=1)
+            arrays[name] = np.ascontiguousarray(value, dtype=float)
+        self.assertGreater(len(module.groups), 1)
+        memory = engine.run(arrays, module=module, statements=statements)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            disk = _DiskArrays(np, Path(directory), np.float64)
+            on_disk = engine.run(dict(arrays), module=module, statements=statements, allocate=disk)
+            self.assertGreater(disk.bytes, 0)
+            self.assertEqual(list(memory), list(on_disk))
+            for name, values in memory.items():
+                np.testing.assert_array_equal(values, np.asarray(on_disk[name]), err_msg=name)
+            on_disk.clear()
+            disk.close()
+
     def test_all_factors_are_aligned_and_populated(self) -> None:
         close = self.inputs["close"]
         for name in JQ240_NAMES:

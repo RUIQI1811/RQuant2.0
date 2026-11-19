@@ -427,7 +427,15 @@ class KunQuantFactorEngine:
         statements: StatementResults | None = None,
         output_buffers: dict[str, Any] | None = None,
         trim_outputs: bool = True,
+        allocate: Any | None = None,
     ) -> dict[str, Any]:
+        """Run the daily graphs over ``inputs`` (dates x stocks arrays) and return every catalog factor.
+
+        ``allocate(shape)`` makes the arrays the graphs read (packed and padded copies of the inputs, and the
+        statement-graph inputs); a disk-backed allocator (``_DiskArrays``) keeps them in the page cache instead of
+        process memory and also keeps each published statement input for the later graph groups. The results do not
+        depend on it.
+        """
         try:
             import numpy as np
             from KunQuant.runner import KunRunner as kr
@@ -460,32 +468,45 @@ class KunQuantFactorEngine:
             library.validate_inputs(normalized)
         time_count, stock_count = shape
         packing = _QuotePacking(np, normalized, self.quote_fields) if self.quote_fields else None
-        if packing is not None:
-            normalized = {name: packing.pack(values) for name, values in normalized.items()}
         run_length = packing.length if packing is not None else time_count
         module = module or self.compile()
         blocking_len = int(module.blocking_len)
         pad_stocks = (-stock_count) % blocking_len
-        if pad_stocks:
-            if self.config.input_layout != "TS" or self.config.output_layout != "TS":
-                raise DataContractError(
-                    "Unaligned stock counts are only supported for KunQuant TS input/output layouts"
-                )
-            normalized = {
-                name: np.pad(values, ((0, 0), (0, pad_stocks)), constant_values=np.nan)
-                for name, values in normalized.items()
-            }
+        if pad_stocks and (self.config.input_layout != "TS" or self.config.output_layout != "TS"):
+            raise DataContractError("Unaligned stock counts are only supported for KunQuant TS input/output layouts")
+        if allocate is None:
+
+            def allocate(shape: tuple[int, int]) -> Any:
+                return np.empty(shape, dtype=numpy_dtype)
+
+        def prepare(values: Any) -> Any:
+            """``values`` with each stock's quoted rows packed to the top and NaN stock columns padded on."""
+            if packing is None and not pad_stocks:
+                return values
+            target = allocate((run_length, stock_count + pad_stocks))
+            if packing is not None:
+                packing.pack_into(values, target[:, :stock_count])
+            else:
+                target[:, :stock_count] = values
+            target[:, stock_count:] = np.nan
+            return target
+
+        normalized = {name: prepare(values) for name, values in normalized.items()}
         expected = self.catalog.canonical_names(self.config.factor_set)
         if output_buffers is not None and set(output_buffers) != set(expected):
             raise DataContractError("KunQuant output buffers do not match the locked catalog")
+
+        keep_published = isinstance(allocate, _DiskArrays)
 
         def published(name: str) -> Any:
             values = np.ascontiguousarray(statements.daily(name), dtype=numpy_dtype)
             if values.shape != shape:
                 raise DataContractError(f"Statement input {name} has shape {values.shape}, not {shape}")
-            if packing is not None:
-                values = packing.pack(values)
-            return np.pad(values, ((0, 0), (0, pad_stocks)), constant_values=np.nan) if pad_stocks else values
+            values = prepare(values)
+            if keep_published:
+                # On disk it costs no memory to keep it for the later groups that read it too.
+                normalized[name] = values
+            return values
 
         executor = kr.createMultiThreadExecutor(self.config.workers)
         output = {}
@@ -559,11 +580,6 @@ class KunQuantFactorEngine:
         if missing_references:
             raise DataContractError(f"Factor libraries did not load their reference inputs: {missing_references}")
         numpy_dtype = np.dtype(np.float64 if self.config.dtype == "double" else np.float32)
-        matrices = {field: np.ascontiguousarray(panel.to_numpy(dtype=numpy_dtype)) for field, panel in panels.items()}
-        for field in self.reference_fields:
-            if field in external and field not in statements:
-                matrices[field] = _aligned_matrix(np, external[field], dates, instruments, numpy_dtype)
-        del panels, external
 
         output_root = Path(output_root)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -574,7 +590,9 @@ class KunQuantFactorEngine:
         blocking_len = int(module.blocking_len)
         padded_stock_count = len(instruments) + (-len(instruments)) % blocking_len
         raw_output_bytes = len(expected) * len(dates) * padded_stock_count * numpy_dtype.itemsize
-        required_free_bytes = raw_output_bytes * 2 + 1024**3
+        # Every input, its packed and padded copy and each published statement input are kept on disk too.
+        raw_input_bytes = 2 * len(self.input_fields) * len(dates) * padded_stock_count * numpy_dtype.itemsize
+        required_free_bytes = raw_output_bytes * 2 + raw_input_bytes + 1024**3
         free_bytes = shutil.disk_usage(output_root).free
         if free_bytes < required_free_bytes:
             shutil.rmtree(staging_root, ignore_errors=True)
@@ -587,15 +605,30 @@ class KunQuantFactorEngine:
         print(
             f"factors {self.config.factor_set}: computing dates={len(dates)} "
             f"stocks={len(instruments)} padded_stocks={padded_stock_count} outputs={len(expected)} "
-            f"temporary_output={raw_output_bytes / 1024**3:.2f} GiB",
+            f"temporary_output={raw_output_bytes / 1024**3:.2f} GiB "
+            f"temporary_inputs<={raw_input_bytes / 1024**3:.2f} GiB",
             file=sys.stderr,
             flush=True,
         )
         partition_hashes: dict[str, str] = {}
+        disk: _DiskArrays | None = None
         try:
             with tempfile.TemporaryDirectory(
-                prefix=f".{self.config.factor_set}.runtime.", dir=output_root
+                prefix=f".{self.config.factor_set}.runtime.", dir=output_root, ignore_cleanup_errors=True
             ) as runtime_directory:
+                # The inputs go to disk one field at a time, so the process never holds every daily panel at once.
+                disk = _DiskArrays(np, Path(runtime_directory), numpy_dtype)
+                matrices = {}
+                for field in list(panels):
+                    matrix = disk((len(dates), len(instruments)))
+                    matrix[...] = panels.pop(field).to_numpy(dtype=numpy_dtype)
+                    matrices[field] = matrix
+                for field in self.reference_fields:
+                    if field in external and field not in statements:
+                        matrix = disk((len(dates), len(instruments)))
+                        matrix[...] = _aligned_matrix(np, external.pop(field), dates, instruments, numpy_dtype)
+                        matrices[field] = matrix
+                del panels, external
                 output_path = Path(runtime_directory) / "kunquant_outputs.dat"
                 output_store = np.memmap(
                     output_path,
@@ -610,8 +643,15 @@ class KunQuantFactorEngine:
                     statements=statements,
                     output_buffers=output_buffers,
                     trim_outputs=False,
+                    allocate=disk,
                 )
                 del matrices
+                print(
+                    f"factors {self.config.factor_set}: inputs on disk {disk.bytes / 1024**3:.2f} GiB",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                disk.close()
                 output_store.flush()
                 print(
                     f"factors {self.config.factor_set}: KunQuant computation complete; writing yearly partitions",
@@ -665,6 +705,8 @@ class KunQuantFactorEngine:
             _atomic_replace_directory(staging_root, final_root)
             return metadata
         finally:
+            if disk is not None:
+                disk.close()
             if staging_root.exists():
                 shutil.rmtree(staging_root, ignore_errors=True)
 
@@ -1190,9 +1232,14 @@ class _QuotePacking:
         self.length = max(int(quoted.sum(axis=0).max(initial=0)), 1)
 
     def pack(self, values: Any) -> Any:
-        packed = self.np.full((self.length, values.shape[1]), self.np.nan, dtype=values.dtype)
-        packed[self.slots, self.stocks] = values[self.times, self.stocks]
-        return packed
+        packed = self.np.empty((self.length, values.shape[1]), dtype=values.dtype)
+        return self.pack_into(values, packed)
+
+    def pack_into(self, values: Any, target: Any) -> Any:
+        """Write the packed ``values`` into ``target`` (``length`` rows, one column per stock) and return it."""
+        target[...] = self.np.nan
+        target[self.slots, self.stocks] = values[self.times, self.stocks]
+        return target
 
     def unpack(self, packed: Any, target: Any | None, time_count: int) -> Any:
         """Scatter packed rows to their dates; ``target`` may share memory with ``packed``."""
@@ -1202,6 +1249,37 @@ class _QuotePacking:
         target[...] = self.np.nan
         target[self.times, self.stocks] = values
         return target
+
+
+class _DiskArrays:
+    """Allocates arrays in files under ``directory``, so large factor inputs live in the OS page cache.
+
+    A memory-mapped input costs no process memory: the OS keeps the pages a graph is reading and drops the rest
+    when memory is short, and they are read back from disk if needed again. Call ``close`` before the directory
+    is removed (Windows cannot delete a mapped file).
+    """
+
+    def __init__(self, np: Any, directory: Path, dtype: Any) -> None:
+        self.np = np
+        self.directory = Path(directory)
+        self.dtype = np.dtype(dtype)
+        self.arrays: list[Any] = []
+        self.bytes = 0
+
+    def __call__(self, shape: tuple[int, ...]) -> Any:
+        path = self.directory / f"input_{len(self.arrays):05d}.dat"
+        array = self.np.memmap(path, mode="w+", dtype=self.dtype, shape=tuple(int(size) for size in shape))
+        self.arrays.append(array)
+        self.bytes += array.nbytes
+        return array
+
+    def close(self) -> None:
+        for array in self.arrays:
+            mapping = getattr(array, "_mmap", None)
+            if mapping is not None:
+                with contextlib.suppress(BufferError, ValueError):
+                    mapping.close()
+        self.arrays.clear()
 
 
 def _load_panel_references(

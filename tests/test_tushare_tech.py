@@ -119,6 +119,22 @@ class TushareTechCalculationTests(unittest.TestCase):
             np.testing.assert_allclose(revolumed[name].to_numpy(), self.outputs[name].to_numpy(), rtol=1e-7,
                                        atol=1e-9, equal_nan=True, err_msg=name)
 
+    # Break caught: quote packing into disk-backed arrays (the low-memory build path) that moves or drops a row.
+    def test_inputs_kept_on_disk_give_bitwise_identical_indicators(self) -> None:
+        from rquant.factors.engine import _DiskArrays
+
+        arrays = {field: panel.to_numpy() for field, panel in self.inputs.items()}
+        self.assertTrue(np.isnan(arrays["close"]).any())  # the packing has suspended days to skip
+        memory = self.engine.run(arrays, module=self.module)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            disk = _DiskArrays(np, Path(directory), np.float64)
+            on_disk = self.engine.run(dict(arrays), module=self.module, allocate=disk)
+            self.assertGreater(disk.bytes, 0)
+            for name, values in memory.items():
+                np.testing.assert_array_equal(values, np.asarray(on_disk[name]), err_msg=name)
+            on_disk.clear()
+            disk.close()
+
     # Break caught: a suspension that resets recursive indicators or shortens a window.
     def test_suspended_days_are_skipped(self) -> None:
         column = 1
