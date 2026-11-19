@@ -63,6 +63,15 @@ def private_gib() -> float:
     return 0.0
 
 
+def arrow_gib() -> float:
+    """Bytes currently allocated by pyarrow's default memory pool, in GiB."""
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return 0.0
+    return pa.default_memory_pool().bytes_allocated() / 1024**3
+
+
 def report(snapshot, top: int, frames: int) -> None:  # type: ignore[no-untyped-def]
     statistics = snapshot.statistics("traceback")
     total = sum(stat.size for stat in statistics)
@@ -107,7 +116,7 @@ def main() -> None:
             with lock:
                 state["peak"] = max(state["peak"], private)
                 phase = state["phase"]
-            log(f"private={private:.2f} GiB phase={phase}")
+            log(f"private={private:.2f} GiB arrow={arrow_gib():.2f} GiB phase={phase}")
             if private > args.stop_gib:
                 log(f"private memory passed {args.stop_gib} GiB in phase {phase}; allocation sites:")
                 report(tracemalloc.take_snapshot(), args.top, args.frames)
@@ -139,6 +148,12 @@ def main() -> None:
     fill = engine_module._CanonicalBars.__wrapped__.fill
     engine_module._CanonicalBars.__wrapped__.fill = phase("_CanonicalBars.fill", fill)
 
+    try:
+        import pyarrow as pa
+
+        log(f"pyarrow {pa.__version__} memory pool: {pa.default_memory_pool().backend_name}")
+    except ImportError:
+        pass
     tracemalloc.start(args.frames)
     thread = threading.Thread(target=sampler, daemon=True)
     thread.start()
