@@ -479,9 +479,9 @@ class KunQuantFactorEngine:
             def allocate(shape: tuple[int, int]) -> Any:
                 return np.empty(shape, dtype=numpy_dtype)
 
-        def prepare(values: Any) -> Any:
+        def prepare(values: Any, *, copy: bool = False) -> Any:
             """``values`` with each stock's quoted rows packed to the top and NaN stock columns padded on."""
-            if packing is None and not pad_stocks:
+            if packing is None and not pad_stocks and not copy:
                 return values
             target = allocate((run_length, stock_count + pad_stocks))
             if packing is not None:
@@ -489,6 +489,7 @@ class KunQuantFactorEngine:
             else:
                 target[:, :stock_count] = values
             target[:, stock_count:] = np.nan
+            _flush(target)
             return target
 
         normalized = {name: prepare(values) for name, values in normalized.items()}
@@ -502,7 +503,8 @@ class KunQuantFactorEngine:
             values = np.ascontiguousarray(statements.daily(name), dtype=numpy_dtype)
             if values.shape != shape:
                 raise DataContractError(f"Statement input {name} has shape {values.shape}, not {shape}")
-            values = prepare(values)
+            # On disk, a published input is copied to its own file even when it needs no packing or padding.
+            values = prepare(values, copy=keep_published)
             if keep_published:
                 # On disk it costs no memory to keep it for the later groups that read it too.
                 normalized[name] = values
@@ -518,6 +520,9 @@ class KunQuantFactorEngine:
             run_buffers = {name: output_buffers[name][:run_length] for name in names} if output_buffers else {}
             output.update(kr.runGraph(executor, group_module, arrays, 0, run_length, run_buffers))
             del arrays
+            # Write a memory-mapped group's results out now, so dirty pages do not pile up in RAM across groups.
+            if run_buffers:
+                _flush(next(iter(run_buffers.values())))
         if packing is not None:
             output = {
                 name: packing.unpack(values, output_buffers[name] if output_buffers else None, time_count)
@@ -564,9 +569,8 @@ class KunQuantFactorEngine:
             raise DataContractError("Canonical dataset is not complete")
         if not bars_path.exists():
             raise DataContractError(f"Canonical bars do not exist: {bars_path}")
-        dates, instruments, panels, output_mask = _load_canonical_panels(
-            pd, bars_path, self.canonical_fields, self.config.universe, start=start, end=end
-        )
+        bars = _CanonicalBars(pd, bars_path, self.config.universe, start=start, end=end)
+        dates, instruments, output_mask = bars.dates, bars.instruments, bars.output_mask
         external, reference_hashes = _load_panel_references(
             self.libraries, Path(canonical_root), dates, instruments, dict(self.config.external_inputs), pd
         )
@@ -618,17 +622,15 @@ class KunQuantFactorEngine:
             ) as runtime_directory:
                 # The inputs go to disk one field at a time, so the process never holds every daily panel at once.
                 disk = _DiskArrays(np, Path(runtime_directory), numpy_dtype)
-                matrices = {}
-                for field in list(panels):
-                    matrix = disk((len(dates), len(instruments)))
-                    matrix[...] = panels.pop(field).to_numpy(dtype=numpy_dtype)
-                    matrices[field] = matrix
+                # Bars go from each canonical file straight into the on-disk matrices.
+                matrices = bars.fill(self.canonical_fields, allocate=disk)
                 for field in self.reference_fields:
                     if field in external and field not in statements:
                         matrix = disk((len(dates), len(instruments)))
                         matrix[...] = _aligned_matrix(np, external.pop(field), dates, instruments, numpy_dtype)
+                        _flush(matrix)
                         matrices[field] = matrix
-                del panels, external
+                del external
                 output_path = Path(runtime_directory) / "kunquant_outputs.dat"
                 output_store = np.memmap(
                     output_path,
@@ -1130,38 +1132,105 @@ def _load_canonical_panels(
     every canonical bar of every instrument that is ever in the universe. Membership only decides which computed rows
     are published.
     """
-    validate_universe(universe)
-    columns = ["datetime", "instrument", *input_fields, *UNIVERSE_COLUMNS[universe]]
-    bars = pd.read_parquet(bars_path, columns=list(dict.fromkeys(columns)))
-    bars["datetime"] = pd.to_datetime(bars["datetime"])
-    if start:
-        bars = bars[bars["datetime"] >= pd.Timestamp(start)]
-    if end:
-        bars = bars[bars["datetime"] <= pd.Timestamp(end)]
-    if bars.empty:
-        raise DataContractError("No canonical rows in requested factor range")
-    bars = bars.assign(in_universe=universe_mask(bars, universe).to_numpy())
-    members = bars.loc[bars["in_universe"], "instrument"].unique()
-    if not len(members):
-        raise DataContractError(f"No canonical rows for universe {universe}")
-    bars = bars[bars["instrument"].isin(members)]
+    bars = _CanonicalBars(pd, bars_path, universe, start=start, end=end)
+    arrays = bars.fill(input_fields)
+    panels = {field: pd.DataFrame(arrays[field], index=bars.dates, columns=bars.instruments) for field in input_fields}
+    return bars.dates, bars.instruments, panels, bars.output_mask
 
-    dates = pd.Index(sorted(bars["datetime"].unique()), name="datetime")
-    instruments = pd.Index(sorted(members), name="instrument")
-    panels = {
-        field: bars.pivot(index="datetime", columns="instrument", values=field).reindex(
-            index=dates, columns=instruments
-        )
-        for field in input_fields
-    }
-    output_mask = (
-        bars.pivot(index="datetime", columns="instrument", values="in_universe")
-        .reindex(index=dates, columns=instruments)
-        .fillna(False)
-        .astype(bool)
-        .to_numpy()
-    )
-    return dates, instruments, panels, output_mask
+
+class _CanonicalBars:
+    """The research universe's canonical bars, read one Parquet file at a time.
+
+    Construction reads only the date, instrument and membership columns to find the instruments ever in the universe,
+    their trading dates and the published-row mask; ``fill`` then reads the requested fields of those instruments file
+    by file straight into ``dates x instruments`` arrays. Neither step holds the whole long bar table, which for the
+    main-board universe is tens of millions of rows.
+    """
+
+    def __init__(self, pd: Any, bars_path: Path, universe: str, *, start: str | None, end: str | None) -> None:
+        import numpy as np
+
+        validate_universe(universe)
+        try:
+            import pyarrow.dataset as pa_dataset
+        except ImportError as exc:
+            raise DependencyError("pyarrow is required to read canonical Parquet") from exc
+        self.pd = pd
+        self.np = np
+        self.files = sorted(pa_dataset.dataset(str(bars_path), format="parquet").files)
+        self.start = pd.Timestamp(start) if start else None
+        self.end = pd.Timestamp(end) if end else None
+        membership = list(dict.fromkeys(["datetime", "instrument", *UNIVERSE_COLUMNS[universe]]))
+        scans = []
+        members: set[str] = set()
+        for path in self.files:
+            frame = self._read(path, membership)
+            if frame.empty:
+                continue
+            in_universe = universe_mask(frame, universe).to_numpy(dtype=bool)
+            members.update(frame.loc[in_universe, "instrument"].unique())
+            scans.append((frame["datetime"].to_numpy(), frame["instrument"].to_numpy(), in_universe))
+        if not scans:
+            raise DataContractError("No canonical rows in requested factor range")
+        if not members:
+            raise DataContractError(f"No canonical rows for universe {universe}")
+        self.instruments = pd.Index(sorted(members), name="instrument")
+        located = [(dates, self.instruments.get_indexer(codes), mask) for dates, codes, mask in scans]
+        del scans
+        member_dates = np.unique(np.concatenate([dates[columns >= 0] for dates, columns, _ in located]))
+        self.dates = pd.Index(pd.DatetimeIndex(member_dates), name="datetime")
+        self.output_mask = np.zeros((len(self.dates), len(self.instruments)), dtype=bool)
+        for dates, columns, mask in located:
+            keep = columns >= 0
+            rows = self.dates.get_indexer(dates[keep])
+            self.output_mask[rows, columns[keep]] = mask[keep]
+
+    def _read(self, path: str, columns: list[str], instruments: Any = None) -> Any:
+        import pyarrow.parquet as pq
+
+        filters = [("instrument", "in", list(instruments))] if instruments is not None else None
+        frame = pq.read_table(path, columns=columns, filters=filters).to_pandas()
+        frame["datetime"] = self.pd.to_datetime(frame["datetime"])
+        if self.start is not None:
+            frame = frame[frame["datetime"] >= self.start]
+        if self.end is not None:
+            frame = frame[frame["datetime"] <= self.end]
+        return frame
+
+    def fill(self, fields: tuple[str, ...], allocate: Any = None) -> dict[str, Any]:
+        """``dates x instruments`` arrays of ``fields`` (NaN where an instrument has no bar), made by ``allocate``."""
+        np = self.np
+        fields = tuple(dict.fromkeys(fields))
+        shape = (len(self.dates), len(self.instruments))
+        if allocate is None:
+
+            def allocate(size: tuple[int, int]) -> Any:
+                return np.empty(size, dtype=np.float64)
+
+        arrays = {}
+        for field in fields:
+            arrays[field] = allocate(shape)
+            arrays[field][...] = np.nan
+        seen = np.zeros(shape, dtype=bool)
+        for path in self.files:
+            frame = self._read(path, ["datetime", "instrument", *fields], self.instruments)
+            columns = self.instruments.get_indexer(frame["instrument"])
+            rows = self.dates.get_indexer(frame["datetime"])
+            keep = (columns >= 0) & (rows >= 0)
+            rows, columns = rows[keep], columns[keep]
+            if seen[rows, columns].any() or len(np.unique(rows * shape[1] + columns)) != len(rows):
+                raise DataContractError(f"Canonical bars repeat a (datetime, instrument) pair in {path}")
+            seen[rows, columns] = True
+            for field in fields:
+                arrays[field][rows, columns] = frame[field].to_numpy(dtype=np.float64, na_value=np.nan)[keep]
+            del frame
+        for array in arrays.values():
+            _flush(array)
+        return arrays
+
+
+# Cells (rows x factor columns) per written row group: about 0.4 GiB of float64 at a time.
+_PARTITION_BLOCK_CELLS = 50_000_000
 
 
 def _write_year_partitions(
@@ -1177,35 +1246,56 @@ def _write_year_partitions(
     *,
     label: str,
 ) -> int:
-    """Write one Parquet partition per year containing only rows inside the research universe."""
+    """Write one Parquet partition per year containing only rows inside the research universe.
+
+    A year is written a few weeks at a time (one row group per block), so only one block of rows is ever copied out
+    of the computed factors at once; reading a partition gives the same frame as writing the whole year at once.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     total_rows = 0
     date_years = dates.year
+    block_dates = max(1, _PARTITION_BLOCK_CELLS // max(1, len(instruments) * len(expected)))
     for year in sorted(set(date_years)):
         positions = np.flatnonzero(date_years == year)
         first = int(positions[0])
         last = int(positions[-1]) + 1
-        year_dates = dates[first:last]
-        keep = output_mask[first:last].reshape(-1)
-        if not keep.any():
+        if not output_mask[first:last].any():
             continue
-        factor_data: dict[str, Any] = {
-            "datetime": np.repeat(year_dates.to_numpy(), len(instruments))[keep],
-            "instrument": np.tile(instruments.to_numpy(), len(year_dates))[keep],
-        }
-        for name in expected:
-            factor_data[name] = np.asarray(values_for(name, first, last)).reshape(-1)[keep]
-        frame = pd.DataFrame(factor_data)
         destination = staging_root / f"year={year}" / "factors.parquet"
         destination.parent.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(destination, index=False)
+        rows = 0
+        writer = None
+        try:
+            for start in range(first, last, block_dates):
+                stop = min(start + block_dates, last)
+                keep = output_mask[start:stop].reshape(-1)
+                if not keep.any():
+                    continue
+                block_dates_index = dates[start:stop]
+                factor_data: dict[str, Any] = {
+                    "datetime": np.repeat(block_dates_index.to_numpy(), len(instruments))[keep],
+                    "instrument": np.tile(instruments.to_numpy(), len(block_dates_index))[keep],
+                }
+                for name in expected:
+                    factor_data[name] = np.asarray(values_for(name, start, stop)).reshape(-1)[keep]
+                table = pa.Table.from_pandas(pd.DataFrame(factor_data), preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(destination, table.schema)
+                writer.write_table(table)
+                rows += table.num_rows
+                del factor_data, table
+        finally:
+            if writer is not None:
+                writer.close()
         partition_hashes[str(year)] = sha256_file(destination)
-        total_rows += len(frame)
+        total_rows += rows
         print(
-            f"factors {label}: year={year} dates={len(year_dates)} rows={len(frame)}",
+            f"factors {label}: year={year} dates={last - first} rows={rows}",
             file=sys.stderr,
             flush=True,
         )
-        del factor_data, frame
     if not total_rows:
         raise DataContractError(f"Factor build for {label} produced no rows inside the research universe")
     return total_rows
@@ -1249,6 +1339,13 @@ class _QuotePacking:
         target[...] = self.np.nan
         target[self.times, self.stocks] = values
         return target
+
+
+def _flush(array: Any) -> None:
+    """Write a memory-mapped array's dirty pages to its file; other arrays are left alone."""
+    flush = getattr(array, "flush", None)
+    if flush is not None:
+        flush()
 
 
 class _DiskArrays:
