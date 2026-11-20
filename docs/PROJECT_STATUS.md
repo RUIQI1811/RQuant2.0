@@ -85,7 +85,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 
 | PR | 内容 | 状态 |
 | --- | --- | --- |
-| 待定 | 日内择时下单回测（分钟线同步、整理、嵌套回测脚本 `scripts/analysis/intraday_execution.py`） | 草稿 |
+| #35 | 日内择时下单回测（分钟线同步、整理、嵌套回测脚本 `scripts/analysis/intraday_execution.py`） | 草稿 |
 | #32 | jq240 LightGBM 调参（IC 早停、排名标签、`--seed`、多 run 平均）和季度重训 | 草稿 |
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
@@ -100,7 +100,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 
 - RD-Agent 自动挖因子能跑通（WSL2 + 通义千问，PR #14 已合并），三次运行只重新发现了 Alpha158 类因子，暂停。
 - FinRL 不建议用；以后要试强化学习，用 qlib.rl。
-- 日内：用户 2026-11-19 开通了 Tushare「A股历史分钟」（`stk_mins`，2000 元/年），在 Windows 上实测可用（241 根/天，vol 单位股、amount 单位元，加总与日线一致）。选的方向是日内择时下单：日频选股不变，用 qlib `NestedExecutor` 在 1 分钟线上按买卖时间窗 TWAP 成交，看是否好过开盘价（PR 见第 6 节，说明在 `docs/intraday-execution.md`）。只下预测前 200 名和持仓的股票日，不下全市场。还没有结果。
+- 日内：用户 2026-11-19 开通了 Tushare「A股历史分钟」（`stk_mins`，2000 元/年），在 Windows 上实测可用（241 根/天，vol 单位股、amount 单位元，加总与日线一致）。选的方向是日内择时下单：日频选股不变，用 qlib `NestedExecutor` 在 1 分钟线上按买卖时间窗 TWAP 成交，看是否好过开盘价（PR #35，说明在 `docs/intraday-execution.md`）。只下预测前 200 名和持仓的股票日，不下全市场。还没有结果。
 - J Law 策略（美股波段冠军，放量突破 + 紧止损 + 每笔风险 0.3%）没有公开的机械规则，PR #33（已合并）把他公开讲过的原则改写成 16 条规则
   （每条注明是原话还是近似，见 `docs/jlaw-rules.md`），用 `scripts/analysis/jlaw_backtest.py` 在 canonical 日线上回测。
   sh_main、25 万、2013-01-04 至 2026-10-21（run `runs/jlaw/20261114T132653Z`）：base 年化 -5.5%、Sharpe -0.76、最大回撤 -53%；
