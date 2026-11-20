@@ -186,6 +186,7 @@ def main() -> None:
                     "start_book": manifest["start_book"],
                     "uncovered_holding_days": manifest["uncovered_holding_days"],
                     "uncovered_share": manifest["uncovered_share"],
+                    "unfilled_orders": manifest["unfilled_orders"],
                     "fallback_trades": manifest["fallback_trades"],
                     "fallback_trade_value_share": manifest["fallback_trade_value_share"],
                 },

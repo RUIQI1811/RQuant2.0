@@ -25,16 +25,19 @@ HAS_QLIB = importlib.util.find_spec("qlib") is not None and importlib.util.find_
 
 DAYS = ["20200130", "20200131", "20200203", "20200204", "20200205"]
 BASE = {"000001.SZ": 10.0, "000002.SZ": 20.0}
-# 000002.SZ opens at its up limit on 2020-02-03 and stays there through the 09:31 bar.
-LIMIT_UP_OPEN = ("000002.SZ", "20200203")
+# 000002.SZ touches its up limit in the 09:31 bar of 2020-02-03; 000001.SZ opens at it on 2020-02-04 (09:30 bar).
+LIMIT_UP_MORNING = ("000002.SZ", "20200203")
+LIMIT_UP_OPEN = ("000001.SZ", "20200204")
 
 
 def _minute_prices(ts_code: str, day: str) -> list[float]:
     """Raw close of each of the 241 Tushare bars of a day (the 09:30 auction print first): a rising line."""
     base = BASE[ts_code] + DAYS.index(day) * 0.1
     prices = [round(base + 0.01 * index, 2) for index in range(241)]
+    if (ts_code, day) == LIMIT_UP_MORNING:
+        prices[2] = _up_limit(ts_code, day)
     if (ts_code, day) == LIMIT_UP_OPEN:
-        prices[0] = prices[1] = prices[2] = _up_limit(ts_code, day)
+        prices[0] = prices[1] = _up_limit(ts_code, day)
     return prices
 
 
@@ -298,7 +301,7 @@ class IntradayPipelineTests(unittest.TestCase):
         self.assertAlmostEqual((prices[0] + prices[1]) / 2 * factor, float(first["vwap"]), places=5)
         self.assertAlmostEqual(prices[1] * factor, float(first["close"]), places=5)
         self.assertAlmostEqual(2000.0 / factor, float(first["volume"]), places=2)
-        self.assertTrue(bool(first["limit_buy"]))
+        self.assertFalse(bool(first["limit_buy"]))
         self.assertTrue(bool(day.iloc[1]["limit_buy"]))
         self.assertFalse(bool(day.iloc[2]["limit_buy"]))
         self.assertTrue((self.minutes / "qlib" / "calendars" / "1min.txt").exists())
@@ -353,9 +356,12 @@ class IntradayPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(prices[3] * factor("SZ000002", "2020-02-03"), float(buy_b["price"]), places=5)
         self.assertAlmostEqual(1.0, float(buy_b["fill_rate"]))
 
-        # Held across the month boundary and liquidated on the last day.
-        self.assertEqual("sell", trades.iloc[-1]["direction"])
-        self.assertEqual(pd.Timestamp("2020-02-05"), trades.iloc[-1]["datetime"])
+        # SZ000001 opens at its up limit on 2020-02-04, so it is no buy candidate; with topk=n_drop=1 Qlib's
+        # TopkDropout then drops the only stock it holds, as the daily backtest does on such a day.
+        self.assertEqual(4, len(trades))
+        self.assertEqual(("SZ000002", "sell"), tuple(trades.iloc[-1][["instrument", "direction"]]))
+        self.assertEqual(pd.Timestamp("2020-02-04"), trades.iloc[-1]["datetime"])
+        self.assertEqual({"buy": 0, "sell": 0}, manifest["unfilled_orders"])
         portfolio = pd.read_parquet(output / "portfolio.parquet")
         self.assertEqual(len(DAYS), len(portfolio))
         # Daily returns chain the account across the month boundary.
@@ -365,6 +371,16 @@ class IntradayPipelineTests(unittest.TestCase):
             self.assertAlmostEqual(account[day] / account[day - 1] - 1.0, net[day], places=6)
         self.assertIn("net_return", manifest["metrics"])
         self.assertIsNotNone(manifest["execution_vs_open_bp"]["buy"])
+        # The daily strategy judges a day by its first bar: limited when that bar is, whatever the later bars do.
+        from rquant.qlib_ext.minute import MinuteAshareExchange
+
+        exchange = MinuteAshareExchange(
+            minute_root=self.minutes, start_time="2020-02-03", end_time="2020-02-04", codes=[]
+        )
+        for stock, day, limited in (("SZ000002", "2020-02-03", False), ("SZ000001", "2020-02-04", True)):
+            first, last = pd.Timestamp(day), pd.Timestamp(day) + pd.Timedelta(hours=23, minutes=59)
+            self.assertEqual(limited, exchange.check_stock_limit(stock, first, last, direction=1), stock)
+            self.assertFalse(exchange.check_stock_limit(stock, first, last, direction=0))
         # The outer report books the inner trades' costs and turnover, and return - cost stays the net return.
         self.assertFalse(trades["fallback"].any())
         previous = portfolio["account"].shift(1).fillna(100_000.0)

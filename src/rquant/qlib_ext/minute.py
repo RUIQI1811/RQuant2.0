@@ -3,8 +3,10 @@
 - ``MinuteAshareExchange``: ``AshareExchange`` (commission minimum, dated stamp tax) whose quotes are the monthly
   minute files of ``rquant.data.minutes`` instead of Qlib feature bins. A price asked for a span longer than one bar
   (the daily strategy sizing its orders) is the span's first bar, the price known when the day's trading starts,
-  where Qlib would take the last one. A stock-day of ``fallback_codes`` with no minute bars gets two bars from the
-  daily data instead (the daily open at 09:30, the daily close at 14:59), listed in ``fallback_days``.
+  where Qlib would take the last one; such a span is limited when its first bar is (Qlib: when all bars are), so
+  the daily strategy skips the stocks the daily backtest skips. A stock-day of ``fallback_codes`` with no minute
+  bars gets two bars from the daily data instead (the daily open at 09:30, the daily close at 14:59), listed in
+  ``fallback_days``.
 - ``WindowTWAPStrategy``: Qlib's ``TWAPStrategy`` with its own time window for buys and for sells; an order on a
   fallback stock-day trades whole at 09:30, the daily open, as the daily backtest does.
 - ``ZeroOrderSafeNestedExecutor``: Qlib's ``NestedExecutor`` with the trade indicator that stays defined on a day
@@ -107,6 +109,26 @@ class MinuteAshareExchange(AshareExchange):
         if len(valid) == 0:
             return super().get_deal_price(stock_id, start_time, end_time, direction, method)
         return valid.iloc[0]
+
+    def check_stock_limit(self, stock_id: str, start_time: Any, end_time: Any, direction: Any = None) -> bool:
+        """A span longer than one bar (the daily strategy picking tradable stocks) is judged by its first bar, as the
+        daily backtest judges a day by its open; Qlib would call it limited only when every bar of the span is."""
+        import pandas as pd
+
+        span = pd.Timestamp(end_time) - pd.Timestamp(start_time)
+        if span < pd.Timedelta(minutes=1):
+            return super().check_stock_limit(stock_id, start_time, end_time, direction)
+        fields = {None: ("limit_buy", "limit_sell"), 1: ("limit_buy",), 0: ("limit_sell",)}[
+            None if direction is None else int(direction)
+        ]
+        for field in fields:
+            flags = self.quote.get_data(stock_id, start_time, end_time, field=field, method=None)
+            if flags is None:
+                return super().check_stock_limit(stock_id, start_time, end_time, direction)
+            values = getattr(flags, "data", flags)
+            if len(values) and bool(values[0]):
+                return True
+        return False
 
 
 def daily_fallback_bars(codes: list[str], start: Any, end: Any, minute_quotes: Any) -> Any:

@@ -142,6 +142,7 @@ class IntradayBacktestRunner:
                 self.log("warning: no daily book before the start in the run's report files; starting from cash")
         universe = predictions[["datetime", "instrument"]]
         reports, holdings, trades, uncovered = [], [], [], []
+        unfilled = {"buy": 0, "sell": 0}
         for number, month in enumerate(months):
             month_days = days[days.to_period("M") == month]
             start, end = month_days[0], month_days[-1]
@@ -190,6 +191,8 @@ class IntradayBacktestRunner:
             reports.append(report)
             holdings.append(_holdings(pd, positions, exchange))
             trades.append(_trades(pd, indicators["1day"][1], exchange))
+            for direction, count in _unfilled_orders(pd, indicators["1day"][1]).items():
+                unfilled[direction] += count
             uncovered.extend(_uncovered(pd, positions, exchange))
             last = positions[max(positions)]
             account = _carry(last)
@@ -240,6 +243,7 @@ class IntradayBacktestRunner:
             "uncovered_holding_days": len(uncovered),
             "uncovered_share": len(uncovered) / len(holdings_frame) if len(holdings_frame) else None,
             "uncovered_examples": uncovered[:20],
+            "unfilled_orders": unfilled,
             "fallback_trades": int(trades_frame["fallback"].sum()) if len(trades_frame) else 0,
             "fallback_trade_value_share": _finite(
                 trades_frame.loc[trades_frame["fallback"], "value"].sum() / trades_frame["value"].sum()
@@ -350,6 +354,20 @@ def _trades(pd: Any, indicator: Any, exchange: Any) -> Any:
         "fallback",
     ]
     return pd.DataFrame(rows, columns=columns).astype({"fallback": bool})
+
+
+def _unfilled_orders(pd: Any, indicator: Any) -> dict[str, int]:
+    """Daily orders that dealt nothing (limit, suspension or cash in every bar of their window), by direction."""
+    counts = {"buy": 0, "sell": 0}
+    for order_indicator in indicator.order_indicator_his.values():
+        ordered = order_indicator.get_index_data("amount").to_dict()
+        dealt = order_indicator.get_index_data("deal_amount").to_dict()
+        directions = order_indicator.get_index_data("trade_dir").to_dict()
+        for stock, amount in ordered.items():
+            deal = dealt.get(stock)
+            if amount and abs(float(amount)) > 1e-12 and (deal is None or pd.isna(deal) or abs(float(deal)) <= 1e-12):
+                counts["sell" if int(directions.get(stock, 1)) == 0 else "buy"] += 1
+    return counts
 
 
 def _uncovered(pd: Any, positions: dict[Any, Any], exchange: Any) -> list[str]:
