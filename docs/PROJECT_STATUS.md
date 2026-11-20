@@ -1,6 +1,6 @@
 # RQuant2.0 项目进度（共享记忆）
 
-最后更新：2026-11-18（美西时间）。
+最后更新：2026-11-19（美西时间）。
 
 这份文件是 Claude 和 GPT/Codex 等 agent 共同读取的项目进度。规则见文末「怎么维护」。
 研究口径、目录职责和安全边界以 `agent.md` 为准；本文件只记录「现在做到哪了」。
@@ -39,8 +39,12 @@ LightGBM 训练从 2026-11-20 起用 16 线程（`num_threads: 16`，以前是 8
 
 - 全部 12 个公式库都用 KunQuant 实现（PR #17/#18/#19 已合并）：`qlib_alpha158`、`qlib_alpha360`、`wq_alpha101`、`gtja191`、
   `talib`、`china_chars`、`size_value_china`、`jq240`、`oap`、`barra_cne6`、`tushare_tech`、`jkp153`；另有选择型 `oap_jq_cnc`（254 列）。
-- 按收益挑选的因子集（Hquality、recent、recent_sh_main、remove_duplicates）已按用户要求删除，以后也不要再按收益挑因子。
+- 按收益挑选的因子集（Hquality、recent、recent_sh_main、remove_duplicates）已按用户要求删除。2026-11-19 用户例外要求按收益重挑一个
+  `oap_jq_cnc_ic`（`main` 上 2020 以后 |Rank IC| ≥ 0.01、相关性 0.8 去重，78 列，样本内，PR #32），结果不如原版；其他因子集仍不按收益挑。
 - 接入新因子集的步骤见 `docs/adding-factor-sets.md`。
+- 因子库现状（2026-11-19 删过一次）：`data/factors/`（csi300）为空；`data/factors-sh_main/` 只剩 jq240（实盘模型用）；
+  `data/factors-main/` 有 jq240、size_value_china、oap、gtja191、china_chars、oap_jq_cnc、barra_cne6、jkp153、wq_alpha101、oap_jq_cnc_ic、
+  qlib_alpha158。GPT 的 jkp406、china469_pit 库也删了，要用得重建。
 - GPT/Codex 做的、还没合并的：`jkp406`（PR #25，364 列；362 列版本在 sh_main 上 2022 年以后 Sharpe 0.93，364 列版本因内存不足没建完），
   `china469_pit`（PR #27，18 列，单独回测很弱：全期 7.0%/0.39）。
 
@@ -76,6 +80,11 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
   跌出前 40% 至 70% 就卖，2022 年以后实盘口径 1.01 至 1.17（只有 70% 略高于基线，在误差内）；「所有过分数线的股票等权满仓」
   （`--strategy score-line`）平均只持 1 至 6 只，2022 年以后年化 -16% 至 -34%，不用。用户 2026-11-18 选择把跌出前 70% 就卖（`x70`）
   放进 PTrade（`LIVE_EXIT_RANK_PCT = 0.7`），预期提升很小，主要是及时卖掉排名掉到后 30% 的持仓。
+- **沪深主板（`main`，60 + 000/001/002/003，2026-11-19，`docs/main-universe-jq240.md`）**：9 个因子集，实盘口径（20 万 top30 换 3，
+  2022 年以后）Sharpe：size_value_china 1.22、barra_cne6 1.13、oap 1.04、jkp153 1.03、oap_jq_cnc 0.90、oap_jq_cnc_ic 0.75（样本内）、
+  jq240 0.69（`20261119T182443Z-30e72d4e`）、gtja191 0.30、wq_alpha101 0.27，对现在实盘 1.12。基本面和风格类在 `main` 上 2022 年以后研究口径
+  比 `sh_main` 高 0.17 到 0.25，纯量价类变差；从 2020 年算大多略差；回撤 -43% 到 -48%。差距在误差内，**实盘不换**。
+  jq240 `main` 的 Rank IC 每年都更高，2013 至 2021 年 Sharpe 1.75 对 1.38，但 2022 年以后没有更好。
 - LGB jq240 sh_main walk-forward 的实测内存峰值：工作集约 3.9 GB、提交内存约 5.9 GB，空闲 5 GB 就能跑（用户 2026-11-08 选了 5 GB 门槛）。
 
 ## 5. 实盘（国金证券，PR #28 已于 2026-11-17 合并；2026-11-13 起用 PTrade）
@@ -110,7 +119,7 @@ qlib 原生化后的同一结果：`20261101T210410Z-aada1bdd`（预测逐位相
 
 | PR | 内容 | 状态 |
 | --- | --- | --- |
-| #32 | jq240 LightGBM 调参：IC 早停、排名标签、`--seed`、多 run 平均脚本、6 个候选配置；季度重训（`rolling.retrain_months`）和近期加权（`rolling.sample_half_life_years`）及 3 个配置 | 草稿，调参 3 步都跑完：2022 年以后没有提升，实盘不换；季度重训 + 近期加权、6 年窗口降权也跑完（2022 年以后都没有提升，不换）；另含拥挤诊断脚本 `scripts/analysis/crowding_diagnostics.py`；2026-11-17/18 加了买入分数线、跌出百分位卖出和 `--strategy score-line`（`docs/score-rules.md`）；PTrade 实盘加了跌出前 70% 就卖（`LIVE_EXIT_RANK_PCT = 0.7`） |
+| #32 | jq240 LightGBM 调参：IC 早停、排名标签、`--seed`、多 run 平均脚本、6 个候选配置；季度重训（`rolling.retrain_months`）和近期加权（`rolling.sample_half_life_years`）及 3 个配置 | 草稿，调参 3 步都跑完：2022 年以后没有提升，实盘不换；季度重训 + 近期加权、6 年窗口降权也跑完（2022 年以后都没有提升，不换）；另含拥挤诊断脚本 `scripts/analysis/crowding_diagnostics.py`；2026-11-17/18 加了买入分数线、跌出百分位卖出和 `--strategy score-line`（`docs/score-rules.md`）；PTrade 实盘加了跌出前 70% 就卖（`LIVE_EXIT_RANK_PCT = 0.7`）；2026-11-19 加了低内存建库（逐年读、内存映射、pyarrow 系统内存池）、建库内存分析脚本、`oap_jq_cnc_ic`、LightGBM 16 线程，以及沪深主板 9 个因子集的结果（`docs/main-universe-jq240.md`） |
 | #25 / #27 | GPT 做的 jkp406 / china469_pit | 草稿 |
 | #26 | Codex 子智能体分工规则（文档） | 草稿 |
 | #15 | RD-Agent 修复 | 用户要求先不合并 |
