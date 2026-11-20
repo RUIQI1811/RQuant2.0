@@ -56,3 +56,23 @@
 2. PTrade → 量化 → 新建策略（股票、日线），把 `generated/jq240_ptrade_live.py` 全部粘贴进去，保存。
 3. 新建交易，选这个策略启动。日志里会马上出现 `[RQ] live.top30=...` 和一组 `live.dry_sell` / `live.dry_buy`。
 4. 第二天 09:21 再看一次模拟下单。确认没问题后，把 `LIVE_DRY_RUN = True` 改成 `False`，重新启动交易。
+
+## 沪深主板合并版（jq240 + size_value_china，2026-11-20 起准备，还没上线）
+
+用户 2026-11-19 选择把实盘换成沪深主板（`main`：沪市 60 + 深市 00）上 jq240 和 size_value_china 两个模型的合并版，
+持 50 只、每天最多换 5 只，不用跌出前 70% 就卖（回测 `main-blend-jq240-size_value_china`，20 万从 2020 年起
+年化 28.9%、Sharpe 1.01）。由 `python ptrade/build_main_blend.py` 生成：
+
+| 文件 | 用途 |
+| --- | --- |
+| `runtime/svc_inputs.py` | 用 PTrade 全 A 股日线和估值表算 CH-3/CH-4 因子收益（`CH4FactorBuilder`），拼 size_value_china 的输入、打分、合并 |
+| `runtime/main_parity.py` → `generated/main_blend_research_parity.py` | 研究模块对账：AS_OF 2026-10-21 的两个模型和合并分数，和回测逐只比 |
+| `runtime/main_live.py` → `generated/main_blend_ptrade_live.py` | 实盘策略：`ptrade_live.py` 设成 `LIVE_UNIVERSE = "main"`、top50、换 5，打分换成合并分数 |
+
+- 模型：`qmt/models/lgb_jq240_main.json`（32 棵树）和 `qmt/models/lgb_size_value_china_main.json`（13 棵树），都是 2026 年窗口
+  （训练 2023-01-03 至 2025-12-30），导出时和回测预测逐位相同。合并：两个模型的分数每天各自标准化（ddof 1）后等权平均，只用两个都打了分的股票。
+- size_value_china 读 Tushare daily_basic 的单位：`total_mv` 是万元（PTrade 市值 / 1e4），`pe_ttm` 用和 jq240 一样的
+  市值 / 归母净利润 TTM，`turnover_total` 是成交股数 / 总股本。CH-4 因子收益用全 A 股（60、00、30 开头，含创业板，和论文一致）
+  每天的收盘/昨收、总市值、估值表的 `pe_ttm` 和换手率，按月分组，需要约 530 个交易日的全 A 股数据。
+- 上线步骤：先在研究模块跑对账文件，看三个 `compare.*.rank_corr` 和 `top50_overlap`；通过后跑几天只打印的实盘文件，再由用户决定真实下单。
+  换过去的头几天，现有的 30 只沪市持仓会按「每天最多换 5 只」逐步换成 50 只，买入只用竞价前的现金。

@@ -26,6 +26,7 @@
 # auction. Set it to False only after a dry run looks right. The account is the one the PTrade login trades; nothing
 # about it is written here.
 LIVE_DRY_RUN = True
+LIVE_UNIVERSE = "sh_main"  # the board the strategy scores and trades: "sh_main" (60xxxx) or "main" (60xxxx + 00xxxx)
 LIVE_CAPITAL = 0  # the most the strategy may hold (holdings at market plus cash); 0 = all its holdings and cash
 LIVE_TOPK = 30
 LIVE_N_DROP = 3
@@ -73,8 +74,16 @@ def _where(exc):
     return "%s: %s at %s" % (type(exc).__name__, exc, " > ".join(spots[-5:]))
 
 
+def on_live_board(code):
+    return on_main_board(code) if LIVE_UNIVERSE == "main" else (code.startswith("60") and code.endswith(".SS"))
+
+
+def live_codes(end):
+    return main_codes(end) if LIVE_UNIVERSE == "main" else sh_main_codes(end)
+
+
 def managed(code):
-    return code.startswith("60") and code.endswith(".SS") and code not in LIVE_KEEP
+    return on_live_board(code) and code not in LIVE_KEEP
 
 
 def account_label():
@@ -85,7 +94,7 @@ def account_label():
 
 
 def read_account(account):
-    """(available cash, {code: (shares, sellable shares)}) for the strategy's sh_main codes."""
+    """(available cash, {code: (shares, sellable shares)}) for the strategy's board (LIVE_UNIVERSE)."""
     portfolio = _pt["context"].portfolio
     positions = {}
     for code, position in (portfolio.positions or {}).items():
@@ -96,7 +105,7 @@ def read_account(account):
 
 
 def sent_today():
-    """Today's orders in the account for sh_main stocks (any source), as get_all_orders lists them."""
+    """Today's orders in the account for the board's stocks (any source), as get_all_orders lists them."""
     rows = get_all_orders() or []  # noqa: F821
     return [row for row in rows if managed(str(row.get("symbol", "")))]
 
@@ -148,8 +157,8 @@ def previous_session(today):
 
 
 def session_bars_in(day, clock):
-    """Whether PTrade has the daily bars of ``day`` yet, from a sample of sh_main codes (one quick lookup)."""
-    codes = sh_main_codes(clock[:8])
+    """Whether PTrade has the daily bars of ``day`` yet, from a sample of the board's codes (one quick lookup)."""
+    codes = live_codes(clock[:8])
     sample = codes[::max(1, len(codes) // LIVE_BARS_SAMPLE)][:LIVE_BARS_SAMPLE]
     stamp = day.strftime("%Y%m%d")
     found = sum(1 for _, dates, _ in _bars(sample, ["close", "volume"], stamp, stamp, trading_calendar(clock[:8]))
@@ -168,7 +177,7 @@ def live_plan():
             rq_log("live.wait", "daily bars of %s not in yet (%d of %d sampled) at %s" % (
                 wanted.strftime("%Y%m%d"), found, asked, clock[8:12]))
             return None
-    inputs = build_inputs(clock[:8], LIVE_DAYS, rq_log, cache=_pt["cache"])
+    inputs = build_inputs(clock[:8], LIVE_DAYS, rq_log, codes=live_codes(clock[:8]), cache=_pt["cache"])
     listed = inputs["close"].index
     counts = inputs["close"].notna().sum(axis=1)
     rq_log("live.bars", ",".join("%s:%d" % (day.strftime("%Y%m%d"), counts[day]) for day in listed[-3:]))
@@ -183,11 +192,17 @@ def live_plan():
     if len(missing):
         rq_log("live.error", "daily bars of %s are missing" % ",".join(day.strftime("%Y%m%d") for day in missing))
         return None
-    scores = daily_scores(inputs, pd.DatetimeIndex([last]))[last]
-    rq_log("live.model", "%s year=%s" % (MODEL["run"], MODEL["prediction_year"]))
+    scores = plan_scores(inputs, last, clock)
     rq_log("live.top%d" % LIVE_TOPK, ",".join(to_rquant(code) for code in ranked(scores)[:LIVE_TOPK]))
     rq_log("live.plan_seconds", round(time.time() - began, 2))
     return {"date": last, "scores": scores, "st": inputs["quotes"]["st"], "made": clock[:8]}
+
+
+def plan_scores(inputs, last, clock):
+    """The scores the plan trades on: the jq240 window's for ``last`` (the main-board blend bundle replaces this)."""
+    scores = daily_scores(inputs, pd.DatetimeIndex([last]))[last]
+    rq_log("live.model", "%s year=%s" % (MODEL["run"], MODEL["prediction_year"]))
+    return scores
 
 
 def keep_plan(plan):
@@ -284,7 +299,7 @@ def rq_trade(context, mode):
     if not LIVE_DRY_RUN:
         orders = sent_today()
         if orders:
-            rq_log("live.skip", "the account already has %d sh_main orders today: no orders" % len(orders))
+            rq_log("live.skip", "the account already has %d %s orders today: no orders" % (len(orders), LIVE_UNIVERSE))
             _pt["done"] = g.rq_done = today  # noqa: F821
             return
     account = account_label()
@@ -334,8 +349,8 @@ def rq_after_open_buy(context):
 
 def initialize(context):
     _pt["context"] = context
-    rq_log("live", "start dry_run=%s auction=%s topk=%d n_drop=%d exit_rank_pct=%s" % (
-        LIVE_DRY_RUN, LIVE_AUCTION, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT))
+    rq_log("live", "start dry_run=%s universe=%s auction=%s topk=%d n_drop=%d exit_rank_pct=%s" % (
+        LIVE_DRY_RUN, LIVE_UNIVERSE, LIVE_AUCTION, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT))
     for moment in LIVE_PLAN_AT:
         run_daily(context, rq_prepare, time=moment)  # noqa: F821
     for moment in LIVE_AUCTION_AT:
