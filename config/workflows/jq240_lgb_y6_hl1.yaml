@@ -1,0 +1,77 @@
+# jq240 LightGBM retraining variant `y6_hl1`: the built-in lgb workflow (Qlib's Alpha158 / CSI300 parameters, early
+# stopping on the validation loss), retrained once a year as before, but each window also trains on the three years
+# before its usual three-year window. Rows from the last three years keep the full weight; older rows halve every
+# year (4 years old 0.5, 5 years 0.25, 6 years 0.125). Windows before 2016 have less than three older years, because
+# the data starts in 2010.
+#
+# Asked for by the user on 2026-11-18 after the quarterly variants; see docs/lgb-tuning.md. Run with
+#   rquant --universe sh_main walk-forward --workflow config/workflows/jq240_lgb_y6_hl1.yaml --first-year 2020
+# The handler below is RQuant's own, so the run takes the lean LightGBM path.
+
+rolling:
+  refit: true
+  older_train_years: 3
+  sample_half_life_years: 1
+  sample_full_weight_years: 3
+
+task:
+  model:
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      early_stopping_rounds: 50
+      num_boost_round: 1000
+      learning_rate: 0.0421
+      colsample_bytree: 0.8879
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 8
+      num_leaves: 210
+      num_threads: 16
+      seed: 42
+  dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: DataHandlerLP
+        module_path: qlib.data.dataset.handler
+        kwargs:
+          instruments: sh_main
+          start_time: "2010-01-01"
+          end_time: "2013-12-31"
+          data_loader:
+            class: KunQuantDataLoader
+            module_path: rquant.qlib_ext.loader
+            kwargs:
+              factor_root: data/factors-sh_main
+              factor_set: jq240
+              horizon: 1d
+          infer_processors:
+            - class: ProcessInf
+              module_path: rquant.qlib_ext.processors
+            - class: ZScoreNorm
+              module_path: rquant.qlib_ext.processors
+              kwargs:
+                fit_start_time: "2010-01-01"
+                fit_end_time: "2012-12-27"
+            - class: Fillna
+              module_path: rquant.qlib_ext.processors
+          learn_processors:
+            - class: DropnaLabel
+              module_path: rquant.qlib_ext.processors
+            - class: CSZScoreNorm
+              module_path: qlib.data.dataset.processor
+              kwargs:
+                fields_group: label
+          process_type: append
+          drop_raw: true
+      segments:
+        train: ["2010-01-01", "2012-12-27"]
+        valid: ["2012-07-01", "2012-12-27"]
+        test: ["2013-01-01", "2013-12-31"]
+  record:
+    - class: SignalRecord
+      module_path: qlib.workflow.record_temp

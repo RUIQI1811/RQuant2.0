@@ -365,6 +365,31 @@ class FactorDeduplicationTests(unittest.TestCase):
         self.assertEqual(0.8, OAP_JQ_CNC_SELECTION.criteria["max_abs_rank_correlation"])
         self.assertFalse(OAP_JQ_CNC_SELECTION.criteria["returns_used"])
 
+    # Break caught: an oap_jq_cnc_ic module with a member outside its three libraries, a repeated member, a member
+    # under the |Rank IC| floor, or criteria that hide that returns picked it (in sample).
+    def test_locked_oap_jq_cnc_ic_members_pass_its_rank_ic_floor(self) -> None:
+        from rquant.factors.libraries.oap_jq_cnc_ic import OAP_JQ_CNC_IC_SELECTION, RANK_IC
+
+        registry = get_library_registry()
+        library_factors = {
+            spec.canonical_name
+            for source in OAP_JQ_CNC_IC_SELECTION.source_factor_sets
+            for library in registry.select(source)
+            for spec in library.specs
+        }
+        members = OAP_JQ_CNC_IC_SELECTION.canonical_names
+        criteria = OAP_JQ_CNC_IC_SELECTION.criteria
+        self.assertIs(OAP_JQ_CNC_IC_SELECTION, registry.selection("oap_jq_cnc_ic"))
+        self.assertEqual(("oap", "jq240", "china_chars"), OAP_JQ_CNC_IC_SELECTION.source_factor_sets)
+        self.assertGreater(len(members), 0)
+        self.assertEqual(len(members), len(set(members)))
+        self.assertTrue(set(members) <= library_factors)
+        self.assertEqual(set(members), set(RANK_IC))
+        self.assertTrue(all(abs(RANK_IC[name]) >= criteria["min_abs_rank_ic"] for name in members))
+        self.assertTrue(criteria["returns_used"])
+        self.assertTrue(criteria["in_sample"])
+        self.assertEqual("main", criteria["universe"])
+
 
 if __name__ == "__main__":
     unittest.main()

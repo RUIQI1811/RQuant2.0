@@ -39,6 +39,7 @@ import pandas as pd
 
 from rquant.errors import DataContractError
 from rquant.factors import statements
+from rquant.factors.daily_panels import daily_basic_panels
 from rquant.factors.extensions import kunquant_panel as k
 from rquant.factors.extensions.kunquant import kunquant_symbols
 from rquant.factors.libraries.base import FactorLibrary, FactorSpec
@@ -592,13 +593,10 @@ class ChinaCharsLibrary(FactorLibrary):
         daily_files = sorted(
             name for name in files if name.startswith("daily_basic/") and int(name.split("=")[1][:4]) in years
         )
-        columns = ["instrument", "datetime", *CHINA_CHARS_DAILY_BASIC]
-        daily = pd.concat([pd.read_parquet(root / name, columns=columns) for name in daily_files], ignore_index=True)
-        daily = daily[daily["instrument"].isin(set(instruments))]
-        inputs: dict[str, Any] = {}
-        for field, scale in CHINA_CHARS_DAILY_BASIC.items():
-            panel = daily.pivot(index="datetime", columns="instrument", values=field)
-            inputs[f"basic_{field}"] = panel.reindex(index=dates, columns=instruments) * scale
+        # Read file by file for the panel's instruments only, so the all-A daily_basic rows never sit in memory.
+        inputs: dict[str, Any] = daily_basic_panels(
+            [root / name for name in daily_files], CHINA_CHARS_DAILY_BASIC, dates, instruments
+        )
 
         factors = pd.read_parquet(root / "market_factors.parquet").set_index("datetime").sort_index()
         for name in MARKET_FACTORS:

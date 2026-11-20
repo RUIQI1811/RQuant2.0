@@ -825,6 +825,15 @@ def sh_main_codes(end):
     return sorted(code for code in get_Ashares(end) if code.startswith("60") and code.endswith(".SS"))  # noqa: F821
 
 
+def on_main_board(code):
+    """RQuant's ``main`` boards: Shanghai 60xxxx and Shenzhen 00xxxx (000-003, the former SME board included)."""
+    return (code.startswith("60") and code.endswith(".SS")) or (code.startswith("00") and code.endswith(".SZ"))
+
+
+def main_codes(end):
+    return sorted(code for code in get_Ashares(end) if on_main_board(code))  # noqa: F821
+
+
 def all_a_codes(end):
     return sorted(code for code in get_Ashares(end) if code.endswith(".SS") or code.endswith(".SZ"))  # noqa: F821
 
@@ -894,8 +903,10 @@ def _cacheable(dates):
     return set(dates[:-CACHE_RECENT_DAYS]) if len(dates) > CACHE_RECENT_DAYS else set()
 
 
-def valuation_panels(codes, dates, fields, log=print, cache=None):
+def valuation_panels(codes, dates, fields, log=print, cache=None, positive=True):
     """{field: dates x codes} from PTrade's daily valuation table; gaps take the stock's nearest known value.
+
+    ``positive=False`` keeps the values as PTrade gives them (zero, negative or missing), without filling gaps.
 
     ``cache`` (a dict kept between runs, as a live strategy left running does) holds the answers of earlier days, so a
     later run only asks for the days it has not seen.
@@ -939,7 +950,7 @@ def valuation_panels(codes, dates, fields, log=print, cache=None):
     panels = {}
     for field in fields:
         panel = pd.DataFrame(values[field]).T.reindex(index=dates, columns=codes)
-        panels[field] = panel.where(panel > 0).ffill().bfill()
+        panels[field] = panel.where(panel > 0).ffill().bfill() if positive else panel
     return panels
 
 
@@ -1123,7 +1134,7 @@ def build_inputs(end, days, log=print, codes=None, status_days=None, cache=None)
     dates = calendar[-days:]
     codes = list(codes) if codes is not None else sh_main_codes(end)
     every = all_a_codes(end)
-    log("inputs.codes", "%d sh_main, %d all-A" % (len(codes), len(every)))
+    log("inputs.codes", "%d to score, %d all-A" % (len(codes), len(every)))
     log("inputs.dates", "%s..%s (%d)" % (dates[0].date(), dates[-1].date(), len(dates)))
     panels = price_panels(codes, dates, end, calendar)
     log("inputs.bars_seconds", round(time.time() - began, 2))
@@ -1145,6 +1156,9 @@ def build_inputs(end, days, log=print, codes=None, status_days=None, cache=None)
     inputs["basic_circ_mv"] = raw_close * floats
     # Tushare's turnover_rate: traded shares / circulating shares, in percent.
     inputs["basic_turnover_rate"] = (raw_volume / floats.where(floats > 0) * 100.0).where(raw_close.notna())
+    # rquant.data.reference's turnover_total: traded shares / total shares, as a fraction (size_value_china).
+    inputs["basic_turnover_total"] = (raw_volume / total.where(total > 0)).where(raw_close.notna())
+    inputs["all_a"], inputs["listed"], inputs["calendar"] = every, opened, calendar
     first_year = max(2005, dates[0].year - FUNDAMENTAL_YEARS_BACK)
     key = ("fundamentals", tuple(codes), first_year, _day(end).year)
     kept = cache.get(key) if cache is not None else None
@@ -1383,12 +1397,16 @@ def ranked(scores):
     return scores.index[np.argsort(-scores.values, kind="mergesort")]
 
 
-def decide(scores, book, day, topk, n_drop):
+def decide(scores, book, day, topk, n_drop, exit_rank_pct=None):
     """Qlib TopkDropoutStrategy.generate_trade_decision for ``day``.
 
     ``scores`` is the previous trading day's prediction (a Series indexed by code); ``day`` holds the quotes the
     tradability checks and the sell simulation use. Ties in score are ordered by ``ranked``. Returns (sells, buys):
     sells and buys as (code, adjusted amount) in the order Qlib places them.
+
+    ``exit_rank_pct`` (e.g. 0.7) also sells every scored, tradable holding that ranks outside the top
+    ``exit_rank_pct`` of the day's scored stocks and replaces it, as RQuant's ScoreRulesMixin does in the backtest
+    (``report --exit-rank-pct``).
     """
     scores = scores.dropna()
 
@@ -1404,10 +1422,14 @@ def decide(scores, book, day, topk, n_drop):
     temp = book.copy()
     current = list(temp.amount)
     last = ranked(scores.reindex(current))
+    forced = []
+    if exit_rank_pct is not None:
+        rank = scores.rank(ascending=False, pct=True, method="max")
+        forced = [code for code in last if rank.get(code, 0.0) > exit_rank_pct and day.tradable(code)]
     others = ranked(scores[~scores.index.isin(last)])
-    today = first_n(others, n_drop + topk - len(last))
+    today = first_n(others, n_drop + len(forced) + topk - len(last))
     comb = ranked(scores.reindex(last.union(pd.Index(today))))
-    sell = last[last.isin(first_n(comb, n_drop, reverse=True))]
+    sell = last[last.isin(first_n(comb, n_drop, reverse=True)) | last.isin(forced)]
     buy = today[: len(sell) + topk - len(last)]
     sells = []
     for code in current:
@@ -1503,7 +1525,7 @@ def live_sell(C, plan, account, tag, auction=False):
     budget = max(0.0, min(cash, capital - value))
     rq_log('live.account', '%s cash %.2f holdings %d value %.2f budget %.2f at %s' % (masked(account), cash, len(held), value, budget, beijing_clock()[8:]))
     book = Book(budget, dict(((code, float(positions[code][0])) for code in held)), dict(((code, day.close[code]) for code in held)), dict(((code, 1 if positions[code][1] > 0 else 0) for code in held)))
-    sells, buys = decide(plan['scores'], book, day, LIVE_TOPK, LIVE_N_DROP)
+    sells, buys = decide(plan['scores'], book, day, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT)
     sold, sent, proceeds = (0.0, 0, 0.0)
     kept = dict(((code, positions[code][0]) for code in held))
     for code, shares in sells:
@@ -1604,8 +1626,9 @@ def live_buy(C, sold, account, tag):
 #   takes about 4 minutes instead of 8 (the first run after a start, about 20). It also plans at once when the trade
 #   is started, and at 09:10.
 # * LIVE_AUCTION_AT (09:21, again at 09:23 if the plan came late) decides like the backtest's TopkDropoutStrategy
-#   (top LIVE_TOPK, drop at most LIVE_N_DROP) against the real holdings and the previous close, and sends the sells at the limit-down price and the buys at
-#   most LIVE_AUCTION_BUY above the previous close, so the opening auction fills both at the open. Buys only use the
+#   (top LIVE_TOPK, drop at most LIVE_N_DROP, and also sell every holding ranked outside the top LIVE_EXIT_RANK_PCT
+#   of sh_main) against the real holdings and the previous close, and sends the sells at the limit-down price and the
+#   buys at most LIVE_AUCTION_BUY above the previous close, so the opening auction fills both at the open. Buys only use the
 #   cash on hand before the auction, so the account keeps about LIVE_N_DROP slots in cash for the next day.
 # * If the plan was not ready for the auction: sells at the first of LIVE_SELL_AT it is ready for and buys at the
 #   LIVE_BUY_AT a minute later, as marketable limit orders. Nothing is sent after 10:00.
@@ -1618,9 +1641,13 @@ def live_buy(C, sold, account, tag):
 # auction. Set it to False only after a dry run looks right. The account is the one the PTrade login trades; nothing
 # about it is written here.
 LIVE_DRY_RUN = True
+LIVE_UNIVERSE = "sh_main"  # the board the strategy scores and trades: "sh_main" (60xxxx) or "main" (60xxxx + 00xxxx)
 LIVE_CAPITAL = 0  # the most the strategy may hold (holdings at market plus cash); 0 = all its holdings and cash
 LIVE_TOPK = 30
 LIVE_N_DROP = 3
+# Also sell every holding ranked outside the top 70% of the day's scored sh_main stocks (backtest x70, 2026-11-18:
+# 2022+ at 200k 34.5% / Sharpe 1.17 against 32.7% / 1.12 without it; see docs/score-rules.md). None turns it off.
+LIVE_EXIT_RANK_PCT = 0.7
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SS"])
 LIVE_AUCTION = True
 LIVE_PLAN_AT = ("21:00", "08:00", "08:30", "09:00", "09:03", "09:06", "09:08", "09:12", "09:14", "09:16", "09:18",
@@ -1662,8 +1689,16 @@ def _where(exc):
     return "%s: %s at %s" % (type(exc).__name__, exc, " > ".join(spots[-5:]))
 
 
+def on_live_board(code):
+    return on_main_board(code) if LIVE_UNIVERSE == "main" else (code.startswith("60") and code.endswith(".SS"))
+
+
+def live_codes(end):
+    return main_codes(end) if LIVE_UNIVERSE == "main" else sh_main_codes(end)
+
+
 def managed(code):
-    return code.startswith("60") and code.endswith(".SS") and code not in LIVE_KEEP
+    return on_live_board(code) and code not in LIVE_KEEP
 
 
 def account_label():
@@ -1674,7 +1709,7 @@ def account_label():
 
 
 def read_account(account):
-    """(available cash, {code: (shares, sellable shares)}) for the strategy's sh_main codes."""
+    """(available cash, {code: (shares, sellable shares)}) for the strategy's board (LIVE_UNIVERSE)."""
     portfolio = _pt["context"].portfolio
     positions = {}
     for code, position in (portfolio.positions or {}).items():
@@ -1685,7 +1720,7 @@ def read_account(account):
 
 
 def sent_today():
-    """Today's orders in the account for sh_main stocks (any source), as get_all_orders lists them."""
+    """Today's orders in the account for the board's stocks (any source), as get_all_orders lists them."""
     rows = get_all_orders() or []  # noqa: F821
     return [row for row in rows if managed(str(row.get("symbol", "")))]
 
@@ -1737,8 +1772,8 @@ def previous_session(today):
 
 
 def session_bars_in(day, clock):
-    """Whether PTrade has the daily bars of ``day`` yet, from a sample of sh_main codes (one quick lookup)."""
-    codes = sh_main_codes(clock[:8])
+    """Whether PTrade has the daily bars of ``day`` yet, from a sample of the board's codes (one quick lookup)."""
+    codes = live_codes(clock[:8])
     sample = codes[::max(1, len(codes) // LIVE_BARS_SAMPLE)][:LIVE_BARS_SAMPLE]
     stamp = day.strftime("%Y%m%d")
     found = sum(1 for _, dates, _ in _bars(sample, ["close", "volume"], stamp, stamp, trading_calendar(clock[:8]))
@@ -1757,7 +1792,7 @@ def live_plan():
             rq_log("live.wait", "daily bars of %s not in yet (%d of %d sampled) at %s" % (
                 wanted.strftime("%Y%m%d"), found, asked, clock[8:12]))
             return None
-    inputs = build_inputs(clock[:8], LIVE_DAYS, rq_log, cache=_pt["cache"])
+    inputs = build_inputs(clock[:8], LIVE_DAYS, rq_log, codes=live_codes(clock[:8]), cache=_pt["cache"])
     listed = inputs["close"].index
     counts = inputs["close"].notna().sum(axis=1)
     rq_log("live.bars", ",".join("%s:%d" % (day.strftime("%Y%m%d"), counts[day]) for day in listed[-3:]))
@@ -1772,11 +1807,17 @@ def live_plan():
     if len(missing):
         rq_log("live.error", "daily bars of %s are missing" % ",".join(day.strftime("%Y%m%d") for day in missing))
         return None
-    scores = daily_scores(inputs, pd.DatetimeIndex([last]))[last]
-    rq_log("live.model", "%s year=%s" % (MODEL["run"], MODEL["prediction_year"]))
+    scores = plan_scores(inputs, last, clock)
     rq_log("live.top%d" % LIVE_TOPK, ",".join(to_rquant(code) for code in ranked(scores)[:LIVE_TOPK]))
     rq_log("live.plan_seconds", round(time.time() - began, 2))
     return {"date": last, "scores": scores, "st": inputs["quotes"]["st"], "made": clock[:8]}
+
+
+def plan_scores(inputs, last, clock):
+    """The scores the plan trades on: the jq240 window's for ``last`` (the main-board blend bundle replaces this)."""
+    scores = daily_scores(inputs, pd.DatetimeIndex([last]))[last]
+    rq_log("live.model", "%s year=%s" % (MODEL["run"], MODEL["prediction_year"]))
+    return scores
 
 
 def keep_plan(plan):
@@ -1873,7 +1914,7 @@ def rq_trade(context, mode):
     if not LIVE_DRY_RUN:
         orders = sent_today()
         if orders:
-            rq_log("live.skip", "the account already has %d sh_main orders today: no orders" % len(orders))
+            rq_log("live.skip", "the account already has %d %s orders today: no orders" % (len(orders), LIVE_UNIVERSE))
             _pt["done"] = g.rq_done = today  # noqa: F821
             return
     account = account_label()
@@ -1923,8 +1964,8 @@ def rq_after_open_buy(context):
 
 def initialize(context):
     _pt["context"] = context
-    rq_log("live", "start dry_run=%s auction=%s topk=%d n_drop=%d" % (LIVE_DRY_RUN, LIVE_AUCTION, LIVE_TOPK,
-                                                                      LIVE_N_DROP))
+    rq_log("live", "start dry_run=%s universe=%s auction=%s topk=%d n_drop=%d exit_rank_pct=%s" % (
+        LIVE_DRY_RUN, LIVE_UNIVERSE, LIVE_AUCTION, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT))
     for moment in LIVE_PLAN_AT:
         run_daily(context, rq_prepare, time=moment)  # noqa: F821
     for moment in LIVE_AUCTION_AT:

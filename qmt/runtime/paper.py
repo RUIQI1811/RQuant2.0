@@ -137,12 +137,16 @@ def ranked(scores):
     return scores.index[np.argsort(-scores.values, kind="mergesort")]
 
 
-def decide(scores, book, day, topk, n_drop):
+def decide(scores, book, day, topk, n_drop, exit_rank_pct=None):
     """Qlib TopkDropoutStrategy.generate_trade_decision for ``day``.
 
     ``scores`` is the previous trading day's prediction (a Series indexed by code); ``day`` holds the quotes the
     tradability checks and the sell simulation use. Ties in score are ordered by ``ranked``. Returns (sells, buys):
     sells and buys as (code, adjusted amount) in the order Qlib places them.
+
+    ``exit_rank_pct`` (e.g. 0.7) also sells every scored, tradable holding that ranks outside the top
+    ``exit_rank_pct`` of the day's scored stocks and replaces it, as RQuant's ScoreRulesMixin does in the backtest
+    (``report --exit-rank-pct``).
     """
     scores = scores.dropna()
 
@@ -158,10 +162,14 @@ def decide(scores, book, day, topk, n_drop):
     temp = book.copy()
     current = list(temp.amount)
     last = ranked(scores.reindex(current))
+    forced = []
+    if exit_rank_pct is not None:
+        rank = scores.rank(ascending=False, pct=True, method="max")
+        forced = [code for code in last if rank.get(code, 0.0) > exit_rank_pct and day.tradable(code)]
     others = ranked(scores[~scores.index.isin(last)])
-    today = first_n(others, n_drop + topk - len(last))
+    today = first_n(others, n_drop + len(forced) + topk - len(last))
     comb = ranked(scores.reindex(last.union(pd.Index(today))))
-    sell = last[last.isin(first_n(comb, n_drop, reverse=True))]
+    sell = last[last.isin(first_n(comb, n_drop, reverse=True)) | last.isin(forced)]
     buy = today[: len(sell) + topk - len(last)]
     sells = []
     for code in current:

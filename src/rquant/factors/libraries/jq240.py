@@ -41,6 +41,7 @@ import pandas as pd
 
 from rquant.data.contracts import FUNDAMENTAL_ENDPOINT_FIELDS
 from rquant.errors import DataContractError
+from rquant.factors.daily_panels import daily_basic_panels
 from rquant.factors.extensions import kunquant_jq240 as j
 from rquant.factors.extensions import kunquant_panel as k
 from rquant.factors.extensions.kunquant import kunquant_symbols
@@ -595,16 +596,10 @@ class JQ240Library(FactorLibrary):
         for name in daily_files:
             if sha256_file(root / name) != files[name]:
                 raise DataContractError(f"Reference file differs from its manifest: {root / name}")
-        columns = ["instrument", "datetime", *JQ240_DAILY_BASIC]
-        # Reading only the panel's instruments keeps the all-A daily_basic partitions out of memory.
-        wanted = [("instrument", "in", list(instruments))]
-        daily = pd.concat(
-            [pd.read_parquet(root / name, columns=columns, filters=wanted) for name in daily_files], ignore_index=True
+        # Read file by file for the panel's instruments only, so the all-A daily_basic rows never sit in memory.
+        inputs: dict[str, Any] = daily_basic_panels(
+            [root / name for name in daily_files], JQ240_DAILY_BASIC, dates, instruments
         )
-        inputs: dict[str, Any] = {}
-        for field, scale in JQ240_DAILY_BASIC.items():
-            panel = daily.pivot(index="datetime", columns="instrument", values=field)
-            inputs[f"basic_{field}"] = panel.reindex(index=dates, columns=instruments) * scale
 
         factors = pd.read_parquet(root / "market_factors.parquet").set_index("datetime").sort_index()
         inputs["mkt"] = factors["mkt"].reindex(dates)
