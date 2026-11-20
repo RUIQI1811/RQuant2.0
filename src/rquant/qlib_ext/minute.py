@@ -3,8 +3,10 @@
 - ``MinuteAshareExchange``: ``AshareExchange`` (commission minimum, dated stamp tax) whose quotes are the monthly
   minute files of ``rquant.data.minutes`` instead of Qlib feature bins. A price asked for a span longer than one bar
   (the daily strategy sizing its orders) is the span's first bar, the price known when the day's trading starts,
-  where Qlib would take the last one.
-- ``WindowTWAPStrategy``: Qlib's ``TWAPStrategy`` with its own time window for buys and for sells.
+  where Qlib would take the last one. A stock-day of ``fallback_codes`` with no minute bars gets two bars from the
+  daily data instead (the daily open at 09:30, the daily close at 14:59), listed in ``fallback_days``.
+- ``WindowTWAPStrategy``: Qlib's ``TWAPStrategy`` with its own time window for buys and for sells; an order on a
+  fallback stock-day trades whole at 09:30, the daily open, as the daily backtest does.
 - ``ZeroOrderSafeNestedExecutor``: Qlib's ``NestedExecutor`` with the trade indicator that stays defined on a day
   without orders, as ``ZeroOrderSafeSimulatorExecutor`` does for the daily executor.
 """
@@ -38,8 +40,12 @@ MINUTE_LIMITS = ("$limit_buy", "$limit_sell")
 class MinuteAshareExchange(AshareExchange):
     """A-share minute exchange reading ``<minute_root>/month=YYYYMM/bars.parquet``."""
 
-    def __init__(self, *args: Any, minute_root: str | Path, **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, minute_root: str | Path, fallback_codes: list[str] | None = None, **kwargs: Any
+    ) -> None:
         self.minute_root = Path(minute_root)
+        self.fallback_codes = sorted(set(fallback_codes or []))
+        self.fallback_days: set[tuple[str, Any]] = set()
         kwargs.setdefault("freq", "1min")
         kwargs.setdefault("deal_price", MINUTE_DEAL_PRICE)
         kwargs.setdefault("limit_threshold", MINUTE_LIMITS)
@@ -57,6 +63,16 @@ class MinuteAshareExchange(AshareExchange):
             end = end + pd.Timedelta(hours=23, minutes=59)
         codes = None if isinstance(self.codes, str) or not len(self.codes) else list(self.codes)
         quotes = load_minute_quotes(self.minute_root, start, end, codes)
+        if self.fallback_codes:
+            fallback = daily_fallback_bars(self.fallback_codes, start, end, quotes)
+            if len(fallback):
+                days = pd.to_datetime(fallback["datetime"]).dt.normalize()
+                self.fallback_days = set(zip(fallback["instrument"], days, strict=True))
+                quotes = (
+                    pd.concat([quotes, fallback.astype(quotes.dtypes.to_dict())], ignore_index=True)
+                    if len(quotes)
+                    else fallback
+                )
         if quotes.empty:
             raise DataContractError(f"No minute bars between {start} and {end} under {self.minute_root}")
         self.codes = sorted(quotes["instrument"].unique())
@@ -93,6 +109,66 @@ class MinuteAshareExchange(AshareExchange):
         return valid.iloc[0]
 
 
+def daily_fallback_bars(codes: list[str], start: Any, end: Any, minute_quotes: Any) -> Any:
+    """Two minute bars per stock-day of ``codes`` that trades on the day but has no minute bars in ``minute_quotes``:
+    09:30 at the adjusted daily open with the daily open-limit flags (what the daily backtest trades at), and 14:59
+    at the adjusted daily close (what the day is valued at), flagged untradeable. Needs ``qlib.init`` with a daily
+    provider."""
+    import pandas as pd
+    from qlib.data import D
+
+    from rquant.data.minutes import MINUTE_FIELDS
+
+    columns = ["instrument", "datetime", *MINUTE_FIELDS]
+    daily = D.features(
+        list(codes),
+        ["$open", "$close", "$volume", "$factor", "$limit_buy", "$limit_sell"],
+        start_time=pd.Timestamp(start).normalize(),
+        end_time=pd.Timestamp(end).normalize(),
+        freq="day",
+    )
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=columns)
+    daily.columns = ["open", "close", "volume", "factor", "limit_buy", "limit_sell"]
+    daily = daily.reset_index()
+    daily = daily[daily["open"].notna() & daily["close"].notna() & daily["volume"].fillna(0).gt(0)]
+    if len(minute_quotes):
+        covered = minute_quotes[["instrument", "datetime"]].copy()
+        covered["datetime"] = pd.to_datetime(covered["datetime"]).dt.normalize()
+        covered = covered.drop_duplicates()
+        daily = daily.merge(covered, on=["instrument", "datetime"], how="left", indicator=True)
+        daily = daily[daily["_merge"] == "left_only"].drop(columns="_merge")
+    if daily.empty:
+        return pd.DataFrame(columns=columns)
+    day = pd.to_datetime(daily["datetime"]).dt.normalize()
+    bars = []
+    for label, price, buy_flag, sell_flag in (
+        ("09:30", daily["open"], daily["limit_buy"].fillna(1).astype(bool), daily["limit_sell"].fillna(1).astype(bool)),
+        ("14:59", daily["close"], True, True),
+    ):
+        hours, minutes = (int(part) for part in label.split(":"))
+        bars.append(
+            pd.DataFrame(
+                {
+                    "instrument": daily["instrument"].to_numpy(),
+                    "datetime": (day + pd.Timedelta(hours=hours, minutes=minutes)).to_numpy(),
+                    "open": price.to_numpy(),
+                    "high": price.to_numpy(),
+                    "low": price.to_numpy(),
+                    "close": price.to_numpy(),
+                    "vwap": price.to_numpy(),
+                    "volume": (daily["volume"] / 2).to_numpy(),
+                    "amount": (daily["volume"] / 2 * price).to_numpy(),
+                    "factor": daily["factor"].to_numpy(),
+                    "change": float("nan"),
+                    "limit_buy": buy_flag if isinstance(buy_flag, bool) else buy_flag.to_numpy(),
+                    "limit_sell": sell_flag if isinstance(sell_flag, bool) else sell_flag.to_numpy(),
+                }
+            )
+        )
+    return pd.concat(bars, ignore_index=True)[columns]
+
+
 def parse_window(text: str) -> tuple[time, time]:
     """``"09:30-10:00"`` to its first and last minute bar labels (both inclusive)."""
     try:
@@ -121,12 +197,14 @@ class WindowTWAPStrategy(_TWAPStrategy):  # type: ignore[misc,valid-type]
         self.sell_window = parse_window(sell_window)
         super().__init__(**kwargs)
 
-    def _window_index(self, direction: Any) -> tuple[int, int]:
+    def _window_index(self, direction: Any, stock_id: str = "") -> tuple[int, int]:
         import pandas as pd
         from qlib.backtest.decision import Order
 
         start, end = self.sell_window if direction == Order.SELL else self.buy_window
         day = pd.Timestamp(self.trade_calendar.get_step_time(0)[0]).normalize()
+        if (stock_id, day) in getattr(self.trade_exchange, "fallback_days", ()):
+            start = end = time(9, 30)
         first = day + pd.Timedelta(hours=start.hour, minutes=start.minute)
         last = day + pd.Timedelta(hours=end.hour, minutes=end.minute)
         return self.trade_calendar.get_range_idx(first, last)
@@ -145,7 +223,7 @@ class WindowTWAPStrategy(_TWAPStrategy):  # type: ignore[misc,valid-type]
         trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
         order_list = []
         for order in self.outer_trade_decision.get_decision():
-            start_idx, end_idx = self._window_index(order.direction)
+            start_idx, end_idx = self._window_index(order.direction, order.stock_id)
             if trade_step < start_idx or trade_step > end_idx:
                 continue
             if self.trade_exchange.check_stock_suspended(

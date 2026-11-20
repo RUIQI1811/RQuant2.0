@@ -365,6 +365,75 @@ class IntradayPipelineTests(unittest.TestCase):
             self.assertAlmostEqual(account[day] / account[day - 1] - 1.0, net[day], places=6)
         self.assertIn("net_return", manifest["metrics"])
         self.assertIsNotNone(manifest["execution_vs_open_bp"]["buy"])
+        # The outer report books the inner trades' costs and turnover, and return - cost stays the net return.
+        self.assertFalse(trades["fallback"].any())
+        previous = portfolio["account"].shift(1).fillna(100_000.0)
+        self.assertAlmostEqual(float(trades["cost"].sum()), float((portfolio["cost"] * previous).sum()), places=4)
+        self.assertAlmostEqual(float(trades["value"].sum()), float((portfolio["turnover"] * previous).sum()), places=2)
+        self.assertGreater(float(portfolio["cost"].iloc[1]), 0.0)  # the first buy, on 2020-01-31
+
+    def test_starts_from_daily_book_and_falls_back_to_daily_bars(self) -> None:
+        pd = self.pd
+        from rquant.workflow.intraday import IntradayBacktestRunner, IntradayConfig
+
+        run = self.root / "run"
+        self._predictions(run)
+        # Minute bars only for the top-ranked stock: SZ000001 on 2020-01-31, SZ000002 from 2020-02-03.
+        plan = plan_minute_requests(pd.read_parquet(run / "predictions.parquet"), pd.to_datetime(DAYS), top=1)
+        collector = TushareCollector(self.raw, client=FakeTushare(), max_requests_per_minute=1000)
+        sync_minutes(collector, monthly_requests(plan))
+        MinuteBarBuilder(self.raw, self.canonical, self.minutes).build()
+        daily = pd.read_parquet(self.canonical / "bars").set_index(["instrument", "datetime"])
+
+        def bar(instrument: str, day: str, field: str) -> float:
+            return float(daily.loc[(instrument, pd.Timestamp(day)), field])
+
+        # The daily book holds 1,000 shares of SZ000001 and 50,000 cash at the close of 2020-01-31.
+        factor = bar("SZ000001", "2020-01-31", "factor")
+        amount = 1000.0 / factor
+        close = bar("SZ000001", "2020-01-31", "close")  # canonical prices are adjusted
+        value = 50_000.0 + amount * close
+        pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(["2020-01-30", "2020-01-31", "2020-01-31"]),
+                "instrument": ["SZ000001", "SZ000001", "SZ000002"],
+                "adjusted_amount": [amount, amount, 0.0],
+            }
+        ).iloc[:2].to_parquet(run / "positions.parquet", index=False)
+        pd.DataFrame(
+            {"datetime": pd.to_datetime(["2020-01-30", "2020-01-31"]), "cash": [50_000.0] * 2, "account": [value] * 2}
+        ).to_parquet(run / "portfolio.parquet", index=False)
+
+        output = self.root / "intraday-start"
+        manifest = IntradayBacktestRunner(
+            qlib_root=self.qlib,
+            minute_root=self.minutes,
+            run_directory=run,
+            output_directory=output,
+            config=IntradayConfig(
+                initial_capital=1.0,
+                topk=1,
+                n_drop=1,
+                buy_window="09:31-09:32",
+                sell_window="09:30-09:31",
+                start="2020-02-03",
+            ),
+        ).run()
+        self.assertEqual({"date": "2020-01-31", "value": value, "holdings": 1}, manifest["start_book"])
+        trades = pd.read_parquet(output / "trades.parquet")
+        sell = trades.iloc[0]
+        self.assertEqual(
+            ("SZ000001", "sell", pd.Timestamp("2020-02-03")), tuple(sell[["instrument", "direction", "datetime"]])
+        )
+        # No minute bars for SZ000001 on 2020-02-03: the whole sell deals at the daily open.
+        self.assertTrue(bool(sell["fallback"]))
+        self.assertAlmostEqual(bar("SZ000001", "2020-02-03", "open"), float(sell["price"]), places=5)
+        self.assertAlmostEqual(1.0, float(sell["fill_rate"]))
+        self.assertEqual(1, manifest["fallback_trades"])
+        self.assertEqual(1, manifest["execution_vs_open_bp"]["buy"]["trades"])
+        portfolio = pd.read_parquet(output / "portfolio.parquet")
+        first = portfolio.iloc[0]
+        self.assertAlmostEqual(float(first["account"]) / value - 1.0, float(first["return"] - first["cost"]), places=6)
 
 
 if __name__ == "__main__":

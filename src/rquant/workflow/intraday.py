@@ -11,6 +11,15 @@ orders, so nothing bought is sold the same day.
 The minute quotes of a whole run do not fit in memory, so the backtest runs one calendar month at a time and carries
 cash, holdings, their last prices and holding days into the next month. Orders are sized at the first bar of the day
 (the daily backtest sizes them at the open).
+
+With a ``start`` date the book starts from the daily backtest's holdings and cash of the day before (the run's
+``positions.parquet`` and ``portfolio.parquet``), so both books hold the same stocks and the minute bars planned from
+the daily book cover the intraday one. A stock-day that still has no minute bars trades whole at the daily open and is
+valued at the daily close (``MinuteAshareExchange`` fallback bars); ``intraday.json`` counts such days and trades.
+
+Qlib's nested executor books costs and turnover in the inner account only, so the outer daily report carries net
+returns with zero cost; ``cost`` and ``turnover`` are refilled from the trades and ``return`` restored to the gross
+return, so ``return - cost`` is the net return as in ``rquant report``.
 """
 
 from __future__ import annotations
@@ -42,6 +51,8 @@ class IntradayConfig:
     sell_window: str = "09:30-09:59"
     start: str | None = None
     end: str | None = None
+    # Start from the daily backtest's book on the day before ``start`` (needs ``start`` and the run's report files).
+    start_from_daily: bool = True
 
     def __post_init__(self) -> None:
         if self.topk < 1 or not 1 <= self.n_drop <= self.topk:
@@ -117,13 +128,31 @@ class IntradayBacktestRunner:
         )
 
         account: Any = float(self.config.initial_capital)
+        previous_value: float | None = None
+        start_book = None
+        if self.config.start is not None and self.config.start_from_daily:
+            start_book = _daily_book(D, pd, self.run_directory, days[0])
+            if start_book is not None:
+                account, previous_value = start_book["account"], start_book["value"]
+                self.log(
+                    f"starting from the daily book of {start_book['date']}: {len(account) - 1} holdings, "
+                    f"value {previous_value:,.0f}"
+                )
+            else:
+                self.log("warning: no daily book before the start in the run's report files; starting from cash")
+        universe = predictions[["datetime", "instrument"]]
         reports, holdings, trades, uncovered = [], [], [], []
         for number, month in enumerate(months):
             month_days = days[days.to_period("M") == month]
             start, end = month_days[0], month_days[-1]
             final = number == len(months) - 1
+            window = universe[(universe["datetime"] >= start - pd.Timedelta(days=15)) & (universe["datetime"] <= end)]
+            fallback_codes = set(window["instrument"]) | (
+                set(account) - {"cash"} if isinstance(account, dict) else set()
+            )
             exchange = MinuteAshareExchange(
                 minute_root=self.minute_root,
+                fallback_codes=sorted(fallback_codes),
                 start_time=start,
                 end_time=end,
                 codes=[],
@@ -155,8 +184,9 @@ class IntradayBacktestRunner:
                 exchange_kwargs={"exchange": exchange},
             )
             report, positions = portfolio["1day"]
-            if reports:
-                report = _rebase_first_day(report, float(reports[-1]["account"].iloc[-1]), carried_cash)
+            if previous_value is not None:
+                report = _rebase_first_day(report, previous_value, carried_cash)
+            previous_value = float(report["account"].iloc[-1])
             reports.append(report)
             holdings.append(_holdings(pd, positions, exchange))
             trades.append(_trades(pd, indicators["1day"][1], exchange))
@@ -164,14 +194,17 @@ class IntradayBacktestRunner:
             last = positions[max(positions)]
             account = _carry(last)
             self.log(
-                f"{month}: account {float(report['account'].iloc[-1]):,.0f}, "
-                f"{len(exchange.codes)} instruments with minute bars"
+                f"{month}: account {previous_value:,.0f}, "
+                f"{len(exchange.codes) - len({code for code, _ in exchange.fallback_days})}+ instruments with minute "
+                f"bars, {len(exchange.fallback_days)} stock-days on daily fallback bars"
             )
 
         report = pd.concat(reports).sort_index()
         report = report[~report.index.duplicated(keep="last")]
-        holdings_frame = pd.concat(holdings, ignore_index=True)
         trades_frame = _with_open_slippage(D, pd, pd.concat(trades, ignore_index=True))
+        initial_value = start_book["value"] if start_book is not None else float(self.config.initial_capital)
+        report = _with_trade_costs(pd, report, trades_frame, initial_value)
+        holdings_frame = pd.concat(holdings, ignore_index=True)
         self.output_directory.mkdir(parents=True, exist_ok=True)
         portfolio_path = self.output_directory / "portfolio.parquet"
         report.reset_index().to_parquet(portfolio_path, index=False)
@@ -194,12 +227,26 @@ class IntradayBacktestRunner:
                 "limits": "bar raw close at the daily up / down limit blocks buys / sells in that bar",
                 "t_plus_one": "outer TopkDropoutStrategy hold_thresh=1; the inner level only executes daily orders",
                 "unfilled": "a slice that cannot trade rolls into later bars of the window; leftovers lapse",
+                "no_minute_bars": "the stock-day trades whole at the daily open and is valued at the daily close",
             },
+            "start_book": (
+                {"date": start_book["date"], "value": start_book["value"], "holdings": len(start_book["account"]) - 1}
+                if start_book is not None
+                else None
+            ),
+            "holding_days": len(holdings_frame),
             "rows": len(report),
             "trade_rows": len(trades_frame),
             "uncovered_holding_days": len(uncovered),
+            "uncovered_share": len(uncovered) / len(holdings_frame) if len(holdings_frame) else None,
             "uncovered_examples": uncovered[:20],
-            "execution_vs_open_bp": _slippage_summary(trades_frame),
+            "fallback_trades": int(trades_frame["fallback"].sum()) if len(trades_frame) else 0,
+            "fallback_trade_value_share": _finite(
+                trades_frame.loc[trades_frame["fallback"], "value"].sum() / trades_frame["value"].sum()
+            )
+            if len(trades_frame)
+            else None,
+            "execution_vs_open_bp": _slippage_summary(trades_frame[~trades_frame["fallback"]]),
             "metrics_definition": METRICS_DEFINITION,
             "metrics": risk_metrics(risk_analysis, report),
             "artifacts": {
@@ -275,6 +322,7 @@ def _trades(pd: Any, indicator: Any, exchange: Any) -> Any:
                 continue
             ordered = metrics["amount"].get(instrument)
             factor = _factor(pd, exchange, instrument, timestamp)
+            day = pd.Timestamp(timestamp).normalize()
             rows.append(
                 {
                     "datetime": pd.Timestamp(timestamp).normalize(),
@@ -286,6 +334,7 @@ def _trades(pd: Any, indicator: Any, exchange: Any) -> Any:
                     "price": float(metrics["trade_price"].get(instrument)),
                     "value": abs(float(metrics["trade_value"].get(instrument))),
                     "cost": float(metrics["trade_cost"].get(instrument)),
+                    "fallback": (instrument, day) in exchange.fallback_days,
                 }
             )
     columns = [
@@ -298,19 +347,85 @@ def _trades(pd: Any, indicator: Any, exchange: Any) -> Any:
         "price",
         "value",
         "cost",
+        "fallback",
     ]
-    return pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame(rows, columns=columns).astype({"fallback": bool})
 
 
 def _uncovered(pd: Any, positions: dict[Any, Any], exchange: Any) -> list[str]:
-    """Holdings with no minute bar on a day they were held: priced at their last close and impossible to sell."""
+    """Holdings with no minute bar on a day they were held: on daily fallback bars, or (suspended) on no bar at all."""
     missing = []
     for timestamp, position in sorted(positions.items()):
         start, end = _day_span(pd, timestamp)
         for stock in position.get_stock_list():
-            if exchange.quote.get_data(stock, start, end, "$close", method="ts_data_last") is None:
+            if (stock, start) in exchange.fallback_days:
                 missing.append(f"{start:%Y-%m-%d} {stock}")
+            elif exchange.quote.get_data(stock, start, end, "$close", method="ts_data_last") is None:
+                missing.append(f"{start:%Y-%m-%d} {stock} (no bar)")
     return missing
+
+
+def _daily_book(D: Any, pd: Any, run_directory: Path, first_day: Any) -> dict[str, Any] | None:
+    """The daily backtest's cash and holdings at the close of the trading day before ``first_day``, as a Qlib account
+    dict with adjusted prices and holding days, or None when the run has no report files for that day."""
+    positions_path = run_directory / "positions.parquet"
+    portfolio_path = run_directory / "portfolio.parquet"
+    if not positions_path.exists() or not portfolio_path.exists():
+        return None
+    portfolio = pd.read_parquet(portfolio_path)
+    portfolio["datetime"] = pd.to_datetime(portfolio["datetime"])
+    before = portfolio[portfolio["datetime"] < pd.Timestamp(first_day)]
+    if before.empty or "cash" not in before.columns:
+        return None
+    row = before.iloc[-1]
+    date = row["datetime"]
+    positions = pd.read_parquet(positions_path, columns=["datetime", "instrument", "adjusted_amount"])
+    positions["datetime"] = pd.to_datetime(positions["datetime"])
+    held = positions[positions["datetime"] == date]
+    account: dict[str, Any] = {"cash": float(row["cash"])}
+    if len(held):
+        closes = D.features(sorted(held["instrument"]), ["$close"], start_time=date, end_time=date, freq="day")
+        closes = (
+            closes.reset_index().set_index("instrument")["$close"] if closes is not None else pd.Series(dtype=float)
+        )
+        history = positions[positions["datetime"] <= date]
+        dates = sorted(history["datetime"].unique())
+        index = {day: number for number, day in enumerate(dates)}
+        for stock, rows in history[history["instrument"].isin(held["instrument"])].groupby("instrument"):
+            numbers = sorted(index[day] for day in rows["datetime"])
+            count = 1
+            while len(numbers) > count and numbers[-1 - count] == numbers[-1] - count:
+                count += 1
+            amount = float(held.loc[held["instrument"] == stock, "adjusted_amount"].iloc[0])
+            price = float(closes.get(stock, float("nan")))
+            if amount <= 1e-12 or price != price:
+                continue
+            account[stock] = {"amount": amount, "price": price, "count_day": count}
+    value = float(row["account"]) if "account" in before.columns else float("nan")
+    return {"account": account, "value": value, "date": f"{date:%Y-%m-%d}"}
+
+
+def _with_trade_costs(pd: Any, report: Any, trades: Any, initial_value: float) -> Any:
+    """Refill the daily ``cost`` / ``turnover`` rates (and totals) from the trades and make ``return`` gross again;
+    the nested executor's outer report has the costs inside its (net) return and books none."""
+    report = report.copy()
+    index = pd.DatetimeIndex(report.index)
+    if len(trades):
+        daily = trades.groupby(pd.to_datetime(trades["datetime"]).dt.normalize())[["cost", "value"]].sum()
+    else:
+        daily = pd.DataFrame(columns=["cost", "value"], dtype=float)
+    daily = daily.reindex(index.normalize()).fillna(0.0)
+    previous = report["account"].shift(1).fillna(initial_value).to_numpy()
+    cost = daily["cost"].to_numpy() / previous
+    turnover = daily["value"].to_numpy() / previous
+    report["return"] = report["return"].to_numpy() - report["cost"].to_numpy() + cost
+    report["cost"] = cost
+    report["turnover"] = turnover
+    if "total_cost" in report.columns:
+        report["total_cost"] = daily["cost"].cumsum().to_numpy()
+    if "total_turnover" in report.columns:
+        report["total_turnover"] = daily["value"].cumsum().to_numpy()
+    return report
 
 
 def _rebase_first_day(report: Any, previous_account: float, initial_cash: float) -> Any:

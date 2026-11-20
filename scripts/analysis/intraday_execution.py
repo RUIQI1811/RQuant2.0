@@ -62,6 +62,13 @@ def _plan(args: argparse.Namespace, paths: dict[str, Path]) -> pd.DataFrame:
     trades = pd.read_parquet(run / "trades.parquet") if (run / "trades.parquet").exists() else None
     if positions is None:
         print("warning: no positions.parquet in the run; planning from predictions alone", file=sys.stderr)
+    # Books of earlier intraday backtests: their holdings and trades, to fetch the minute bars they fell back on.
+    for book in args.book or []:
+        book = Path(book)
+        extra_positions = pd.read_parquet(book / "positions.parquet", columns=["datetime", "instrument"])
+        extra_trades = pd.read_parquet(book / "trades.parquet", columns=["datetime", "instrument"])
+        positions = extra_positions if positions is None else pd.concat([positions, extra_positions], ignore_index=True)
+        trades = extra_trades if trades is None else pd.concat([trades, extra_trades], ignore_index=True)
     plan = plan_minute_requests(
         predictions,
         _calendar(paths),
@@ -103,6 +110,9 @@ def main() -> None:
         command.add_argument("--start", default="2020-01-01")
         command.add_argument("--end", default=None)
         command.add_argument("--max-requests-per-minute", type=int, default=190)
+        command.add_argument(
+            "--book", action="append", help="an intraday backtest output dir whose holdings and trades to cover too"
+        )
         if name == "sync":
             command.add_argument("--workers", type=int, default=4)
             command.add_argument("--limit", type=int, default=None, help="fetch only the first N requests (a trial)")
@@ -117,6 +127,9 @@ def main() -> None:
     backtest.add_argument("--start", default=None)
     backtest.add_argument("--end", default=None)
     backtest.add_argument("--output", default=None, help="default <run>/intraday/<label>")
+    backtest.add_argument(
+        "--from-empty", action="store_true", help="start with cash only instead of the daily book of the day before"
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -149,6 +162,7 @@ def main() -> None:
             sell_window=args.sell_window,
             start=args.start,
             end=args.end,
+            start_from_daily=not args.from_empty,
         )
         run = Path(args.run)
         output = Path(args.output) if args.output else run / "intraday" / config.label
@@ -169,7 +183,11 @@ def main() -> None:
                     "information_ratio": net.get("information_ratio"),
                     "max_drawdown": net.get("max_drawdown"),
                     "execution_vs_open_bp": manifest["execution_vs_open_bp"],
+                    "start_book": manifest["start_book"],
                     "uncovered_holding_days": manifest["uncovered_holding_days"],
+                    "uncovered_share": manifest["uncovered_share"],
+                    "fallback_trades": manifest["fallback_trades"],
+                    "fallback_trade_value_share": manifest["fallback_trade_value_share"],
                 },
                 indent=2,
             )
