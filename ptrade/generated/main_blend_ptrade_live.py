@@ -1921,12 +1921,13 @@ def all_a_daily(codes, days, end, calendar, cache=None):
     return panels
 
 
-def ch4_factor_returns(inputs, end, log=print, cache=None):
+def ch4_factor_returns(inputs, end, log=print, cache=None, date=None):
     """Daily CH-3/CH-4 factor returns (columns CH4_FACTORS and ch4_stocks) over the last CH4_STREAM_DAYS sessions up
-    to the inputs' last day, from PTrade's all-A bars and valuation table."""
+    to ``date`` (default the inputs' last day), from PTrade's all-A bars and valuation table. A live morning's inputs
+    end on today, which has no bars yet, so the live strategy passes the day it scores."""
     began = time.time()
     calendar, every, listed = inputs["calendar"], inputs["all_a"], inputs["listed"]
-    last = calendar.searchsorted(inputs["close"].index[-1])
+    last = calendar.searchsorted(inputs["close"].index[-1] if date is None else date)
     days = calendar[max(0, last - CH4_STREAM_DAYS + 1):last + 1]
     daily = all_a_daily(every, days, end, calendar, cache)
     codes = daily["close"].columns
@@ -1952,9 +1953,11 @@ def ch4_factor_returns(inputs, end, log=print, cache=None):
     return factors
 
 
-def svc_inputs(inputs, factors):
-    """size_value_china's input dict over the last SVC_DAYS rows of the jq240 inputs (the same stocks)."""
-    tail = inputs["close"].index[-SVC_DAYS:]
+def svc_inputs(inputs, factors, date=None):
+    """size_value_china's input dict over the last SVC_DAYS rows of the jq240 inputs (the same stocks) up to ``date``
+    (default the inputs' last day)."""
+    index = inputs["close"].index
+    tail = (index if date is None else index[index <= date])[-SVC_DAYS:]
     result = {
         "close": inputs["close"].reindex(tail),
         "basic_total_mv": inputs["cap"].reindex(tail) / 1e4,
@@ -1989,14 +1992,15 @@ def blend_scores(members):
 
 
 def main_blend_scores(inputs, date, end, log=print, cache=None):
-    """(blend, jq240 scores, size_value_china scores) of the day's universe on ``date`` (the inputs' last day)."""
+    """(blend, jq240 scores, size_value_china scores) of the day's universe on ``date`` (the last day with bars)."""
     began = time.time()
     member = inputs["universe"].loc[date]
     codes = sorted(code for code, inside in zip(member.index, member.values) if inside)
     jq = daily_scores(inputs, pd.DatetimeIndex([date]))[date]
     log("svc.jq240_seconds", round(time.time() - began, 2))
-    factors = ch4_factor_returns(inputs, end, log, cache)
-    svc = model_scores(SVC_MODEL, svc_features(svc_inputs(inputs, factors), date, SVC_MODEL["features"], codes), codes)
+    factors = ch4_factor_returns(inputs, end, log, cache, date)
+    svc = model_scores(SVC_MODEL, svc_features(svc_inputs(inputs, factors, date), date, SVC_MODEL["features"], codes),
+                       codes)
     log("svc.models", "%s year=%s trees=%d + %s year=%s trees=%d" % (
         MODEL["run"], MODEL["prediction_year"], len(MODEL["trees"]), SVC_MODEL["run"], SVC_MODEL["prediction_year"],
         len(SVC_MODEL["trees"])))
@@ -2040,7 +2044,7 @@ LIVE_N_DROP = 5
 # 2022+ at 200k 34.5% / Sharpe 1.17 against 32.7% / 1.12 without it; see docs/score-rules.md). None turns it off.
 LIVE_EXIT_RANK_PCT = None
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SS"])
-LIVE_AUCTION = True
+LIVE_AUCTION = False
 LIVE_PLAN_AT = ("21:00", "08:00", "08:30", "09:00", "09:03", "09:06", "09:08", "09:12", "09:14", "09:16", "09:18",
                 "09:20", "09:22", "09:25", "09:28", "09:35", "09:42")  # each run plans only if still needed
 LIVE_AUCTION_AT = ("09:21", "09:23")  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
@@ -2053,7 +2057,7 @@ LIVE_SLIP = 0.01  # after the open: limit price offset from the last price; capp
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
 LIVE_FILL_MAX = 1.3  # idle cash tops today's buys up lot by lot, to at most this many slots each
 LIVE_TOPUP = False  # False: only today's new buys get the idle cash; True: held names are topped up too
-LIVE_FIRST_LOT_MAX = 1.5  # a new name whose one lot is above a slot is still bought if the lot is under this
+LIVE_FIRST_LOT_MAX = 2.5  # a new name whose one lot is above a slot is still bought if the lot is under this
 LIVE_TOPUP_MIN = 0.2  # top-ups of a held name under this many slots are not sent (5 yuan minimum commission)
 LIVE_DAYS = 1100  # trading days of history the factors are computed on (as the QMT strategy)
 LIVE_TAG = "[RQ]"

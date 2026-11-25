@@ -122,13 +122,13 @@ class Market:
         return pd.DataFrame(rows).set_index("datetime")
 
 
-def _run_ch4(names: dict, market: Market, end: pd.Timestamp, cache: dict | None) -> pd.DataFrame:
+def _run_ch4(names: dict, market: Market, end: pd.Timestamp, cache: dict | None, date=None) -> pd.DataFrame:
     for name in ("get_trade_days", "get_Ashares", "get_stock_info", "get_price", "get_fundamentals"):
         names[name] = getattr(market, name)
     calendar = names["trading_calendar"](end.strftime("%Y%m%d"))
     stub = {"calendar": calendar, "all_a": list(market.codes), "listed": names["listing_dates"](market.codes),
             "close": pd.DataFrame(index=calendar[-300:])}
-    return names["ch4_factor_returns"](stub, end.strftime("%Y%m%d"), log=lambda *args: None, cache=cache)
+    return names["ch4_factor_returns"](stub, end.strftime("%Y%m%d"), log=lambda *args: None, cache=cache, date=date)
 
 
 # Break caught: CH-4 factor returns built from PTrade data that drift from the builder RQuant trains on (a day's
@@ -167,6 +167,17 @@ def test_ch4_adapter_reuses_the_cache_and_matches_a_cold_run() -> None:
 
 
 # Break caught: the bundle's rewrite of the size_value_china reference changing what it computes.
+# Break caught: a live morning (inputs end on today, which has no bars yet) streaming the CH-4 factors up to today, so
+# the day it scores is not the stream's last and the stream starts a day late (2026-11-25: ch4_last 20261125, all NaN).
+def test_ch4_stops_at_the_scored_day() -> None:
+    names = namespace()
+    market = Market()
+    scored = market.calendar[-2]
+    ours = _run_ch4(names, market, market.calendar[-1], None, date=scored)
+    pd.testing.assert_frame_equal(ours, _run_ch4(names, market, scored, None))
+    assert ours.index[-1] == scored
+
+
 def test_bundled_size_value_china_matches_the_reference() -> None:
     names = namespace()
     rng = np.random.default_rng(3)
@@ -198,6 +209,9 @@ def test_svc_inputs_use_tushare_daily_basic_units() -> None:
     assert len(inputs["close"]) == names["SVC_DAYS"]
     pd.testing.assert_frame_equal(inputs["basic_total_mv"], panel.iloc[-names["SVC_DAYS"]:] * 100.0)
     assert inputs["ch4_pmo"].index.equals(inputs["close"].index)
+    morning = names["svc_inputs"]({"close": panel, "cap": panel * 1e6, "basic_pe_ttm": panel,
+                                   "basic_turnover_total": panel / 100}, factors, dates[-2])
+    assert morning["close"].index[-1] == dates[-2] and len(morning["close"]) == names["SVC_DAYS"]
 
 
 # Break caught: a live blend that weighs one model by its score scale, or keeps stocks only one model scores.
@@ -288,7 +302,7 @@ class BlendLive(ptl.Live):
 def test_live_bundle_settings_are_the_backtested_ones() -> None:
     source = build_main_blend.build_live()
     for line in ('LIVE_UNIVERSE = "main"', "LIVE_TOPK = 50", "LIVE_N_DROP = 5", "LIVE_EXIT_RANK_PCT = None",
-                 "LIVE_DRY_RUN = True"):
+                 "LIVE_DRY_RUN = True", "LIVE_AUCTION = False", "LIVE_FIRST_LOT_MAX = 2.5"):
         assert f"\n{line}" in source
     assert source.index("\ndef plan_scores(") < source.rindex("\ndef plan_scores(")  # main_live's comes last
 
@@ -298,6 +312,9 @@ def test_live_bundle_trades_shenzhen_main_board_on_the_blend() -> None:
     live.run("initialize", "20110701080000")
     live.run("rq_prepare", "20110701080000")
     live.run("rq_auction", "20110701092100")
+    assert not live.sent  # the plan is never ready for the auction: the blend trades after the open
+    live.run("rq_after_open_sell", "20110701093100")
+    live.run("rq_after_open_buy", "20110701093200")
     lines = live.lines()
     assert not any("error" in line for line in lines), lines[-8:]
     assert any(line.startswith("[RQ] live.top3=") and ".SZ" in line for line in lines)

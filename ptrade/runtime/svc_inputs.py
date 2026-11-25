@@ -51,12 +51,13 @@ def all_a_daily(codes, days, end, calendar, cache=None):
     return panels
 
 
-def ch4_factor_returns(inputs, end, log=print, cache=None):
+def ch4_factor_returns(inputs, end, log=print, cache=None, date=None):
     """Daily CH-3/CH-4 factor returns (columns CH4_FACTORS and ch4_stocks) over the last CH4_STREAM_DAYS sessions up
-    to the inputs' last day, from PTrade's all-A bars and valuation table."""
+    to ``date`` (default the inputs' last day), from PTrade's all-A bars and valuation table. A live morning's inputs
+    end on today, which has no bars yet, so the live strategy passes the day it scores."""
     began = time.time()
     calendar, every, listed = inputs["calendar"], inputs["all_a"], inputs["listed"]
-    last = calendar.searchsorted(inputs["close"].index[-1])
+    last = calendar.searchsorted(inputs["close"].index[-1] if date is None else date)
     days = calendar[max(0, last - CH4_STREAM_DAYS + 1):last + 1]
     daily = all_a_daily(every, days, end, calendar, cache)
     codes = daily["close"].columns
@@ -82,9 +83,11 @@ def ch4_factor_returns(inputs, end, log=print, cache=None):
     return factors
 
 
-def svc_inputs(inputs, factors):
-    """size_value_china's input dict over the last SVC_DAYS rows of the jq240 inputs (the same stocks)."""
-    tail = inputs["close"].index[-SVC_DAYS:]
+def svc_inputs(inputs, factors, date=None):
+    """size_value_china's input dict over the last SVC_DAYS rows of the jq240 inputs (the same stocks) up to ``date``
+    (default the inputs' last day)."""
+    index = inputs["close"].index
+    tail = (index if date is None else index[index <= date])[-SVC_DAYS:]
     result = {
         "close": inputs["close"].reindex(tail),
         "basic_total_mv": inputs["cap"].reindex(tail) / 1e4,
@@ -119,14 +122,15 @@ def blend_scores(members):
 
 
 def main_blend_scores(inputs, date, end, log=print, cache=None):
-    """(blend, jq240 scores, size_value_china scores) of the day's universe on ``date`` (the inputs' last day)."""
+    """(blend, jq240 scores, size_value_china scores) of the day's universe on ``date`` (the last day with bars)."""
     began = time.time()
     member = inputs["universe"].loc[date]
     codes = sorted(code for code, inside in zip(member.index, member.values) if inside)
     jq = daily_scores(inputs, pd.DatetimeIndex([date]))[date]
     log("svc.jq240_seconds", round(time.time() - began, 2))
-    factors = ch4_factor_returns(inputs, end, log, cache)
-    svc = model_scores(SVC_MODEL, svc_features(svc_inputs(inputs, factors), date, SVC_MODEL["features"], codes), codes)
+    factors = ch4_factor_returns(inputs, end, log, cache, date)
+    svc = model_scores(SVC_MODEL, svc_features(svc_inputs(inputs, factors, date), date, SVC_MODEL["features"], codes),
+                       codes)
     log("svc.models", "%s year=%s trees=%d + %s year=%s trees=%d" % (
         MODEL["run"], MODEL["prediction_year"], len(MODEL["trees"]), SVC_MODEL["run"], SVC_MODEL["prediction_year"],
         len(SVC_MODEL["trees"])))
