@@ -388,6 +388,18 @@ def test_live_bundle_plans_from_the_closing_snapshots_and_trades_the_auction() -
     assert live.g.rq_done == "20110704"
 
 
+# Break caught: a trade started (or the 21:00 run) after the close planning the day before from daily bars, so the
+# next morning waits for the bars again.
+def test_live_bundle_started_in_the_evening_plans_from_the_snapshots() -> None:
+    live = SnapshotBlendLive({})
+    live.run("initialize", "20110701210000")
+    live.run("rq_prepare", "20110701210000")
+    lines = live.lines()
+    assert not any("error" in line for line in lines), lines[-8:]
+    assert live.g.rq_plan["date"] == "20110701"
+    assert any(line.startswith("[RQ] live.snapshot_plan=20110701") for line in lines)
+
+
 def test_committed_main_blend_bundles_are_current() -> None:
     assert build_main_blend.PARITY_OUTPUT.read_text(encoding="ascii") == build_main_blend.build_parity()
     live = build_main_blend.LIVE_OUTPUT.read_text(encoding="ascii")

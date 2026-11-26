@@ -1890,22 +1890,36 @@ def latest_session(clock):
 
 
 def rq_prepare(context):
-    """Plan unless the plan in hand already scores the latest finished session (or another job is making one)."""
+    """Plan unless the plan in hand already scores the latest finished session (or another job is making one). With
+    LIVE_SNAPSHOT_AT, a run after the close of a trading day (those times, 21:00, or a start in the evening) plans
+    that day from its closing snapshots."""
     _pt["context"] = context
     if _pt["planning"]:
         return
+    clock = beijing_clock()
+    latest = latest_session(clock)
     plan = current_plan()
-    if plan is not None and plan["date"] == latest_session(beijing_clock()):
+    if plan is not None and plan["date"] == latest:
         return
     _pt["planning"] = True
     try:
+        snapped = False
+        if LIVE_SNAPSHOT_AT and latest is not None and latest == pd.Timestamp(clock[:8]):
+            bars = session_snapshot(latest)
+            if bars is not None:
+                SESSION_EXTRA.update(day=latest, bars=bars)
+                keep_snapshot_sample(latest, bars)
+                snapped = True
         made = live_plan()
         if made is not None:
             _pt["plan"] = made
             keep_plan(made)
+            if snapped and made["date"] == latest:
+                rq_log("live.snapshot_plan", "%s planned from the closing snapshots" % latest.strftime("%Y%m%d"))
     except Exception as exc:
         rq_log("live.error", _where(exc))
     finally:
+        SESSION_EXTRA.clear()
         _pt["planning"] = False
 
 
@@ -1974,30 +1988,9 @@ def keep_snapshot_sample(day, bars):
 
 
 def rq_session_close(context):
-    """After the close: plan the session that just ended from its closing snapshots (LIVE_SNAPSHOT_AT), so the next
-    morning's auction does not wait for the daily bars."""
-    _pt["context"] = context
-    clock = beijing_clock()
-    day = latest_session(clock)
-    if day is None or day != pd.Timestamp(clock[:8]) or _pt["planning"]:
-        return  # not a trading day, or before the close, or a plan is being made
-    plan = current_plan()
-    if plan is not None and plan["date"] == day:
-        return
-    try:
-        bars = session_snapshot(day)
-        if bars is None:
-            return
-        SESSION_EXTRA.update(day=day, bars=bars)
-        keep_snapshot_sample(day, bars)
-        rq_prepare(context)
-        plan = current_plan()
-        if plan is not None and plan["date"] == day:
-            rq_log("live.snapshot_plan", "%s planned from the closing snapshots" % day.strftime("%Y%m%d"))
-    except Exception as exc:
-        rq_log("live.error", _where(exc))
-    finally:
-        SESSION_EXTRA.clear()
+    """LIVE_SNAPSHOT_AT: plan the session that just closed from its closing snapshots (rq_prepare does it after the
+    close), so the next morning's auction does not wait for the daily bars."""
+    rq_prepare(context)
 
 
 def rq_snapshot_check(context):
