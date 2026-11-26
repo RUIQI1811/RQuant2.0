@@ -700,6 +700,10 @@ VALUATION_CHUNK = 1000
 STATEMENT_CODES = 200
 STATEMENT_FIELDS_PER_CALL = 30
 CACHE_RECENT_DAYS = 3  # with a cache, the last days are always asked again
+# A session whose daily bars PTrade has not published yet (they come in around 09:10 the next morning), built by the
+# live strategy from its closing snapshots: {"day": Timestamp, "bars": {code: {field: value}}} with the fields of
+# get_price. _bars adds that day to each listed code's bars when asked about it; empty, nothing changes.
+SESSION_EXTRA = {}
 FUNDAMENTALS_MAX_AGE = 14 * 3600  # with a cache, statements fetched less than this many seconds ago are reused
 
 # Tushare statement fields used by jq240 -> PTrade get_fundamentals table and field. None: PTrade has no such line,
@@ -825,22 +829,49 @@ def sh_main_codes(end):
     return sorted(code for code in get_Ashares(end) if code.startswith("60") and code.endswith(".SS"))  # noqa: F821
 
 
+def on_main_board(code):
+    """RQuant's ``main`` boards: Shanghai 60xxxx and Shenzhen 00xxxx (000-003, the former SME board included)."""
+    return (code.startswith("60") and code.endswith(".SS")) or (code.startswith("00") and code.endswith(".SZ"))
+
+
+def main_codes(end):
+    return sorted(code for code in get_Ashares(end) if on_main_board(code))  # noqa: F821
+
+
 def all_a_codes(end):
     return sorted(code for code in get_Ashares(end) if code.endswith(".SS") or code.endswith(".SZ"))  # noqa: F821
 
 
 def _bars(codes, fields, start, end, calendar):
-    """Yield (code, dates, structured array) of unadjusted daily bars on exchange trading days, oldest first."""
+    """Yield (code, dates, bars) of unadjusted daily bars on exchange trading days, oldest first: bars is get_price's
+    structured array, or a dict of arrays of ``fields`` when SESSION_EXTRA added a day."""
     for chunk in _chunks(codes, BAR_CHUNK):
         data = get_price(chunk, start_date=start, end_date=end, frequency="1d", fields=fields,  # noqa: F821
                          fq=None, is_dict=True) or {}
         for code in chunk:
             bars = data.get(code)
             if bars is None or len(bars) == 0:
-                continue
-            dates = pd.DatetimeIndex([_day(value) for value in bars["datetime"]])
-            keep = dates.isin(calendar) & ~dates.duplicated(keep="last")
-            yield code, dates[keep], bars[keep]
+                dates, bars = pd.DatetimeIndex([]), dict((field, np.zeros(0)) for field in fields)
+            else:
+                dates = pd.DatetimeIndex([_day(value) for value in bars["datetime"]])
+                keep = dates.isin(calendar) & ~dates.duplicated(keep="last")
+                dates, bars = dates[keep], bars[keep]
+            extra = _session_extra(code, dates, start, end)
+            if extra is not None:
+                bars = dict((field, np.r_[np.asarray(bars[field], dtype=float), float(extra[field])]) for field in fields)
+                dates = dates.append(pd.DatetimeIndex([SESSION_EXTRA["day"]]))
+            if len(dates):
+                yield code, dates, bars
+
+
+def _session_extra(code, dates, start, end):
+    """SESSION_EXTRA's bar of ``code`` when its day is asked for (between ``start`` and ``end``) and not in ``dates``."""
+    if not SESSION_EXTRA:
+        return None
+    day = SESSION_EXTRA["day"]
+    if not (_day(start) <= day <= _day(end)) or day in dates or (len(dates) and dates[-1] > day):
+        return None
+    return SESSION_EXTRA["bars"].get(code)
 
 
 def _traded(bars):
@@ -894,8 +925,10 @@ def _cacheable(dates):
     return set(dates[:-CACHE_RECENT_DAYS]) if len(dates) > CACHE_RECENT_DAYS else set()
 
 
-def valuation_panels(codes, dates, fields, log=print, cache=None):
+def valuation_panels(codes, dates, fields, log=print, cache=None, positive=True):
     """{field: dates x codes} from PTrade's daily valuation table; gaps take the stock's nearest known value.
+
+    ``positive=False`` keeps the values as PTrade gives them (zero, negative or missing), without filling gaps.
 
     ``cache`` (a dict kept between runs, as a live strategy left running does) holds the answers of earlier days, so a
     later run only asks for the days it has not seen.
@@ -939,7 +972,7 @@ def valuation_panels(codes, dates, fields, log=print, cache=None):
     panels = {}
     for field in fields:
         panel = pd.DataFrame(values[field]).T.reindex(index=dates, columns=codes)
-        panels[field] = panel.where(panel > 0).ffill().bfill()
+        panels[field] = panel.where(panel > 0).ffill().bfill() if positive else panel
     return panels
 
 
@@ -1123,7 +1156,7 @@ def build_inputs(end, days, log=print, codes=None, status_days=None, cache=None)
     dates = calendar[-days:]
     codes = list(codes) if codes is not None else sh_main_codes(end)
     every = all_a_codes(end)
-    log("inputs.codes", "%d sh_main, %d all-A" % (len(codes), len(every)))
+    log("inputs.codes", "%d to score, %d all-A" % (len(codes), len(every)))
     log("inputs.dates", "%s..%s (%d)" % (dates[0].date(), dates[-1].date(), len(dates)))
     panels = price_panels(codes, dates, end, calendar)
     log("inputs.bars_seconds", round(time.time() - began, 2))
@@ -1145,6 +1178,9 @@ def build_inputs(end, days, log=print, codes=None, status_days=None, cache=None)
     inputs["basic_circ_mv"] = raw_close * floats
     # Tushare's turnover_rate: traded shares / circulating shares, in percent.
     inputs["basic_turnover_rate"] = (raw_volume / floats.where(floats > 0) * 100.0).where(raw_close.notna())
+    # rquant.data.reference's turnover_total: traded shares / total shares, as a fraction (size_value_china).
+    inputs["basic_turnover_total"] = (raw_volume / total.where(total > 0)).where(raw_close.notna())
+    inputs["all_a"], inputs["listed"], inputs["calendar"] = every, opened, calendar
     first_year = max(2005, dates[0].year - FUNDAMENTAL_YEARS_BACK)
     key = ("fundamentals", tuple(codes), first_year, _day(end).year)
     kept = cache.get(key) if cache is not None else None

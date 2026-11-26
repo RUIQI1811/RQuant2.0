@@ -142,6 +142,26 @@ def test_jobs_and_auction_trade_sells_and_buys_at_once() -> None:
     assert not any("1234567890" in line for line in lines)
 
 
+# Break caught: the rank exit (LIVE_EXIT_RANK_PCT) not reaching the bundled strategy's auction sells.
+def test_the_auction_also_sells_holdings_ranked_outside_the_exit_fraction() -> None:
+    def auction_sells(exit_rank_pct):  # type: ignore[no-untyped-def]
+        live = Live({})
+        live.run("initialize", "20110701080000")
+        live.run("rq_prepare", "20110701080000")
+        scores = live.names["_pt"]["plan"]["scores"]
+        worst = [code[:-3] + ".SS" for code in live.names["ranked"](scores)[-2:]]
+        live.context.portfolio.positions = {code: Holder(amount=300, enable_amount=300) for code in worst}
+        live.names["LIVE_EXIT_RANK_PCT"] = exit_rank_pct
+        live.run("rq_auction", "20110701092100")
+        return sorted(code for code, amount, _ in live.sent if amount < 0), worst
+
+    assert Live({}).names["LIVE_EXIT_RANK_PCT"] == 0.7
+    dropout_only, worst = auction_sells(None)
+    with_exit, _ = auction_sells(0.5)
+    assert len(dropout_only) == 1  # LIVE_N_DROP
+    assert with_exit == sorted(worst)  # both rank in the bottom half
+
+
 def test_dry_run_logs_orders_at_start_and_sends_nothing() -> None:
     live = Live({"600002.SS": (300, 300)}, dry_run=True)
     live.run("initialize", "20110701200000")

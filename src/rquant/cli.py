@@ -34,6 +34,7 @@ from rquant.reporting import build_report
 from rquant.runs import RunContext
 from rquant.universe import SUPPORTED_UNIVERSES
 from rquant.workflow.backtest import (
+    ENTRIES,
     RISK_MODELS,
     STRATEGIES,
     PortfolioBacktestRunner,
@@ -137,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--first-year", type=int)
     walk.add_argument("--last-year", type=int)
     walk.add_argument("--through", type=_date, help="Inclusive date, YYYY-MM-DD (default: data.through)")
+    walk.add_argument(
+        "--seed",
+        type=int,
+        help="Override workflow.seed (the model's random seed); runs that differ only in seed can be averaged with "
+        "scripts/analysis/blend_runs.py",
+    )
     walk.set_defaults(handler=_walk_forward, run_category="walk-forward")
 
     report = commands.add_parser("report", help="Run portfolio backtest and build the report for a walk-forward run")
@@ -147,13 +154,38 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--strategy",
         choices=STRATEGIES,
-        help="Override backtest.strategy: equal-weight top-K, or Qlib enhanced indexing with a risk model",
+        help="Override backtest.strategy: equal-weight top-K, Qlib enhanced indexing with a risk model, or score-line "
+        "(equal weight across every stock above --min-score-z, cash when none passes)",
     )
     report.add_argument(
         "--risk-model",
         choices=RISK_MODELS,
         help="Override backtest.enhanced_indexing.risk_model: PCA factors of past returns, or Shenwan industries + "
         "CNE6 styles from the barra_cne6 store (industry and size limits)",
+    )
+    report.add_argument(
+        "--entry",
+        choices=ENTRIES,
+        help="Override backtest.entry: trade each signal at the next open (default) or at the signal day's own close "
+        "(an upper bound for scoring near the close and buying in the closing auction)",
+    )
+    report.add_argument(
+        "--max-open-gap",
+        type=float,
+        help="Override backtest.max_open_gap: with --entry open, skip buying stocks that open more than this fraction "
+        "above their previous close (e.g. 0.03); the next-ranked tradable stock is bought instead",
+    )
+    report.add_argument(
+        "--min-score-z",
+        type=float,
+        help="Override backtest.min_score_z: buy only stocks whose score is at least this many standard deviations "
+        "above the day's mean score (e.g. 3); a skipped buy stays in cash",
+    )
+    report.add_argument(
+        "--exit-rank-pct",
+        type=float,
+        help="Override backtest.exit_rank_pct: also sell every holding that ranks outside the day's top fraction "
+        "(e.g. 0.2 = top 20%%) and replace it",
     )
     report.add_argument(
         "--signal-only",
@@ -615,7 +647,11 @@ def _walk_forward(args: argparse.Namespace) -> int:
             workflow=args.model or Path(args.workflow).expanduser(),
             horizon=args.horizon,
             factor_set=args.factor_set,
-            seed=int(workflow.get("seed", config.get("project", {}).get("seed", 42))),
+            seed=(
+                args.seed
+                if args.seed is not None
+                else int(workflow.get("seed", config.get("project", {}).get("seed", 42)))
+            ),
             train_years=int(workflow.get("train_years", 3)),
             validation_months=int(workflow.get("validation_months", 6)),
             formal_start_year=_date_value(config.get("data", {}).get("formal_start", "2010-01-01")).year,
@@ -666,7 +702,10 @@ def _report(args: argparse.Namespace) -> int:
         if not predictions_path.exists():
             raise DataContractError(f"Predictions do not exist: {predictions_path}")
         if args.signal_only:
-            portfolio_options = (args.topk, args.n_drop, args.rebalance_days, args.strategy, args.risk_model)
+            portfolio_options = (
+                args.topk, args.n_drop, args.rebalance_days, args.strategy, args.risk_model, args.entry,
+                args.max_open_gap, args.min_score_z, args.exit_rank_pct,
+            )
             if any(value is not None for value in portfolio_options):
                 raise DataContractError("--signal-only runs no backtest; drop the portfolio options")
             return _signal_report(run, paths, args.run_id, run_directory, predictions_path)
@@ -685,6 +724,10 @@ def _report(args: argparse.Namespace) -> int:
             universe=_walk_forward_universe(run_directory, config),
             rebalance_days=args.rebalance_days or int(backtest.get("rebalance_days", 1)),
             strategy=args.strategy or str(backtest.get("strategy", "topk-dropout")),
+            entry=args.entry or str(backtest.get("entry", "open")),
+            max_open_gap=args.max_open_gap if args.max_open_gap is not None else backtest.get("max_open_gap"),
+            min_score_z=args.min_score_z if args.min_score_z is not None else backtest.get("min_score_z"),
+            exit_rank_pct=args.exit_rank_pct if args.exit_rank_pct is not None else backtest.get("exit_rank_pct"),
             **{
                 **_enhanced_indexing_options(backtest.get("enhanced_indexing") or {}),
                 **({"risk_model": args.risk_model} if args.risk_model else {}),

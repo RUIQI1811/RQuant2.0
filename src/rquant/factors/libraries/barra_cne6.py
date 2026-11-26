@@ -40,6 +40,7 @@ import pandas as pd
 
 from rquant.errors import DataContractError
 from rquant.factors import statements
+from rquant.factors.daily_panels import daily_basic_panels
 from rquant.factors.extensions import kunquant_oap as op
 from rquant.factors.extensions.kunquant_oap import g
 from rquant.factors.libraries.base import FactorLibrary, FactorSpec
@@ -538,15 +539,10 @@ class BarraCNE6Library(FactorLibrary):
             if sha256_file(root / name) != files[name]:
                 raise DataContractError(f"Reference file differs from its manifest: {root / name}")
 
-        wanted = [("instrument", "in", list(instruments))]
-        columns = ["instrument", "datetime", *CNE6_DAILY_BASIC]
-        daily = pd.concat(
-            [pd.read_parquet(root / name, columns=columns, filters=wanted) for name in daily_files], ignore_index=True
+        # Read file by file for the panel's instruments only, so the all-A daily_basic rows never sit in memory.
+        inputs: dict[str, Any] = daily_basic_panels(
+            [root / name for name in daily_files], CNE6_DAILY_BASIC, dates, instruments
         )
-        inputs: dict[str, Any] = {}
-        for field, scale in CNE6_DAILY_BASIC.items():
-            panel = daily.pivot(index="datetime", columns="instrument", values=field)
-            inputs[f"basic_{field}"] = panel.reindex(index=dates, columns=instruments) * scale
         factors = pd.read_parquet(root / "market_factors.parquet").set_index("datetime").sort_index()
         inputs["mkt"] = factors["mkt"].reindex(dates)
         fundamentals = pd.read_parquet(root / "fundamentals.parquet")

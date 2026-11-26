@@ -1355,12 +1355,16 @@ def ranked(scores):
     return scores.index[np.argsort(-scores.values, kind="mergesort")]
 
 
-def decide(scores, book, day, topk, n_drop):
+def decide(scores, book, day, topk, n_drop, exit_rank_pct=None):
     """Qlib TopkDropoutStrategy.generate_trade_decision for ``day``.
 
     ``scores`` is the previous trading day's prediction (a Series indexed by code); ``day`` holds the quotes the
     tradability checks and the sell simulation use. Ties in score are ordered by ``ranked``. Returns (sells, buys):
     sells and buys as (code, adjusted amount) in the order Qlib places them.
+
+    ``exit_rank_pct`` (e.g. 0.7) also sells every scored, tradable holding that ranks outside the top
+    ``exit_rank_pct`` of the day's scored stocks and replaces it, as RQuant's ScoreRulesMixin does in the backtest
+    (``report --exit-rank-pct``).
     """
     scores = scores.dropna()
 
@@ -1376,10 +1380,14 @@ def decide(scores, book, day, topk, n_drop):
     temp = book.copy()
     current = list(temp.amount)
     last = ranked(scores.reindex(current))
+    forced = []
+    if exit_rank_pct is not None:
+        rank = scores.rank(ascending=False, pct=True, method="max")
+        forced = [code for code in last if rank.get(code, 0.0) > exit_rank_pct and day.tradable(code)]
     others = ranked(scores[~scores.index.isin(last)])
-    today = first_n(others, n_drop + topk - len(last))
+    today = first_n(others, n_drop + len(forced) + topk - len(last))
     comb = ranked(scores.reindex(last.union(pd.Index(today))))
-    sell = last[last.isin(first_n(comb, n_drop, reverse=True))]
+    sell = last[last.isin(first_n(comb, n_drop, reverse=True)) | last.isin(forced)]
     buy = today[: len(sell) + topk - len(last)]
     sells = []
     for code in current:
@@ -1664,6 +1672,7 @@ LIVE_ACCOUNT = ""  # empty: the account selected for the strategy in QMT
 LIVE_CAPITAL = 0  # the most the strategy may hold (holdings at market plus cash); 0 = all its holdings and cash
 LIVE_TOPK = 30
 LIVE_N_DROP = 3
+LIVE_EXIT_RANK_PCT = None  # e.g. 0.7: also sell holdings ranked outside the day's top 70% (the PTrade strategy does)
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SH"])
 LIVE_AUCTION = True  # trade in the opening call auction (at the open); False: after the open, as below
 LIVE_AUCTION_AT = "092100"  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
@@ -1801,7 +1810,7 @@ def live_sell(C, plan, account, tag, auction=False):
     book = Book(budget, dict((code, float(positions[code][0])) for code in held),
                 dict((code, day.close[code]) for code in held),
                 dict((code, 1 if positions[code][1] > 0 else 0) for code in held))
-    sells, buys = decide(plan["scores"], book, day, LIVE_TOPK, LIVE_N_DROP)
+    sells, buys = decide(plan["scores"], book, day, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT)
     sold, sent, proceeds = 0.0, 0, 0.0
     kept = dict((code, positions[code][0]) for code in held)
     for code, shares in sells:

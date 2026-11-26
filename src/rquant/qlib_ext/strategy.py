@@ -20,6 +20,7 @@ from typing import Any
 from rquant.errors import DataContractError
 
 try:
+    from qlib.contrib.strategy.signal_strategy import BaseSignalStrategy as _BaseSignalStrategy
     from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy as _TopkDropoutStrategy
     from qlib.contrib.strategy.signal_strategy import WeightStrategyBase as _WeightStrategyBase
 except ImportError:  # pragma: no cover - Qlib is a locked dependency
@@ -28,6 +29,9 @@ except ImportError:  # pragma: no cover - Qlib is a locked dependency
         pass
 
     class _TopkDropoutStrategy:  # type: ignore[no-redef]
+        pass
+
+    class _BaseSignalStrategy:  # type: ignore[no-redef]
         pass
 
 
@@ -261,6 +265,251 @@ def keep_rebalance_dates(signal: Any, every: int) -> Any:
 
 class LiquidatingTopkDropoutStrategy(RebalancingLiquidationMixin, _TopkDropoutStrategy):  # type: ignore[misc]
     """Qlib's ``TopkDropoutStrategy`` with a rebalance interval and a final liquidation."""
+
+
+def daily_zscore(scores: Any) -> Any:
+    """One day's scores minus their mean, over their standard deviation (zero when every score is the same)."""
+    std = float(scores.std())
+    if not std > 0:
+        return scores * 0.0
+    return (scores - scores.mean()) / std
+
+
+class ScoreRulesMixin:
+    """Two extra rules on top of ``TopkDropoutStrategy`` (``only_tradable``, sell the bottom, buy the top):
+
+    - ``min_score_z``: buy a stock only when its score is at least this many standard deviations above the day's mean
+      score. A skipped buy leaves its share of the cash uninvested; the empty slot is offered again the next day.
+      The daily z-score keeps the line comparable across walk-forward windows, whose models score on different
+      scales (a window with few trees has a narrow score range).
+    - ``exit_rank_pct``: also sell every holding whose score ranks below the top ``exit_rank_pct`` of the day's
+      scored stocks (0.2 = outside the top 20%), however many that is; each is replaced like a dropped stock.
+
+    Everything else (which of the ``n_drop`` bottom holdings are sold, equal cash per buy, ``hold_thresh``, limit
+    rules) is Qlib's ``TopkDropoutStrategy.generate_trade_decision``.
+    """
+
+    def __init__(
+        self, *, min_score_z: float | None = None, exit_rank_pct: float | None = None, **kwargs: Any
+    ) -> None:
+        if exit_rank_pct is not None and not 0 < exit_rank_pct < 1:
+            raise ValueError(f"exit_rank_pct must be in (0, 1), got {exit_rank_pct}")
+        self.min_score_z = min_score_z
+        self.exit_rank_pct = exit_rank_pct
+        super().__init__(**kwargs)
+
+    def generate_trade_decision(self, execute_result: Any = None) -> Any:
+        if self.min_score_z is None and self.exit_rank_pct is None:
+            return super().generate_trade_decision(execute_result)
+        import copy
+
+        import pandas as pd
+        from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
+
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
+        pred_start, pred_end = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start, end_time=pred_end)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+
+        def tradable(code: str, direction: Any = None) -> bool:
+            return bool(
+                self.trade_exchange.is_stock_tradable(
+                    stock_id=code, start_time=trade_start, end_time=trade_end, direction=direction
+                )
+            )
+
+        def first_n(codes: Any, n: int) -> list[str]:
+            chosen: list[str] = []
+            for code in codes:
+                if len(chosen) >= n:
+                    break
+                if tradable(code):
+                    chosen.append(code)
+            return chosen
+
+        def last_n(codes: Any, n: int) -> list[str]:
+            return first_n(list(codes)[::-1], n)[::-1]
+
+        current = copy.deepcopy(self.trade_position)
+        cash = current.get_cash()
+        holdings = current.get_stock_list()
+        last = pred_score.reindex(holdings).sort_values(ascending=False).index
+        # Scored holdings outside the top exit_rank_pct, sold on top of the dropout. Unscored holdings already rank
+        # last for the dropout, as in Qlib.
+        forced: list[str] = []
+        if self.exit_rank_pct is not None:
+            rank = pred_score.rank(ascending=False, pct=True, method="max").reindex(last)
+            forced = [code for code in last if rank[code] > self.exit_rank_pct and tradable(code)]
+        today = first_n(
+            pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+            self.n_drop + len(forced) + self.topk - len(last),
+        )
+        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+        dropped = set(last_n(comb, self.n_drop))
+        sell = [code for code in last if code in dropped or code in forced]
+        buy = today[: len(sell) + self.topk - len(last)]
+
+        sell_orders = []
+        for code in holdings:
+            if code not in sell:
+                continue
+            if not tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.SELL):
+                continue
+            if current.get_stock_count(code, bar=self.trade_calendar.get_freq()) < self.hold_thresh:
+                continue
+            order = Order(
+                stock_id=code,
+                amount=current.get_stock_amount(code=code),
+                start_time=trade_start,
+                end_time=trade_end,
+                direction=Order.SELL,
+            )
+            if self.trade_exchange.check_order(order):
+                sell_orders.append(order)
+                trade_value, trade_cost, _ = self.trade_exchange.deal_order(order, position=current)
+                cash += trade_value - trade_cost
+
+        # Equal cash per intended buy; a buy below the score line keeps its share as cash.
+        value = cash * self.risk_degree / len(buy) if buy else 0.0
+        if self.min_score_z is not None and buy:
+            z = daily_zscore(pred_score)
+            buy = [code for code in buy if z[code] >= self.min_score_z]
+        buy_orders = []
+        for code in buy:
+            if not tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.BUY):
+                continue
+            price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start, end_time=trade_end, direction=OrderDir.BUY
+            )
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start, end_time=trade_end)
+            amount = self.trade_exchange.round_amount_by_trade_unit(value / price, factor)
+            buy_orders.append(
+                Order(stock_id=code, amount=amount, start_time=trade_start, end_time=trade_end, direction=Order.BUY)
+            )
+        return TradeDecisionWO(sell_orders + buy_orders, self)
+
+
+class ScoreRuleTopkDropoutStrategy(  # type: ignore[misc]
+    RebalancingLiquidationMixin, ScoreRulesMixin, _TopkDropoutStrategy
+):
+    """``LiquidatingTopkDropoutStrategy`` with a buy score line and a rank exit (``ScoreRulesMixin``)."""
+
+
+class ScoreLineEqualWeightStrategy(RebalancingLiquidationMixin, _BaseSignalStrategy):  # type: ignore[misc]
+    """Hold every stock whose score is at least ``min_score_z`` daily standard deviations above the day's mean score,
+    equally weighted and fully invested; hold cash on a day when no stock passes the line.
+
+    Each day the target is ``risk_degree`` times the book value split equally over the stocks above the line. A
+    holding below the line (or no longer scored) is sold. A stock above the line that is not held is bought at the
+    target. A holding above the line is only resized when it is outside ``band`` of the target (0.5: below half or
+    above one and a half times the target), so small drifts do not trade every day. When the cash after the sales
+    does not cover every buy, the buys are scaled down together. Limit and suspension rules, T+1 (``hold_thresh``)
+    and lot rounding are the exchange's, as in Qlib's ``TopkDropoutStrategy``.
+    """
+
+    def __init__(self, *, min_score_z: float, band: float = 0.5, hold_thresh: int = 1, **kwargs: Any) -> None:
+        import math
+
+        if not math.isfinite(min_score_z):
+            raise ValueError(f"min_score_z must be a finite number, got {min_score_z}")
+        if not 0 <= band < 1:
+            raise ValueError(f"band must be in [0, 1), got {band}")
+        self.min_score_z = min_score_z
+        self.band = band
+        self.hold_thresh = hold_thresh
+        super().__init__(**kwargs)
+
+    def generate_trade_decision(self, execute_result: Any = None) -> Any:
+        import copy
+
+        import pandas as pd
+        from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
+
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
+        pred_start, pred_end = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start, end_time=pred_end)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+        pred_score = pred_score.dropna()
+
+        def tradable(code: str, direction: Any) -> bool:
+            return bool(
+                self.trade_exchange.is_stock_tradable(
+                    stock_id=code, start_time=trade_start, end_time=trade_end, direction=direction
+                )
+            )
+
+        def price(code: str, direction: Any) -> float:
+            return float(
+                self.trade_exchange.get_deal_price(
+                    stock_id=code, start_time=trade_start, end_time=trade_end, direction=direction
+                )
+            )
+
+        def lots(code: str, value: float, direction: Any) -> float:
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start, end_time=trade_end)
+            return float(self.trade_exchange.round_amount_by_trade_unit(value / price(code, direction), factor))
+
+        current = copy.deepcopy(self.trade_position)
+        z = daily_zscore(pred_score)
+        passing = list(z[z >= self.min_score_z].sort_values(ascending=False).index)
+        target = current.calculate_value() * self.risk_degree / len(passing) if passing else 0.0
+        low, high = (1 - self.band) * target, (1 + self.band) * target
+
+        sell_orders = []
+        cash = current.get_cash()
+        for code in current.get_stock_list():
+            # A suspended stock has no deal price, so tradability is checked before sizing the sale.
+            if not tradable(code, OrderDir.SELL):
+                continue
+            amount = float(current.get_stock_amount(code=code))
+            if code in passing:
+                held_value = amount * float(current.get_stock_price(code))
+                if held_value <= high:
+                    continue
+                amount = min(amount, lots(code, held_value - target, OrderDir.SELL))
+            if amount <= 0:
+                continue
+            if current.get_stock_count(code, bar=self.trade_calendar.get_freq()) < self.hold_thresh:
+                continue
+            order = Order(
+                stock_id=code, amount=amount, start_time=trade_start, end_time=trade_end, direction=Order.SELL
+            )
+            if self.trade_exchange.check_order(order):
+                sell_orders.append(order)
+                trade_value, trade_cost, _ = self.trade_exchange.deal_order(order, position=current)
+                cash += trade_value - trade_cost
+
+        wanted: dict[str, float] = {}
+        held = set(current.get_stock_list())
+        for code in passing:
+            held_value = (
+                float(current.get_stock_amount(code=code)) * float(current.get_stock_price(code))
+                if code in held
+                else 0.0
+            )
+            if code in held and held_value >= low:
+                continue
+            if tradable(code, OrderDir.BUY):
+                wanted[code] = target - held_value
+        scale = min(1.0, cash * self.risk_degree / sum(wanted.values())) if wanted else 0.0
+        buy_orders = []
+        for code, value in wanted.items():
+            amount = lots(code, value * scale, OrderDir.BUY)
+            if amount > 0:
+                buy_orders.append(
+                    Order(
+                        stock_id=code, amount=amount, start_time=trade_start, end_time=trade_end, direction=Order.BUY
+                    )
+                )
+        return TradeDecisionWO(sell_orders + buy_orders, self)
 
 
 class LiquidatingEnhancedIndexingStrategy(RebalancingLiquidationMixin, EnhancedIndexingStrategy):  # type: ignore[misc]

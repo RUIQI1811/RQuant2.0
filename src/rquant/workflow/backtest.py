@@ -11,8 +11,12 @@ from rquant.io import atomic_write_json, sha256_file
 from rquant.qlib_ext.exchange import AshareCostModel, AshareExchange
 from rquant.qlib_ext.loader import LABEL_EXPRESSIONS
 
-STRATEGIES = ("topk-dropout", "enhanced-indexing")
+STRATEGIES = ("topk-dropout", "enhanced-indexing", "score-line")
 RISK_MODELS = ("statistical", "structured")
+ENTRIES = ("open", "close")
+# A Shanghai main-board stock (not ST) closes at its +/-10% limit when its close is the day's high (low) and the raw
+# change is at least 9.5%: the limits round to the cent, so a limit day's change is 9.5%-10.5%, never below.
+CLOSE_LIMIT_CHANGE = 0.095
 
 
 @dataclass(frozen=True)
@@ -33,7 +37,9 @@ class PortfolioConfig:
     rebalance_days: int = 1
     # "topk-dropout" holds the equal-weighted top K. "enhanced-indexing" weights the whole universe with Qlib's
     # EnhancedIndexingOptimizer against the universe's float-cap index (rquant.qlib_ext.strategy); topk and n_drop are
-    # then unused.
+    # then unused. "score-line" holds every stock at least min_score_z daily standard deviations above the mean score,
+    # equally weighted and fully invested, and cash when none passes (ScoreLineEqualWeightStrategy); topk and n_drop
+    # are unused.
     strategy: str = "topk-dropout"
     # "statistical": Qlib's StructuredCovEstimator (risk_factors PCA factors of past returns). "structured": Shenwan
     # industries + CNE6 styles from the barra_cne6 factor store (rquant.qlib_ext.riskmodel), which the industry,
@@ -52,6 +58,18 @@ class PortfolioConfig:
     turnover_limit: float = 0.2
     benchmark_deviation: float | None = 0.01
     risk_degree: float = 0.95
+    # "open": trade the signal of day t at the open of t+1 (the default). "close": trade it at the close of t itself,
+    # as a strategy that scores near the close (e.g. 14:50 Beijing) and buys in the closing auction would; the signal
+    # still uses t's full-day bar, so this is an upper bound on what such a strategy gets.
+    entry: str = "open"
+    # With entry "open": do not buy a stock whose open is more than this fraction above its previous close (TopkDropout
+    # takes the next-ranked tradable stock instead), as a buy order capped at previous close * (1 + max_open_gap) would.
+    max_open_gap: float | None = None
+    # TopkDropout only (rquant.qlib_ext.strategy.ScoreRulesMixin). min_score_z: buy a stock only when its score is at
+    # least this many standard deviations above the day's mean score; a skipped buy stays in cash. exit_rank_pct: also
+    # sell every holding that ranks outside the day's top exit_rank_pct (0.2 = top 20%) and replace it.
+    min_score_z: float | None = None
+    exit_rank_pct: float | None = None
 
     def __post_init__(self) -> None:
         if self.topk < 1:
@@ -80,6 +98,21 @@ class PortfolioConfig:
             raise ValueError(f"benchmark_deviation must not be negative, got {self.benchmark_deviation}")
         if not 0 < self.risk_degree <= 1:
             raise ValueError(f"risk_degree must be in (0, 1], got {self.risk_degree}")
+        if self.entry not in ENTRIES:
+            raise ValueError(f"entry must be one of {ENTRIES}, got {self.entry}")
+        if self.strategy != "topk-dropout" and (self.entry != "open" or self.max_open_gap is not None):
+            raise ValueError("entry 'close' and max_open_gap are only supported with the topk-dropout strategy")
+        if self.max_open_gap is not None and (self.entry != "open" or self.max_open_gap <= 0):
+            raise ValueError(f"max_open_gap needs entry 'open' and must be positive, got {self.max_open_gap}")
+        if self.strategy == "score-line":
+            if self.min_score_z is None or self.exit_rank_pct is not None:
+                raise ValueError("the score-line strategy needs min_score_z and takes no exit_rank_pct")
+        elif self.strategy != "topk-dropout" and (self.min_score_z is not None or self.exit_rank_pct is not None):
+            raise ValueError("min_score_z and exit_rank_pct are only supported with the topk-dropout strategy")
+        if self.exit_rank_pct is not None and not 0 < self.exit_rank_pct < 1:
+            raise ValueError(f"exit_rank_pct must be in (0, 1), got {self.exit_rank_pct}")
+        if self.min_score_z is not None and not math.isfinite(self.min_score_z):
+            raise ValueError(f"min_score_z must be a finite number, got {self.min_score_z}")
 
 
 class PortfolioBacktestRunner:
@@ -139,11 +172,17 @@ class PortfolioBacktestRunner:
         )
         from qlib.data import D
 
-        start_time = predictions["datetime"].min()
         signal_end = predictions["datetime"].max()
         later = D.calendar(start_time=signal_end, freq="day")
         end_time = next((value for value in later if pd.Timestamp(value) > signal_end), signal_end)
         signal = predictions.set_index(["datetime", "instrument"])["score"].sort_index()
+        # Qlib trades step d on the signal of the step before d; to trade at t's close, the signal of t is dated t-1.
+        trade_signal = (
+            shift_to_previous_trading_day(signal, D.calendar(end_time=signal_end, freq="day"))
+            if self.config.entry == "close"
+            else signal
+        )
+        start_time = trade_signal.index.get_level_values("datetime").min()
         signal_days = int(
             keep_rebalance_dates(signal, self.config.rebalance_days).index.get_level_values("datetime").nunique()
         )
@@ -164,6 +203,7 @@ class PortfolioBacktestRunner:
             cost_model=cost_model,
             trade_unit=self.config.trade_unit,
             impact_cost=self.config.impact_cost,
+            **exchange_trading_rules(self.config),
         )
         optimization_log = OptimizationLog()
         if self.config.strategy == "enhanced-indexing":
@@ -185,6 +225,9 @@ class PortfolioBacktestRunner:
                 "optimization_log": optimization_log,
                 "risk_degree": self.config.risk_degree,
             }
+        elif self.config.strategy == "score-line":
+            strategy_class = "ScoreLineEqualWeightStrategy"
+            strategy_kwargs = {"min_score_z": self.config.min_score_z, "risk_degree": 1.0, "hold_thresh": 1}
         else:
             strategy_class = "LiquidatingTopkDropoutStrategy"
             strategy_kwargs = {
@@ -195,6 +238,9 @@ class PortfolioBacktestRunner:
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": False,
             }
+            if self.config.min_score_z is not None or self.config.exit_rank_pct is not None:
+                strategy_class = "ScoreRuleTopkDropoutStrategy"
+                strategy_kwargs.update(min_score_z=self.config.min_score_z, exit_rank_pct=self.config.exit_rank_pct)
         port_analysis_config = {
             "strategy": {
                 "class": strategy_class,
@@ -224,6 +270,9 @@ class PortfolioBacktestRunner:
             else:
                 # As in SignalRecord, a label that cannot be built (no horizon) is saved as None; nothing is scored.
                 recorder.save_objects(**{"label.pkl": None})
+            if trade_signal is not signal:
+                # Scored above on its own dates; PortAnaRecord trades (and dates the backtest by) the re-dated copy.
+                recorder.save_objects(**{"pred.pkl": trade_signal.to_frame("score")})
             artifacts = PortAnaRecord(
                 recorder,
                 config=port_analysis_config,
@@ -275,17 +324,21 @@ class PortfolioBacktestRunner:
             "signal_days": signal_days,
             "constraints": {
                 "rebalance": _rebalance_description(self.config),
-                "deal_price": "next trading day open",
+                "deal_price": (
+                    "signal day close (signal re-dated to the previous trading day)"
+                    if self.config.entry == "close"
+                    else "next trading day open"
+                ),
                 "long_only": True,
-                "equal_weight": self.config.strategy == "topk-dropout",
+                "equal_weight": self.config.strategy in ("topk-dropout", "score-line"),
                 "weights": _weighting_description(self.config),
                 "t_plus_one": (
                     "TopkDropoutStrategy hold_thresh=1"
-                    if self.config.strategy == "topk-dropout"
+                    if self.config.strategy in ("topk-dropout", "score-line")
                     else "daily steps: a stock bought at one open is sold at the earliest on the next"
                 ),
                 "suspension": "Qlib $close NaN",
-                "open_limit": "direction-aware $limit_buy/$limit_sell",
+                "price_limit": _limit_description(self.config),
                 "market_impact": (
                     f"impact_cost * (trade_value / daily_value)^2, impact_cost={self.config.impact_cost}"
                     if self.config.impact_cost
@@ -512,6 +565,11 @@ def _labels(D: Any, pd: Any, signal: Any, horizon: str) -> Any:
 def _weighting_description(config: PortfolioConfig) -> str:
     if config.strategy == "topk-dropout":
         return f"equal weight across the top {config.topk}"
+    if config.strategy == "score-line":
+        return (
+            f"equal weight across every stock at least {config.min_score_z:g} daily standard deviations above the "
+            "mean score (resized when outside 50%-150% of the target), cash when none passes"
+        )
     if config.risk_model == "structured":
         risk = (
             f"Shenwan L1 industry + CNE6 style risk model over {config.risk_lookback_days} days (half-life "
@@ -527,13 +585,69 @@ def _weighting_description(config: PortfolioConfig) -> str:
     )
 
 
+def exchange_trading_rules(config: PortfolioConfig) -> dict[str, Any]:
+    """The Qlib ``Exchange`` deal price and (buy, sell) limit expressions for ``config``'s entry.
+
+    A limit expression is true where that side cannot trade. Qlib's And/Or are bitwise and fail on its float series,
+    so a conjunction is a product and a disjunction a ``Greater`` (maximum) of 0/1 series.
+    """
+    if config.entry == "close":
+        return {
+            "deal_price": "$close",
+            "limit_threshold": (
+                f"Ge($change, {CLOSE_LIMIT_CHANGE}) * Ge($close, $high)",
+                f"Le($change, -{CLOSE_LIMIT_CHANGE}) * Le($close, $low)",
+            ),
+        }
+    buy_limit = "$limit_buy"
+    if config.max_open_gap is not None:
+        buy_limit = f"Greater($limit_buy, Gt($open / Ref($close, 1), {1.0 + config.max_open_gap}))"
+    return {"deal_price": "$open", "limit_threshold": (buy_limit, "$limit_sell")}
+
+
+def shift_to_previous_trading_day(signal: Any, calendar: Any) -> Any:
+    """``signal`` (on a <datetime, instrument> index) with every date replaced by the trading day before it."""
+    import pandas as pd
+
+    days = pd.DatetimeIndex(pd.to_datetime(list(calendar))).normalize()
+    dates = pd.DatetimeIndex(signal.index.get_level_values("datetime")).normalize()
+    positions = days.get_indexer(dates)
+    if (positions < 1).any():
+        missing = dates[positions < 1][0]
+        raise DataContractError(f"No trading day before signal date {missing.date()} in the provider calendar")
+    index = pd.MultiIndex.from_arrays(
+        [days[positions - 1], signal.index.get_level_values("instrument")], names=signal.index.names
+    )
+    return pd.Series(signal.to_numpy(), index=index, name=signal.name).sort_index()
+
+
+def _limit_description(config: PortfolioConfig) -> str:
+    if config.entry == "close":
+        return (
+            f"no buy (sell) when the close is the day's high (low) with a raw change of at least "
+            f"+{CLOSE_LIMIT_CHANGE:.1%} (-{CLOSE_LIMIT_CHANGE:.1%})"
+        )
+    rule = "direction-aware $limit_buy/$limit_sell (open at the limit)"
+    if config.max_open_gap is not None:
+        rule += f"; no buy when the open is more than {config.max_open_gap:.1%} above the previous close"
+    return rule
+
+
 def _rebalance_description(config: PortfolioConfig) -> str:
     cadence = "daily" if config.rebalance_days == 1 else f"every {config.rebalance_days} trading days"
     if config.strategy == "enhanced-indexing":
         return f"{cadence}, re-optimised weights"
+    if config.strategy == "score-line":
+        return f"{cadence}, hold every stock above the score line"
     if config.n_drop == config.topk:
-        return f"{cadence}, full rebalance into the latest top {config.topk}"
-    return f"{cadence}, drop at most {config.n_drop} of the top {config.topk}"
+        rule = f"{cadence}, full rebalance into the latest top {config.topk}"
+    else:
+        rule = f"{cadence}, drop at most {config.n_drop} of the top {config.topk}"
+    if config.exit_rank_pct is not None:
+        rule += f"; also sell every holding outside the day's top {config.exit_rank_pct:.0%}"
+    if config.min_score_z is not None:
+        rule += f"; buy only scores at least {config.min_score_z:g} daily standard deviations above the mean"
+    return rule
 
 
 def _position_artifact(pd: Any, positions: dict[Any, Any], exchange: Any) -> Any:

@@ -82,7 +82,7 @@ class FactorLibraryRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             ("qlib_alpha158", "wq_alpha101", "gtja191", "qlib_alpha360", "china_chars", "size_value_china", "talib",
-             "jq240", "oap", "barra_cne6", "tushare_tech", "jkp153", "oap_jq_cnc"),
+             "jq240", "oap", "barra_cne6", "tushare_tech", "jkp153", "oap_jq_cnc", "oap_jq_cnc_ic"),
             registry.factor_sets(),
         )
         self.assertEqual(

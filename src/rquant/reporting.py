@@ -279,12 +279,13 @@ IMPORTANCE_TOP = 30
 
 
 def _feature_importance_summary(pd: Any, frame: Any) -> dict[str, Any]:
-    """Average each factor's share of the total gain over the walk-forward years, highest first."""
+    """Average each factor's share of the total gain over the walk-forward windows (one per year, or one per
+    ``rolling.retrain_months`` with a ``window`` column), highest first."""
     required = {"prediction_year", "factor", "gain", "split", "gain_share"}
     missing = sorted(required.difference(frame.columns))
     if missing:
         raise DataContractError(f"Feature importance columns are missing: {missing}")
-    years = int(frame["prediction_year"].nunique())
+    years = int(frame["window" if "window" in frame.columns else "prediction_year"].nunique())
     grouped = frame.groupby("factor", sort=False)
     table = pd.DataFrame(
         {

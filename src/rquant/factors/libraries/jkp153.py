@@ -45,6 +45,7 @@ import pandas as pd
 
 from rquant.errors import DataContractError
 from rquant.factors import statements
+from rquant.factors.daily_panels import daily_basic_panels
 from rquant.factors.extensions import kunquant_oap as op
 from rquant.factors.extensions import kunquant_oap_regression as regression_op
 from rquant.factors.extensions.kunquant_oap import g
@@ -1421,15 +1422,10 @@ class JKP153Library(FactorLibrary):
                 "sync-fundamentals` and `rquant data build-reference` again"
             )
 
-        wanted = [("instrument", "in", list(instruments))]
-        columns = ["instrument", "datetime", *JKP_DAILY_BASIC]
-        daily = pd.concat(
-            [pd.read_parquet(root / name, columns=columns, filters=wanted) for name in daily_files], ignore_index=True
+        # Read file by file for the panel's instruments only, so the all-A daily_basic rows never sit in memory.
+        inputs: dict[str, Any] = daily_basic_panels(
+            [root / name for name in daily_files], JKP_DAILY_BASIC, dates, instruments
         )
-        inputs: dict[str, Any] = {}
-        for field, scale in JKP_DAILY_BASIC.items():
-            panel = daily.pivot(index="datetime", columns="instrument", values=field)
-            inputs[f"basic_{field}"] = panel.reindex(index=dates, columns=instruments) * scale
         factors = pd.read_parquet(root / "market_factors.parquet").set_index("datetime").sort_index()
         for name in MARKET_FACTORS:
             inputs[name] = factors[name].reindex(dates)

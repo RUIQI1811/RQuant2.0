@@ -26,6 +26,7 @@ from typing import Any
 import pandas as pd
 
 from rquant.errors import DataContractError
+from rquant.factors.daily_panels import daily_basic_panels
 from rquant.factors.extensions import kunquant_panel as k
 from rquant.factors.libraries.base import FactorLibrary, FactorSpec
 from rquant.io import sha256_file, stable_hash
@@ -253,13 +254,10 @@ class SizeValueChinaLibrary(FactorLibrary):
             if sha256_file(root / name) != files[name]:
                 raise DataContractError(f"Reference file differs from its manifest: {root / name}")
 
-        columns = ["instrument", "datetime", *DAILY_BASIC_FIELDS]
-        daily = pd.concat([pd.read_parquet(root / name, columns=columns) for name in daily_files], ignore_index=True)
-        daily = daily[daily["instrument"].isin(set(instruments))]
-        inputs: dict[str, Any] = {}
-        for field in DAILY_BASIC_FIELDS:
-            panel = daily.pivot(index="datetime", columns="instrument", values=field)
-            inputs[f"basic_{field}"] = panel.reindex(index=dates, columns=instruments)
+        # Read file by file for the panel's instruments only, so the all-A daily_basic rows never sit in memory.
+        inputs: dict[str, Any] = daily_basic_panels(
+            [root / name for name in daily_files], DAILY_BASIC_FIELDS, dates, instruments
+        )
         factors = pd.read_parquet(root / "ch4_factors.parquet").set_index("datetime").sort_index()
         for name in sorted(set(CH3) | set(CH4)):
             inputs[f"ch4_{name}"] = factors[name].reindex(dates)
