@@ -955,6 +955,10 @@ VALUATION_CHUNK = 1000
 STATEMENT_CODES = 200
 STATEMENT_FIELDS_PER_CALL = 30
 CACHE_RECENT_DAYS = 3  # with a cache, the last days are always asked again
+# A session whose daily bars PTrade has not published yet (they come in around 09:10 the next morning), built by the
+# live strategy from its closing snapshots: {"day": Timestamp, "bars": {code: {field: value}}} with the fields of
+# get_price. _bars adds that day to each listed code's bars when asked about it; empty, nothing changes.
+SESSION_EXTRA = {}
 FUNDAMENTALS_MAX_AGE = 14 * 3600  # with a cache, statements fetched less than this many seconds ago are reused
 
 # Tushare statement fields used by jq240 -> PTrade get_fundamentals table and field. None: PTrade has no such line,
@@ -1094,17 +1098,35 @@ def all_a_codes(end):
 
 
 def _bars(codes, fields, start, end, calendar):
-    """Yield (code, dates, structured array) of unadjusted daily bars on exchange trading days, oldest first."""
+    """Yield (code, dates, bars) of unadjusted daily bars on exchange trading days, oldest first: bars is get_price's
+    structured array, or a dict of arrays of ``fields`` when SESSION_EXTRA added a day."""
     for chunk in _chunks(codes, BAR_CHUNK):
         data = get_price(chunk, start_date=start, end_date=end, frequency="1d", fields=fields,  # noqa: F821
                          fq=None, is_dict=True) or {}
         for code in chunk:
             bars = data.get(code)
             if bars is None or len(bars) == 0:
-                continue
-            dates = pd.DatetimeIndex([_day(value) for value in bars["datetime"]])
-            keep = dates.isin(calendar) & ~dates.duplicated(keep="last")
-            yield code, dates[keep], bars[keep]
+                dates, bars = pd.DatetimeIndex([]), dict((field, np.zeros(0)) for field in fields)
+            else:
+                dates = pd.DatetimeIndex([_day(value) for value in bars["datetime"]])
+                keep = dates.isin(calendar) & ~dates.duplicated(keep="last")
+                dates, bars = dates[keep], bars[keep]
+            extra = _session_extra(code, dates, start, end)
+            if extra is not None:
+                bars = dict((field, np.r_[np.asarray(bars[field], dtype=float), float(extra[field])]) for field in fields)
+                dates = dates.append(pd.DatetimeIndex([SESSION_EXTRA["day"]]))
+            if len(dates):
+                yield code, dates, bars
+
+
+def _session_extra(code, dates, start, end):
+    """SESSION_EXTRA's bar of ``code`` when its day is asked for (between ``start`` and ``end``) and not in ``dates``."""
+    if not SESSION_EXTRA:
+        return None
+    day = SESSION_EXTRA["day"]
+    if not (_day(start) <= day <= _day(end)) or day in dates or (len(dates) and dates[-1] > day):
+        return None
+    return SESSION_EXTRA["bars"].get(code)
 
 
 def _traded(bars):
@@ -1613,6 +1635,8 @@ def ch4_factor_returns(inputs, end, log=print, cache=None, date=None):
     shares = shares.reindex(index=days, columns=codes)
     pe = valuation_panels(every, days, ["pe_ttm"], log, cache, positive=False)["pe_ttm"].reindex(
         index=days, columns=codes)
+    if len(days) > 1 and pe.iloc[-1].isna().all():
+        pe.iloc[-1] = pe.iloc[-2]  # a session planned from its closing snapshots before PTrade has its valuation
     log("svc.ch4_inputs_seconds", round(time.time() - began, 2))
     cap = daily["close"].ffill() * shares
     turnover = daily["volume"] / shares.where(shares > 0)

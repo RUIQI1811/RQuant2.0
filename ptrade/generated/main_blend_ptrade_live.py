@@ -955,6 +955,10 @@ VALUATION_CHUNK = 1000
 STATEMENT_CODES = 200
 STATEMENT_FIELDS_PER_CALL = 30
 CACHE_RECENT_DAYS = 3  # with a cache, the last days are always asked again
+# A session whose daily bars PTrade has not published yet (they come in around 09:10 the next morning), built by the
+# live strategy from its closing snapshots: {"day": Timestamp, "bars": {code: {field: value}}} with the fields of
+# get_price. _bars adds that day to each listed code's bars when asked about it; empty, nothing changes.
+SESSION_EXTRA = {}
 FUNDAMENTALS_MAX_AGE = 14 * 3600  # with a cache, statements fetched less than this many seconds ago are reused
 
 # Tushare statement fields used by jq240 -> PTrade get_fundamentals table and field. None: PTrade has no such line,
@@ -1094,17 +1098,35 @@ def all_a_codes(end):
 
 
 def _bars(codes, fields, start, end, calendar):
-    """Yield (code, dates, structured array) of unadjusted daily bars on exchange trading days, oldest first."""
+    """Yield (code, dates, bars) of unadjusted daily bars on exchange trading days, oldest first: bars is get_price's
+    structured array, or a dict of arrays of ``fields`` when SESSION_EXTRA added a day."""
     for chunk in _chunks(codes, BAR_CHUNK):
         data = get_price(chunk, start_date=start, end_date=end, frequency="1d", fields=fields,  # noqa: F821
                          fq=None, is_dict=True) or {}
         for code in chunk:
             bars = data.get(code)
             if bars is None or len(bars) == 0:
-                continue
-            dates = pd.DatetimeIndex([_day(value) for value in bars["datetime"]])
-            keep = dates.isin(calendar) & ~dates.duplicated(keep="last")
-            yield code, dates[keep], bars[keep]
+                dates, bars = pd.DatetimeIndex([]), dict((field, np.zeros(0)) for field in fields)
+            else:
+                dates = pd.DatetimeIndex([_day(value) for value in bars["datetime"]])
+                keep = dates.isin(calendar) & ~dates.duplicated(keep="last")
+                dates, bars = dates[keep], bars[keep]
+            extra = _session_extra(code, dates, start, end)
+            if extra is not None:
+                bars = dict((field, np.r_[np.asarray(bars[field], dtype=float), float(extra[field])]) for field in fields)
+                dates = dates.append(pd.DatetimeIndex([SESSION_EXTRA["day"]]))
+            if len(dates):
+                yield code, dates, bars
+
+
+def _session_extra(code, dates, start, end):
+    """SESSION_EXTRA's bar of ``code`` when its day is asked for (between ``start`` and ``end``) and not in ``dates``."""
+    if not SESSION_EXTRA:
+        return None
+    day = SESSION_EXTRA["day"]
+    if not (_day(start) <= day <= _day(end)) or day in dates or (len(dates) and dates[-1] > day):
+        return None
+    return SESSION_EXTRA["bars"].get(code)
 
 
 def _traded(bars):
@@ -1935,6 +1957,8 @@ def ch4_factor_returns(inputs, end, log=print, cache=None, date=None):
     shares = shares.reindex(index=days, columns=codes)
     pe = valuation_panels(every, days, ["pe_ttm"], log, cache, positive=False)["pe_ttm"].reindex(
         index=days, columns=codes)
+    if len(days) > 1 and pe.iloc[-1].isna().all():
+        pe.iloc[-1] = pe.iloc[-2]  # a session planned from its closing snapshots before PTrade has its valuation
     log("svc.ch4_inputs_seconds", round(time.time() - began, 2))
     cap = daily["close"].ffill() * shares
     turnover = daily["volume"] / shares.where(shares > 0)
@@ -2030,6 +2054,8 @@ def main_blend_scores(inputs, date, end, log=print, cache=None):
 # * The plan is also kept in PTrade's ``g``, which survives a server restart: a trade the broker restarts (as on
 #   2026-11-16, after the weekend) trades on the plan it already had instead of planning again from cold (20 minutes,
 #   which missed both the auction and the after-open orders).
+# * With LIVE_SNAPSHOT_AT (the main-board blend, whose morning plan takes about 16 minutes and so missed the auction),
+#   the session is planned the same afternoon from PTrade's closing snapshots, and the morning only trades.
 # It trades at most once a day, and not at all on a day the account already has orders for sh_main stocks.
 #
 # LIVE_DRY_RUN = True (the default) sends nothing: it logs the orders it would send, once at start and then at each
@@ -2044,7 +2070,7 @@ LIVE_N_DROP = 5
 # 2022+ at 200k 34.5% / Sharpe 1.17 against 32.7% / 1.12 without it; see docs/score-rules.md). None turns it off.
 LIVE_EXIT_RANK_PCT = None
 LIVE_KEEP = set()  # sh_main codes the strategy must leave alone, e.g. set(["600000.SS"])
-LIVE_AUCTION = False
+LIVE_AUCTION = True
 LIVE_PLAN_AT = ("21:00", "08:00", "08:30", "09:00", "09:03", "09:06", "09:08", "09:12", "09:14", "09:16", "09:18",
                 "09:20", "09:22", "09:25", "09:28", "09:35", "09:42")  # each run plans only if still needed
 LIVE_AUCTION_AT = ("09:21", "09:23")  # orders sent from 09:20 on cannot be cancelled, so the auction keeps them
@@ -2057,9 +2083,17 @@ LIVE_SLIP = 0.01  # after the open: limit price offset from the last price; capp
 LIVE_MAX_ORDER = 2.5  # no single buy above this many equal slots (strategy money / LIVE_TOPK)
 LIVE_FILL_MAX = 1.3  # idle cash tops today's buys up lot by lot, to at most this many slots each
 LIVE_TOPUP = False  # False: only today's new buys get the idle cash; True: held names are topped up too
-LIVE_FIRST_LOT_MAX = 2.5  # a new name whose one lot is above a slot is still bought if the lot is under this
+LIVE_FIRST_LOT_MAX = 1.5  # a new name whose one lot is above a slot is still bought if the lot is under this
 LIVE_TOPUP_MIN = 0.2  # top-ups of a held name under this many slots are not sent (5 yuan minimum commission)
 LIVE_DAYS = 1100  # trading days of history the factors are computed on (as the QMT strategy)
+# Plan the session that just closed at these times (Beijing) from PTrade's closing snapshots, instead of waiting for
+# its daily bars (published around 09:10 the next morning): the next morning's auction then trades on a plan made the
+# afternoon before. Empty: plan only from daily bars. LIVE_SNAPSHOT_CHECK_AT compares the snapshot bars of a sample
+# with the published daily bars the next morning and logs the largest gaps.
+LIVE_SNAPSHOT_AT = ("15:10", "15:40", "16:10")
+LIVE_SNAPSHOT_MIN_SHARE = 0.85  # snapshot planning needs this share of all A shares with a traded closing snapshot
+LIVE_SNAPSHOT_CHECK_AT = "09:45"
+LIVE_SNAPSHOT_SAMPLE = 40
 LIVE_TAG = "[RQ]"
 SNAPSHOT_CHUNK = 300
 HALTED = ("HALT", "SUSP", "STOPT", "DELISTED")
@@ -2289,6 +2323,113 @@ def _ready_plan(today):
     return plan
 
 
+# PTrade snapshot field for each get_price daily-bar field (business_amount in shares, business_balance in yuan).
+SNAPSHOT_BAR = (("open", "open_px"), ("high", "high_px"), ("low", "low_px"), ("close", "last_px"),
+                ("volume", "business_amount"), ("money", "business_balance"), ("preclose", "preclose_px"))
+
+
+def session_snapshot(day):
+    """{code: daily bar} of every A share that traded in the session ``day`` (just closed), from get_snapshot; None
+    (logged) when too few stocks have one or the volume and amount units are not shares and yuan."""
+    codes = all_a_codes(day.strftime("%Y%m%d"))
+    snaps = {}
+    for chunk in _chunks(codes, SNAPSHOT_CHUNK):
+        snaps.update(get_snapshot(chunk) or {})  # noqa: F821
+    bars = {}
+    for code in codes:
+        snap = snaps.get(code) or {}
+        if str(snap.get("trade_status", "")) in HALTED:
+            continue
+        try:
+            bar = dict((field, float(snap.get(key) or 0.0)) for field, key in SNAPSHOT_BAR)
+        except (TypeError, ValueError):
+            continue
+        if min(bar["open"], bar["close"], bar["preclose"], bar["volume"], bar["money"]) > 0:
+            bars[code] = bar
+    if len(bars) < LIVE_SNAPSHOT_MIN_SHARE * len(codes):
+        rq_log("live.snapshot_error", "only %d of %d A shares have a traded snapshot" % (len(bars), len(codes)))
+        return None
+    # The day's average price over its close: about 1 when volume is in shares and the amount in yuan.
+    ratio = float(np.median([bar["money"] / (bar["volume"] * bar["close"]) for bar in bars.values()]))
+    if 50.0 < ratio < 200.0:
+        for bar in bars.values():
+            bar["volume"] *= 100.0  # in lots of 100 shares
+    elif not 0.5 < ratio < 2.0:
+        rq_log("live.snapshot_error", "amount / (volume x close) is %.4g: unknown units" % ratio)
+        return None
+    rq_log("live.snapshot", "%s: %d of %d A shares traded, amount / (volume x close) %.3f" % (
+        day.strftime("%Y%m%d"), len(bars), len(codes), ratio))
+    return bars
+
+
+def keep_snapshot_sample(day, bars):
+    """A sample of the board's snapshot bars in g, for rq_snapshot_check the next morning."""
+    codes = sorted(code for code in bars if on_live_board(code))
+    sample = codes[::max(1, len(codes) // LIVE_SNAPSHOT_SAMPLE)][:LIVE_SNAPSHOT_SAMPLE]
+    g.rq_snapshot = {"day": day.strftime("%Y%m%d"), "checked": False,  # noqa: F821
+                     "bars": dict((code, [bars[code][field] for field, _ in SNAPSHOT_BAR]) for code in sample)}
+
+
+def rq_session_close(context):
+    """After the close: plan the session that just ended from its closing snapshots (LIVE_SNAPSHOT_AT), so the next
+    morning's auction does not wait for the daily bars."""
+    _pt["context"] = context
+    clock = beijing_clock()
+    day = latest_session(clock)
+    if day is None or day != pd.Timestamp(clock[:8]) or _pt["planning"]:
+        return  # not a trading day, or before the close, or a plan is being made
+    plan = current_plan()
+    if plan is not None and plan["date"] == day:
+        return
+    try:
+        bars = session_snapshot(day)
+        if bars is None:
+            return
+        SESSION_EXTRA.update(day=day, bars=bars)
+        keep_snapshot_sample(day, bars)
+        rq_prepare(context)
+        plan = current_plan()
+        if plan is not None and plan["date"] == day:
+            rq_log("live.snapshot_plan", "%s planned from the closing snapshots" % day.strftime("%Y%m%d"))
+    except Exception as exc:
+        rq_log("live.error", _where(exc))
+    finally:
+        SESSION_EXTRA.clear()
+
+
+def rq_snapshot_check(context):
+    """Once the daily bars of a snapshot-planned session are in: the largest relative gaps between the sample's
+    snapshot bars and PTrade's daily bars, per field (logged once)."""
+    kept = getattr(g, "rq_snapshot", None)  # noqa: F821
+    if not kept or kept.get("checked"):
+        return
+    try:
+        day = pd.Timestamp(kept["day"])
+        clock = beijing_clock()
+        if day >= pd.Timestamp(clock[:8]):
+            return
+        fields = [field for field, _ in SNAPSHOT_BAR]
+        gaps, compared = dict((field, 0.0) for field in fields), 0
+        for code, dates, bars in _bars(sorted(kept["bars"]), fields, kept["day"], kept["day"],
+                                       trading_calendar(clock[:8])):
+            if day not in dates:
+                continue
+            at = list(dates).index(day)
+            compared += 1
+            for number, field in enumerate(fields):
+                published = float(np.asarray(bars[field], dtype=float)[at])
+                gap = abs(kept["bars"][code][number] - published) / max(abs(published), 1e-9)
+                gaps[field] = max(gaps[field], gap)
+        if not compared:
+            return
+        rq_log("live.snapshot_check", "%s %d codes, largest relative gap: %s" % (
+            kept["day"], compared, " ".join("%s=%.2g" % (field, gaps[field]) for field in fields)))
+        kept["checked"] = True
+        g.rq_snapshot = kept  # noqa: F821
+    except Exception as exc:
+        rq_log("live.error", _where(exc))
+
+
 def rq_trade(context, mode):
     """mode 'auction' (sells and buys at once), 'sell' (after the open) or 'dry' (log only, at start)."""
     _pt["context"] = context
@@ -2359,8 +2500,9 @@ def rq_after_open_buy(context):
 
 def initialize(context):
     _pt["context"] = context
-    rq_log("live", "start dry_run=%s universe=%s auction=%s topk=%d n_drop=%d exit_rank_pct=%s" % (
-        LIVE_DRY_RUN, LIVE_UNIVERSE, LIVE_AUCTION, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT))
+    rq_log("live", "start dry_run=%s universe=%s auction=%s topk=%d n_drop=%d exit_rank_pct=%s snapshot_at=%s" % (
+        LIVE_DRY_RUN, LIVE_UNIVERSE, LIVE_AUCTION, LIVE_TOPK, LIVE_N_DROP, LIVE_EXIT_RANK_PCT,
+        ",".join(LIVE_SNAPSHOT_AT) or "none"))
     for moment in LIVE_PLAN_AT:
         run_daily(context, rq_prepare, time=moment)  # noqa: F821
     for moment in LIVE_AUCTION_AT:
@@ -2369,6 +2511,10 @@ def initialize(context):
         run_daily(context, rq_after_open_sell, time=moment)  # noqa: F821
     for moment in LIVE_BUY_AT:
         run_daily(context, rq_after_open_buy, time=moment)  # noqa: F821
+    for moment in LIVE_SNAPSHOT_AT:
+        run_daily(context, rq_session_close, time=moment)  # noqa: F821
+    if LIVE_SNAPSHOT_AT:
+        run_daily(context, rq_snapshot_check, time=LIVE_SNAPSHOT_CHECK_AT)  # noqa: F821
 
 
 def before_trading_start(context, data):

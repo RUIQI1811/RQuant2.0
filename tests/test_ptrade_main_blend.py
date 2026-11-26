@@ -302,7 +302,7 @@ class BlendLive(ptl.Live):
 def test_live_bundle_settings_are_the_backtested_ones() -> None:
     source = build_main_blend.build_live()
     for line in ('LIVE_UNIVERSE = "main"', "LIVE_TOPK = 50", "LIVE_N_DROP = 5", "LIVE_EXIT_RANK_PCT = None",
-                 "LIVE_DRY_RUN = True", "LIVE_AUCTION = False", "LIVE_FIRST_LOT_MAX = 2.5"):
+                 "LIVE_DRY_RUN = True", "LIVE_AUCTION = True", 'LIVE_SNAPSHOT_AT = ("15:10", "15:40", "16:10")'):
         assert f"\n{line}" in source
     assert source.index("\ndef plan_scores(") < source.rindex("\ndef plan_scores(")  # main_live's comes last
 
@@ -312,9 +312,6 @@ def test_live_bundle_trades_shenzhen_main_board_on_the_blend() -> None:
     live.run("initialize", "20110701080000")
     live.run("rq_prepare", "20110701080000")
     live.run("rq_auction", "20110701092100")
-    assert not live.sent  # the plan is never ready for the auction: the blend trades after the open
-    live.run("rq_after_open_sell", "20110701093100")
-    live.run("rq_after_open_buy", "20110701093200")
     lines = live.lines()
     assert not any("error" in line for line in lines), lines[-8:]
     assert any(line.startswith("[RQ] live.top3=") and ".SZ" in line for line in lines)
@@ -324,6 +321,71 @@ def test_live_bundle_trades_shenzhen_main_board_on_the_blend() -> None:
     buys = [code for code, amount, _ in live.sent if amount > 0]
     assert sells == ["600002.SS"]  # the ST name; the ChiNext holding is not the strategy's
     assert buys and set(buys) <= {"600001.SS", "600003.SS", "600004.SS", "000001.SZ"}
+
+
+# Break caught: a session planned from closing snapshots scoring differently from the same session's daily bars
+# (a snapshot field mapped to the wrong bar field, the day added twice, or the canonical prices chained wrongly).
+def test_snapshot_session_builds_the_inputs_of_its_daily_bars() -> None:
+    names = namespace()
+    fake = ValuationFake()
+    for name in pti.API:
+        names[name] = getattr(fake, name)
+    last = pd.Timestamp(qmt.END)
+    codes = names["main_codes"](qmt.END)
+    full = names["build_inputs"](qmt.END, qmt.DAYS, lambda *args: None, codes=codes)
+    fields = ["open", "high", "low", "close", "volume", "money", "preclose"]
+    day_bars = fake.get_price(list(fake.bars), start_date=qmt.END, end_date=qmt.END, fields=fields, is_dict=True)
+    original = fake.get_price
+
+    def hidden(security, start_date=None, end_date=None, **kwargs):  # PTrade before it publishes the day's bars
+        data = original(security, start_date=start_date, end_date=end_date, **kwargs)
+        return dict((code, bars[bars["datetime"] != int(qmt.END)]) for code, bars in data.items())
+
+    names["get_price"] = hidden
+    snapshot = {code: {field: float(bars[field][0]) for field in fields}
+                for code, bars in day_bars.items() if len(bars)}
+    names["SESSION_EXTRA"].update(day=last, bars=snapshot)
+    try:
+        snapped = names["build_inputs"](qmt.END, qmt.DAYS, lambda *args: None, codes=codes)
+    finally:
+        names["SESSION_EXTRA"].clear()
+        names["get_price"] = original
+    for key in ("close", "open", "volume", "amount", "cap", "basic_turnover_total", "universe"):
+        pd.testing.assert_frame_equal(snapped[key], full[key], check_exact=False, rtol=1e-12, obj=key)
+    pd.testing.assert_series_equal(snapped["mkt"], full["mkt"], check_exact=False, rtol=1e-12)
+    assert full["close"].loc[last].notna().sum() > 0
+
+
+class SnapshotBlendLive(BlendLive):
+    """BlendLive whose snapshots after the close carry the day's whole bar (high, low, volume in shares, amount)."""
+
+    def get_snapshot(self, codes):
+        snaps = super().get_snapshot(codes)
+        for code, snap in snaps.items():
+            volume = float(self.fake.bars[code]["volume"].iloc[-1]) * 100.0
+            snap.update(high_px=snap["last_px"] * 1.01, low_px=snap["last_px"] * 0.98, business_amount=volume,
+                        business_balance=volume * snap["last_px"])
+        return snaps
+
+
+# Break caught: the blend waiting for the next morning's daily bars (16 minutes from 09:10, too late for the 09:21
+# auction on 2026-11-25 and 11-26) instead of planning the session from its closing snapshots that afternoon.
+def test_live_bundle_plans_from_the_closing_snapshots_and_trades_the_auction() -> None:
+    live = SnapshotBlendLive({"600002.SS": (300, 300)})
+    live.run("initialize", "20110701080000")
+    assert ("rq_session_close", "15:10") in live.jobs and ("rq_snapshot_check", "09:45") in live.jobs
+    live.run("rq_session_close", "20110701151000")  # 07-01 has no daily bars yet: its snapshots stand in
+    lines = live.lines()
+    assert not any("error" in line for line in lines), lines[-8:]
+    assert "[RQ] live.data_through=20110701" in lines
+    assert any(line.startswith("[RQ] live.snapshot_plan=20110701") for line in lines)
+    assert live.g.rq_plan["date"] == "20110701" and live.g.rq_snapshot["day"] == "20110701"
+    count = len(lines)
+    live.run("rq_prepare", "20110704080000")  # the morning has its plan: no waiting for bars, no planning
+    live.run("rq_auction", "20110704092100")
+    assert not any("live.wait" in line or "inputs.codes" in line for line in live.lines()[count:])
+    assert any(amount < 0 for _, amount, _ in live.sent) and any(amount > 0 for _, amount, _ in live.sent)
+    assert live.g.rq_done == "20110704"
 
 
 def test_committed_main_blend_bundles_are_current() -> None:

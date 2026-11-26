@@ -65,6 +65,8 @@ def ch4_factor_returns(inputs, end, log=print, cache=None, date=None):
     shares = shares.reindex(index=days, columns=codes)
     pe = valuation_panels(every, days, ["pe_ttm"], log, cache, positive=False)["pe_ttm"].reindex(
         index=days, columns=codes)
+    if len(days) > 1 and pe.iloc[-1].isna().all():
+        pe.iloc[-1] = pe.iloc[-2]  # a session planned from its closing snapshots before PTrade has its valuation
     log("svc.ch4_inputs_seconds", round(time.time() - began, 2))
     cap = daily["close"].ffill() * shares
     turnover = daily["volume"] / shares.where(shares > 0)

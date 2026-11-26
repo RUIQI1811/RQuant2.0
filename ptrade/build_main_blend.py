@@ -16,8 +16,8 @@ Outputs:
 * ``ptrade/generated/main_blend_research_parity.py``: for one PTrade research notebook cell; scores AS_OF and compares
   with RQuant's backtest scores of that day (``tests/data/main_blend_parity_202610.parquet``);
 * ``ptrade/generated/main_blend_ptrade_live.py``: the live strategy (``ptrade/runtime/ptrade_live.py`` with
-  LIVE_UNIVERSE "main", top 50, drop 5, no rank exit, after the open, and ``ptrade/runtime/main_live.py``'s
-  scoring), dry run.
+  LIVE_UNIVERSE "main", top 50, drop 5, no rank exit, planned the afternoon before from the closing snapshots, and
+  ``ptrade/runtime/main_live.py``'s scoring), dry run.
 
 Usage: ``python ptrade/build_main_blend.py``.
 """
@@ -46,19 +46,15 @@ PARITY_DAY = "2026-10-21"
 RUNTIME = ROOT / "ptrade" / "runtime"
 PARITY_OUTPUT = ROOT / "ptrade" / "generated" / "main_blend_research_parity.py"
 LIVE_OUTPUT = ROOT / "ptrade" / "generated" / "main_blend_ptrade_live.py"
-# The live strategy's settings for the blend, as backtested (top 50, at most 5 swaps a day, no rank exit), and:
-# * no auction: the morning plan of 3,200 stocks and two models takes about 16 minutes once the bars are in (09:10),
-#   so it is never ready for 09:21 (2026-11-25: plan done 09:26). It trades at 09:31/09:32 and keeps no cash back
-#   for the next day's auction (that reserve left 17,500 yuan idle on 2026-11-25);
-# * a new name's first lot may cost up to LIVE_MAX_ORDER slots: at about 175,000 yuan a top-50 slot is 3,500 yuan,
-#   and at 1.5 slots every stock above about 52 yuan was skipped (6 of 8 buys on 2026-11-25).
+# The live strategy's settings for the blend, as backtested (top 50, at most 5 swaps a day, no rank exit), and the
+# afternoon plan from the closing snapshots: once the bars are in (09:10), the morning plan of 3,200 stocks and two
+# models takes about 16 minutes, too late for the 09:21 auction (2026-11-25 and 11-26: done 09:26).
 LIVE_SETTINGS = (
     ('LIVE_UNIVERSE = "sh_main"', 'LIVE_UNIVERSE = "main"'),
     ("LIVE_TOPK = 30", "LIVE_TOPK = 50"),
     ("LIVE_N_DROP = 3", "LIVE_N_DROP = 5"),
     ("LIVE_EXIT_RANK_PCT = 0.7", "LIVE_EXIT_RANK_PCT = None"),
-    ("LIVE_AUCTION = True", "LIVE_AUCTION = False"),
-    ("LIVE_FIRST_LOT_MAX = 1.5", "LIVE_FIRST_LOT_MAX = 2.5"),
+    ("LIVE_SNAPSHOT_AT = ()", 'LIVE_SNAPSHOT_AT = ("15:10", "15:40", "16:10")'),
 )
 
 
